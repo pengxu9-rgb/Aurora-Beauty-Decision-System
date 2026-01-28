@@ -136,7 +136,10 @@ def get_embedding(client: OpenAI, *, model: str, text: str) -> List[float]:
   embedding = response.data[0].embedding
   if not isinstance(embedding, list) or not embedding:
     raise ValueError("Embedding response invalid")
-  return [float(x) for x in embedding]
+  floats = [float(x) for x in embedding]
+  if len(floats) != 1536:
+    raise ValueError(f"Expected embedding dim=1536, got dim={len(floats)} (model={model})")
+  return floats
 
 
 def embedding_to_vector_literal(embedding: List[float]) -> str:
@@ -247,12 +250,16 @@ def _get_excel_rows(path: str, sheet: Optional[str]) -> Tuple[List[str], Iterabl
   return headers, rows
 
 
-def _pick_column(headers: List[str], preferred: str) -> int:
+def _pick_column(headers: List[str], preferred: Optional[str], *, required: bool = True) -> Optional[int]:
+  if preferred is None:
+    return None
   lowered = [h.strip().lower() for h in headers]
   key = preferred.strip().lower()
   if key in lowered:
     return lowered.index(key)
-  raise RuntimeError(f"Missing required column: {preferred} (available: {headers})")
+  if required:
+    raise RuntimeError(f"Missing required column: {preferred} (available: {headers})")
+  return None
 
 
 def load_input_skus_from_excel(
@@ -275,11 +282,11 @@ def load_input_skus_from_excel(
   idx_name = _pick_column(headers, col_name)
   idx_ing = _pick_column(headers, col_ingredients)
 
-  idx_price_usd = _pick_column(headers, col_price_usd) if col_price_usd else None
-  idx_price = _pick_column(headers, col_price) if col_price else None
+  idx_price_usd = _pick_column(headers, col_price_usd, required=False)
+  idx_price = _pick_column(headers, col_price, required=False)
 
-  idx_product_url = _pick_column(headers, col_product_url) if col_product_url else None
-  idx_image_url = _pick_column(headers, col_image_url) if col_image_url else None
+  idx_product_url = _pick_column(headers, col_product_url, required=False)
+  idx_image_url = _pick_column(headers, col_image_url, required=False)
 
   skus: List[InputSku] = []
   for r in rows:
@@ -486,4 +493,3 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-
