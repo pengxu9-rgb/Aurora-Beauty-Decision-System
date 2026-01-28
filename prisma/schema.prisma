@@ -1,0 +1,76 @@
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+// Product Identity
+model Product {
+  id         String  @id @default(uuid())
+  brand      String
+  name       String
+  priceUsd   Decimal @map("price_usd") @db.Decimal(10, 2)
+  priceCny   Decimal @map("price_cny") @db.Decimal(10, 2)
+  productUrl String? @map("product_url")
+  imageUrl   String? @map("image_url")
+
+  vectors     SkuVector?
+  ingredients IngredientData?
+  socialStats SocialStats?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([brand])
+  @@index([name])
+  @@map("products")
+}
+
+// Logic Core (Vectors)
+model SkuVector {
+  id        String  @id @default(uuid())
+  productId String  @unique @map("product_id")
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  mechanism  Json     // { oil_control: 85, soothing: 20 }
+  experience Json     // { texture: "gel", pilling_risk: 0.8 }
+  riskFlags  String[] @map("risk_flags")
+
+  // Vector embedding for similarity search (Unsupported type in Prisma, managed by raw SQL)
+  embedding Unsupported("vector(1536)")?
+
+  @@map("sku_vectors")
+}
+
+// Ingredient Data
+model IngredientData {
+  id        String  @id @default(uuid())
+  productId String  @unique @map("product_id")
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  fullList    String[] @map("full_list")
+  heroActives Json     @map("hero_actives")
+
+  @@map("ingredients")
+}
+
+// Social Stats
+model SocialStats {
+  id        String   @id @default(uuid())
+  productId String   @unique @map("product_id")
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  redScore    Int      @default(0) @map("red_score")
+  redditScore Int      @default(0) @map("reddit_score")
+  burnRate    Decimal  @default(0.0) @map("burn_rate")
+  topKeywords String[] @map("top_keywords")
+
+  lastUpdated DateTime @default(now()) @map("last_updated")
+
+  @@map("social_stats")
+}
