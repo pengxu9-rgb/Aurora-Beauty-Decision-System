@@ -232,6 +232,10 @@ export function AuroraApp() {
   const [skuDb, setSkuDb] = useState<SkuVector[]>(() => AURORA_SKU_DB);
   const [skuDbStatus, setSkuDbStatus] = useState<"mock" | "loading" | "db">("mock");
   const [skuDbError, setSkuDbError] = useState<string | null>(null);
+  const [chatQuery, setChatQuery] = useState<string>("");
+  const [chatAnswer, setChatAnswer] = useState<string>("");
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [isChatting, setIsChatting] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -380,6 +384,35 @@ export function AuroraApp() {
       setIsAnalyzing(false);
     }
   }, [anchorSkuId, localRecommendedDupe, user]);
+
+  const handleChat = useCallback(async () => {
+    const q = chatQuery.trim();
+    if (!q) return;
+
+    setIsChatting(true);
+    setChatError(null);
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || `Chat failed (${res.status})`);
+      }
+
+      const json = (await res.json()) as { answer?: string };
+      setChatAnswer(typeof json.answer === "string" ? json.answer : "");
+    } catch (err) {
+      setChatError(err instanceof Error ? err.message : "Chat failed");
+      setChatAnswer("");
+    } finally {
+      setIsChatting(false);
+    }
+  }, [chatQuery]);
 
   const inputSection = (
     <section className="w-full h-full overflow-y-auto p-8 fade-in">
@@ -607,6 +640,49 @@ export function AuroraApp() {
         </div>
 
         <div className="bg-white rounded-xl shadow-lg border border-slate-200 p-6 space-y-6">
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-4">
+            <div className="flex items-center justify-between gap-3">
+              <h4 className="font-bold text-slate-800">0) Chat (RAG)</h4>
+              <button
+                type="button"
+                className="text-xs px-2 py-1 rounded border border-slate-200 bg-white hover:bg-slate-100"
+                onClick={() =>
+                  setChatQuery((q) =>
+                    q.trim()
+                      ? q
+                      : `我敏感肌，想找 ${anchor.brand} ${anchor.name} 的平替。请给出推荐与取舍（trade-off）。`,
+                  )
+                }
+              >
+                Use current anchor
+              </button>
+            </div>
+            <div className="mt-3 grid gap-3">
+              <textarea
+                className="w-full min-h-[90px] rounded-md border border-slate-200 bg-white px-3 py-2 text-sm"
+                placeholder="例如：我是重度敏感肌，最近脸特别疼。想买 Murad A醇精华，适合吗？"
+                value={chatQuery}
+                onChange={(e) => setChatQuery(e.target.value)}
+              />
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleChat}
+                  disabled={isChatting || !chatQuery.trim()}
+                  className="rounded-md bg-slate-900 text-white px-4 py-2 text-sm font-semibold hover:bg-slate-800 disabled:opacity-60"
+                >
+                  {isChatting ? "Thinking..." : "Ask"}
+                </button>
+                {chatError ? <span className="text-xs text-rose-600">{chatError}</span> : null}
+              </div>
+              {chatAnswer ? (
+                <pre className="whitespace-pre-wrap text-sm text-slate-700 bg-white border border-slate-200 rounded-md p-3">
+                  {chatAnswer}
+                </pre>
+              ) : null}
+            </div>
+          </div>
+
           <div>
             <h4 className="font-bold text-slate-800 mb-2">1) Diagnosis</h4>
             <ul className="text-sm text-slate-600 list-disc pl-5 space-y-1">
