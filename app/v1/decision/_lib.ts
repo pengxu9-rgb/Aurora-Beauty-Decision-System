@@ -115,6 +115,19 @@ function aliasForSkuId(skuId: string) {
   return ALIAS_SKUS.find((a) => a.sku_id === skuId) ?? null;
 }
 
+function inferCategory(name: string): SkuCategory {
+  const n = name.toLowerCase();
+
+  if (n.includes("cleanser") || n.includes("facial wash") || n.includes("face wash") || n.includes("foaming")) return "cleanser";
+  if (n.includes("toner") || n.includes("essence") || (n.includes("lotion") && !n.includes("cream"))) return "toner";
+  if (n.includes("spf") || n.includes("sunscreen") || n.includes("uv")) return "sunscreen";
+  if (n.includes("cream") || n.includes("moistur") || n.includes("baume") || n.includes("balm")) return "moisturizer";
+  if (n.includes("treatment") || n.includes("retinol") || n.includes("adapalene") || n.includes("acid")) return "treatment";
+  if (n.includes("serum") || n.includes("ampoule")) return "serum";
+
+  return "serum";
+}
+
 function looksLikeUuid(value: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
@@ -143,7 +156,7 @@ function mapProductToSkuVector(product: any): SkuVector | null {
     sku_id: alias?.sku_id ?? product.id,
     name: product.name,
     brand: product.brand,
-    category: alias?.category ?? "serum",
+    category: alias?.category ?? inferCategory(String(product.name ?? "")),
     price: Number.isFinite(price) ? price : 0,
     currency: "USD",
     mechanism: {

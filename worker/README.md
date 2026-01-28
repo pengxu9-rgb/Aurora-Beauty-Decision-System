@@ -87,7 +87,7 @@ python3 worker/ingest.py \
 
 ## 4.1) 从 JSON 批量导入（Top 10 快速喂数）
 
-仓库内置了一份「Top 10 Skincare」示例数据：`worker/datasets/top10.json`。
+仓库内置了一份「Top 10+ Skincare」示例数据：`worker/datasets/top10.json`（可在此基础上继续加 SKU）。
 
 ```bash
 cd client

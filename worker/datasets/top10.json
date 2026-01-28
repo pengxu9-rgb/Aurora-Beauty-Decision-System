@@ -89,7 +89,18 @@
       "name": "Ultra Facial Cream",
       "price_usd": 38,
       "ingredients_text": "Water, Glycerin, Squalane, Shea Butter, Panthenol"
+    },
+    {
+      "brand": "Estée Lauder",
+      "name": "Advanced Night Repair",
+      "price_usd": 105,
+      "ingredients_text": "Water, Bifida Ferment Lysate, Glycerin, Sodium Hyaluronate (Hyaluronic Acid), Peptides"
+    },
+    {
+      "brand": "La Mer",
+      "name": "The Concentrate",
+      "price_usd": 400,
+      "ingredients_text": "Cyclopentasiloxane, Algae Extract, Glycerin, Dimethicone, Tocopherol"
     }
   ]
 }
-

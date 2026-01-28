@@ -152,6 +152,19 @@ function categoryOverride(brand: string, name: string) {
   return PRODUCT_OVERRIDES.find((o) => o.brand === brand && o.name === name) ?? null;
 }
 
+function inferCategory(name: string): SkuCategory {
+  const n = name.toLowerCase();
+
+  if (n.includes("cleanser") || n.includes("facial wash") || n.includes("face wash") || n.includes("foaming")) return "cleanser";
+  if (n.includes("toner") || n.includes("essence") || (n.includes("lotion") && !n.includes("cream"))) return "toner";
+  if (n.includes("spf") || n.includes("sunscreen") || n.includes("uv")) return "sunscreen";
+  if (n.includes("cream") || n.includes("moistur") || n.includes("baume") || n.includes("balm")) return "moisturizer";
+  if (n.includes("treatment") || n.includes("retinol") || n.includes("adapalene") || n.includes("acid")) return "treatment";
+  if (n.includes("serum") || n.includes("ampoule")) return "serum";
+
+  return "serum";
+}
+
 function toSkuVector(row: SimilarRow): SkuVector {
   const override = categoryOverride(row.brand, row.name);
 
@@ -172,7 +185,7 @@ function toSkuVector(row: SimilarRow): SkuVector {
     sku_id: override?.sku_id ?? row.product_id,
     name: row.name,
     brand: row.brand,
-    category: override?.category ?? "serum",
+    category: override?.category ?? inferCategory(row.name),
     price: Number.isFinite(priceUsd) ? priceUsd : 0,
     currency: "USD",
     mechanism: {
