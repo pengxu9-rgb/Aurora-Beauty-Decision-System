@@ -45,6 +45,15 @@ python3 worker/ingest.py --demo --overwrite
 
 默认 LLM 模型是 `gemini-2.5-flash-preview`（可用 `--llm-model` 覆盖）。
 
+如果你遇到 `model not found`，先列出你这个 key 可用的模型：
+
+```bash
+cd client
+python3 worker/ingest.py --list-models
+```
+
+然后把 `--llm-model` 改成列表里带 `generateContent` 的那个。
+
 ## 4) 从 Excel/CSV 批量导入
 
 Excel 表需要至少包含这些列（列名可通过参数指定）：

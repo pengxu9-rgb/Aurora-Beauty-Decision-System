@@ -155,6 +155,21 @@ class GeminiClient:
     self._session = requests.Session()
     self._session.headers.update({"Content-Type": "application/json"})
 
+  def list_models(self) -> List[Dict[str, Any]]:
+    url = f"{self._api_base_url}/models"
+
+    def _call():
+      resp = self._session.get(url, params={"key": self._api_key}, timeout=60)
+      if resp.status_code >= 400:
+        raise RuntimeError(f"Gemini ListModels failed ({resp.status_code}): {resp.text[:500]}")
+      return resp.json()
+
+    payload = _retry(_call, tries=3, base_sleep_s=1.0)
+    models = payload.get("models") or []
+    if not isinstance(models, list):
+      raise RuntimeError(f"Gemini ListModels response invalid: {payload}")
+    return models
+
   def generate_json(self, *, model: str, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
     url = f"{self._api_base_url}/models/{model}:generateContent"
     body = {
@@ -166,6 +181,13 @@ class GeminiClient:
     def _call():
       resp = self._session.post(url, params={"key": self._api_key}, json=body, timeout=60)
       if resp.status_code >= 400:
+        if resp.status_code == 404:
+          raise RuntimeError(
+            f"Gemini generateContent failed (404): model '{model}' not found / not supported on '{self._api_base_url}'. "
+            f"Tip: run with --list-models to see available models, or set GEMINI_API_BASE_URL "
+            f"to switch API version (e.g. https://generativelanguage.googleapis.com/v1). "
+            f"Raw: {resp.text[:400]}"
+          )
         raise RuntimeError(f"Gemini generateContent failed ({resp.status_code}): {resp.text[:500]}")
       return resp.json()
 
@@ -531,6 +553,7 @@ def main() -> None:
   parser.add_argument("--input", type=str, help="Path to Excel (.xlsx) file.")
   parser.add_argument("--sheet", type=str, default=None, help="Excel sheet name (default: active sheet).")
   parser.add_argument("--limit", type=int, default=None, help="Max rows to ingest (for testing).")
+  parser.add_argument("--list-models", action="store_true", help="List available Gemini models and exit.")
 
   parser.add_argument("--col-brand", type=str, default="brand")
   parser.add_argument("--col-name", type=str, default="name")
@@ -554,10 +577,19 @@ def main() -> None:
   api_key = _require_any_env(["GEMINI_API_KEY", "GOOGLE_API_KEY"])
   api_base_url = (os.getenv("GEMINI_API_BASE_URL") or DEFAULT_GEMINI_API_BASE_URL).strip()
 
-  if not args.demo and not args.input:
-    raise SystemExit("Provide --demo or --input /path/to.xlsx")
-
   gemini_client = GeminiClient(api_key=api_key, api_base_url=api_base_url)
+
+  if args.list_models:
+    models = gemini_client.list_models()
+    # Keep output compact & copyable
+    for m in models:
+      name = m.get("name")
+      methods = m.get("supportedGenerationMethods") or []
+      print(f"{name}  methods={methods}")
+    return
+
+  if not args.demo and not args.input:
+    raise SystemExit("Provide --demo or --input /path/to.xlsx (or --list-models)")
 
   if args.demo:
     skus = demo_skus()
