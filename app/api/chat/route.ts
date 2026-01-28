@@ -197,8 +197,14 @@ async function geminiGenerateContent(input: {
 
   const payload = (await res.json()) as any;
   const candidates = payload?.candidates ?? [];
-  const text = candidates?.[0]?.content?.parts?.[0]?.text;
-  if (typeof text !== "string" || !text.trim()) throw new Error("Gemini response missing text");
+  const parts = candidates?.[0]?.content?.parts;
+  const text = Array.isArray(parts)
+    ? parts
+        .map((p) => (p && typeof p === "object" && typeof (p as any).text === "string" ? (p as any).text : ""))
+        .join("")
+    : "";
+
+  if (!text.trim()) throw new Error("Gemini response missing text");
   return text.trim();
 }
 
