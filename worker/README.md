@@ -55,6 +55,13 @@ python3 worker/ingest.py --list-models
 
 然后把 `--llm-model` 改成列表里带 `generateContent` 的那个。
 
+## 3.1) 不会写 SQL 的验证方式
+
+```bash
+cd client
+python3 worker/verify_db.py
+```
+
 ## 4) 从 Excel/CSV 批量导入
 
 Excel 表需要至少包含这些列（列名可通过参数指定）：
