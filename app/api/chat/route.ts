@@ -106,6 +106,20 @@ function detectOilyAcne(query: string) {
   );
 }
 
+function detectClosedComedonesOrRoughTexture(query: string) {
+  const q = query.toLowerCase();
+  return (
+    q.includes("closed comedone") ||
+    q.includes("closed comedones") ||
+    q.includes("rough texture") ||
+    q.includes("bumps") ||
+    query.includes("闭口") ||
+    query.includes("粗糙") ||
+    query.includes("颗粒感") ||
+    query.includes("小疙瘩")
+  );
+}
+
 function parseBudgetCny(query: string): number | null {
   // Examples: "预算 500 块人民币", "500元", "¥500"
   const normalized = query.replace(/，/g, ",");
@@ -142,7 +156,13 @@ function inferGoals(query: string): UserGoal[] {
   };
 
   // Acne / closed comedones
-  if (q.includes("comed") || q.includes("acne") || query.includes("闭口") || query.includes("粉刺") || query.includes("痘")) {
+  if (
+    q.includes("comed") ||
+    q.includes("acne") ||
+    detectClosedComedonesOrRoughTexture(query) ||
+    query.includes("粉刺") ||
+    query.includes("痘")
+  ) {
     push("acne_comedonal", 1);
     push("oil_control", 2);
   }
@@ -399,6 +419,19 @@ type RoutineRec = {
   total_cny: number;
 };
 
+function hasDrySkin(user: UserVector) {
+  const skin = user.skin_type;
+  if (Array.isArray(skin)) return skin.includes("dry");
+  return skin === "dry";
+}
+
+function isLowBudgetCny(budgetCny: number | null) {
+  if (budgetCny == null) return false;
+  if (!Number.isFinite(budgetCny)) return false;
+  // Tight MVP threshold: <= ¥500 is considered "low" for a full routine.
+  return budgetCny <= 500;
+}
+
 function pickCheapest(db: SkuVector[], category: SkuVector["category"]): SkuVector | null {
   const candidates = db.filter((s) => s.category === category).sort((a, b) => a.price - b.price);
   return candidates[0] ?? null;
@@ -413,6 +446,53 @@ function pickBestByScore(db: SkuVector[], category: SkuVector["category"], user:
   return scored[0]?.sku ?? null;
 }
 
+function isAcidTreatmentCandidate(sku: SkuVector) {
+  const n = sku.name.toLowerCase();
+  const b = sku.brand.toLowerCase();
+  const text = `${b} ${n}`;
+
+  // Avoid false positives like "Hyaluronic Acid" which isn't exfoliating.
+  if (text.includes("hyaluronic")) return false;
+
+  return (
+    text.includes("bha") ||
+    text.includes("aha") ||
+    text.includes("azelaic") ||
+    text.includes("mandelic") ||
+    text.includes("salicylic") ||
+    text.includes("glycolic") ||
+    text.includes("lactic") ||
+    text.includes("exfoliant") ||
+    sku.risk_flags.includes("acid")
+  );
+}
+
+function isMildAcidCandidate(sku: SkuVector) {
+  const text = `${sku.brand} ${sku.name}`.toLowerCase();
+  return text.includes("azelaic") || text.includes("mandelic");
+}
+
+function pickBestAcidForComedones(db: SkuVector[], user: UserVector) {
+  const sensitive = Array.isArray(user.skin_type) ? user.skin_type.includes("sensitive") : user.skin_type === "sensitive";
+
+  const candidates = db
+    .filter(isAcidTreatmentCandidate)
+    .map((sku) => ({ sku, score: calculateScore(sku, user) }))
+    .filter((x) => x.score.total > 0);
+
+  if (candidates.length === 0) return null;
+
+  if (sensitive) {
+    const mild = candidates.filter((c) => isMildAcidCandidate(c.sku)).sort((a, b) => b.score.total - a.score.total);
+    if (mild[0]?.sku) return mild[0].sku;
+    // If no mild acids exist in the DB, do not force a harsher acid.
+    return null;
+  }
+
+  // Non-sensitive: pick the highest-scoring acid candidate.
+  return [...candidates].sort((a, b) => b.score.total - a.score.total)[0]?.sku ?? null;
+}
+
 function sumUniqueUsd(skus: SkuVector[]) {
   const seen = new Set<string>();
   let total = 0;
@@ -424,56 +504,24 @@ function sumUniqueUsd(skus: SkuVector[]) {
   return total;
 }
 
-function buildBudgetRoutine(db: SkuVector[], user: UserVector, budgetCny: number | null): RoutineRec {
-  const budgetUsd = budgetCny ? budgetCny / USD_TO_CNY : null;
+function buildPrimaryRoutine(db: SkuVector[], user: UserVector, query: string, budgetCny: number | null): RoutineRec {
+  const lowBudget = isLowBudgetCny(budgetCny);
+  const skipAmMoisturizer = lowBudget && !hasDrySkin(user);
+  const comedones = detectClosedComedonesOrRoughTexture(query);
 
-  // Essentials for MVP: cleanser + treatment + moisturizer + sunscreen
   const cleanser = pickCheapest(db, "cleanser");
   const sunscreen = pickCheapest(db, "sunscreen");
 
-  // For acne/comedones, prefer treatment; if none, fall back to serum.
-  let treatment: SkuVector | null = pickBestByScore(db, "treatment", user) ?? pickBestByScore(db, "serum", user);
-  let moisturizer: SkuVector | null = pickBestByScore(db, "moisturizer", user) ?? pickCheapest(db, "moisturizer");
+  // Targeted comedone logic: prioritize acids (BHA/AHA/Azelaic) in PM over Niacinamide/Retinol.
+  let treatment: SkuVector | null = null;
+  if (comedones) treatment = pickBestAcidForComedones(db, user);
+  if (!treatment) treatment = pickBestByScore(db, "treatment", user) ?? pickBestByScore(db, "serum", user);
 
-  // Simple budget guardrails: if total exceeds budget, pick cheaper alternatives.
-  const mustHave: Array<{ key: "cleanser" | "sunscreen" | "treatment" | "moisturizer"; sku: SkuVector | null }> = [
-    { key: "cleanser", sku: cleanser },
-    { key: "treatment", sku: treatment },
-    { key: "moisturizer", sku: moisturizer },
-    { key: "sunscreen", sku: sunscreen },
-  ];
-
-  const currentSkus = mustHave.map((m) => m.sku).filter((s): s is SkuVector => Boolean(s));
-  let totalUsd = sumUniqueUsd(currentSkus);
-
-  if (budgetUsd != null && totalUsd > budgetUsd) {
-    // First attempt: downgrade moisturizer to cheapest.
-    const cheapMoist = pickCheapest(db, "moisturizer");
-    if (cheapMoist && moisturizer && cheapMoist.sku_id !== moisturizer.sku_id) {
-      moisturizer = cheapMoist;
-      totalUsd = sumUniqueUsd([cleanser, treatment, moisturizer, sunscreen].filter((s): s is SkuVector => Boolean(s)));
-    }
-  }
-
-  if (budgetUsd != null && totalUsd > budgetUsd) {
-    // Second attempt: pick cheaper sunscreen (already cheapest) and treatment: choose cheaper high-scoring treatment.
-    const treatmentCandidates = db
-      .filter((s) => s.category === "treatment" || s.category === "serum")
-      .map((s) => ({ sku: s, score: calculateScore(s, user) }))
-      .filter((x) => x.score.total > 0)
-      .sort((a, b) => b.score.total - a.score.total);
-
-    const byPrice = [...treatmentCandidates].sort((a, b) => a.sku.price - b.sku.price);
-    const cheaper = byPrice.find((x) => treatment && x.sku.price < treatment.price);
-    if (cheaper) treatment = cheaper.sku;
-    totalUsd = sumUniqueUsd([cleanser, treatment, moisturizer, sunscreen].filter((s): s is SkuVector => Boolean(s)));
-  }
-
-  // If still above budget, drop optional category upgrades and keep essentials (cleanser + moisturizer + sunscreen).
-  if (budgetUsd != null && totalUsd > budgetUsd) {
-    treatment = null;
-    totalUsd = sumUniqueUsd([cleanser, moisturizer, sunscreen].filter((s): s is SkuVector => Boolean(s)));
-  }
+  // Budget compression: if low budget and not dry, keep moisturizer simple/cheap and invest in the PM active.
+  const moisturizer: SkuVector | null =
+    lowBudget && !hasDrySkin(user)
+      ? pickCheapest(db, "moisturizer")
+      : pickBestByScore(db, "moisturizer", user) ?? pickCheapest(db, "moisturizer");
 
   const am: RoutineRec["am"] = [];
   const pm: RoutineRec["pm"] = [];
@@ -483,12 +531,18 @@ function buildBudgetRoutine(db: SkuVector[], user: UserVector, budgetCny: number
     pm.push({ step: "Cleanser", sku: cleanser, notes: ["If wearing sunscreen/makeup, double cleanse as needed."] });
   }
 
-  if (moisturizer) {
+  if (!skipAmMoisturizer && moisturizer) {
     am.push({ step: "Moisturizer", sku: moisturizer, notes: ["Light layer to support barrier."] });
   }
 
   if (sunscreen) {
-    am.push({ step: "Sunscreen", sku: sunscreen, notes: ["Apply generously; reapply if outdoors."] });
+    am.push({
+      step: "Sunscreen",
+      sku: sunscreen,
+      notes: skipAmMoisturizer
+        ? ["Moisturizing sunscreen can replace AM moisturizer on oily/combo skin (budget compression).", "Apply generously; reapply if outdoors."]
+        : ["Apply generously; reapply if outdoors."],
+    });
   }
 
   if (treatment) {
@@ -497,7 +551,11 @@ function buildBudgetRoutine(db: SkuVector[], user: UserVector, budgetCny: number
       step: "Treatment",
       sku: treatment,
       notes: [
-        acneGoal ? "Targeting closed comedones/oil control." : "Active step.",
+        acneGoal && comedones
+          ? "Targeting closed comedones/rough texture (prioritize acids to unclog pores)."
+          : acneGoal
+            ? "Targeting oil control/comedones."
+            : "Active step.",
         "Start 2-3 nights/week, then increase as tolerated.",
       ],
     });
@@ -507,8 +565,97 @@ function buildBudgetRoutine(db: SkuVector[], user: UserVector, budgetCny: number
     pm.push({ step: "Moisturizer", sku: moisturizer, notes: ["Seal in hydration; reduce irritation."] });
   }
 
-  const total_cny = computeUsdToCny(totalUsd);
-  return { am, pm, total_usd: totalUsd, total_cny };
+  const totalUsd = sumUniqueUsd([...am, ...pm].map((s) => s.sku));
+  return { am, pm, total_usd: totalUsd, total_cny: computeUsdToCny(totalUsd) };
+}
+
+function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string, budgetCny: number | null): RoutineRec {
+  const primary = buildPrimaryRoutine(db, user, query, budgetCny);
+  if (budgetCny == null || !Number.isFinite(budgetCny)) return primary;
+
+  const budgetUsd = budgetCny / USD_TO_CNY;
+  if (!Number.isFinite(budgetUsd) || budgetUsd <= 0) return primary;
+
+  const lowBudget = isLowBudgetCny(budgetCny);
+  const skipAmMoisturizer = lowBudget && !hasDrySkin(user);
+
+  const cleanser = pickCheapest(db, "cleanser");
+  const sunscreen = pickCheapest(db, "sunscreen");
+
+  // Start from the same treatment/moisturizer choices as primary.
+  let treatment = primary.pm.find((s) => s.step === "Treatment")?.sku ?? null;
+  let moisturizer = primary.pm.find((s) => s.step === "Moisturizer")?.sku ?? null;
+
+  const budgetSkus = () => [cleanser, sunscreen, treatment, moisturizer].filter((s): s is SkuVector => Boolean(s));
+
+  let totalUsd = sumUniqueUsd(budgetSkus());
+
+  if (totalUsd > budgetUsd) {
+    // First attempt: ensure moisturizer is cheapest.
+    const cheapMoist = pickCheapest(db, "moisturizer");
+    if (cheapMoist) moisturizer = cheapMoist;
+    totalUsd = sumUniqueUsd(budgetSkus());
+  }
+
+  if (totalUsd > budgetUsd) {
+    // Second attempt: downgrade the active to a cheaper, high-scoring option (may sacrifice acids).
+    const candidates = db
+      .filter((s) => s.category === "treatment" || s.category === "serum")
+      .map((sku) => ({ sku, score: calculateScore(sku, user) }))
+      .filter((x) => x.score.total > 0)
+      .sort((a, b) => b.score.total - a.score.total);
+
+    const cheaper = [...candidates]
+      .sort((a, b) => a.sku.price - b.sku.price)
+      .find((x) => treatment && x.sku.price < treatment.price);
+
+    if (cheaper) treatment = cheaper.sku;
+    totalUsd = sumUniqueUsd(budgetSkus());
+  }
+
+  if (totalUsd > budgetUsd) {
+    // Last resort: drop the active.
+    treatment = null;
+    totalUsd = sumUniqueUsd(budgetSkus());
+  }
+
+  // Rebuild steps (keep the "skip AM moisturizer" rule).
+  const am: RoutineRec["am"] = [];
+  const pm: RoutineRec["pm"] = [];
+
+  if (cleanser) {
+    am.push({ step: "Cleanser", sku: cleanser, notes: ["Use gentle cleansing; avoid over-stripping."] });
+    pm.push({ step: "Cleanser", sku: cleanser, notes: ["If wearing sunscreen/makeup, double cleanse as needed."] });
+  }
+
+  if (!skipAmMoisturizer && moisturizer) {
+    am.push({ step: "Moisturizer", sku: moisturizer, notes: ["Light layer to support barrier."] });
+  }
+
+  if (sunscreen) {
+    am.push({
+      step: "Sunscreen",
+      sku: sunscreen,
+      notes: skipAmMoisturizer
+        ? ["Moisturizing sunscreen can replace AM moisturizer on oily/combo skin (budget compression).", "Apply generously; reapply if outdoors."]
+        : ["Apply generously; reapply if outdoors."],
+    });
+  }
+
+  if (treatment) {
+    pm.push({
+      step: "Treatment",
+      sku: treatment,
+      notes: ["Budget-safe active choice.", "Start 2-3 nights/week, then increase as tolerated."],
+    });
+  }
+
+  if (moisturizer) {
+    pm.push({ step: "Moisturizer", sku: moisturizer, notes: ["Seal in hydration; reduce irritation."] });
+  }
+
+  const finalUsd = sumUniqueUsd([...am, ...pm].map((s) => s.sku));
+  return { am, pm, total_usd: finalUsd, total_cny: computeUsdToCny(finalUsd) };
 }
 
 function isTooShort(answer: string) {
@@ -575,27 +722,51 @@ function buildFallbackProductAnswer(input: {
   return lines.join("\n").trim();
 }
 
-function buildFallbackRoutineAnswer(input: { query: string; budget_cny: number | null; routine: RoutineRec }) {
-  const { budget_cny, routine } = input;
+function buildFallbackRoutineAnswer(input: {
+  query: string;
+  budget_cny: number | null;
+  routine_primary: RoutineRec;
+  routine_budget?: RoutineRec;
+}) {
+  const { budget_cny, routine_primary, routine_budget } = input;
+  const withinBudget = budget_cny != null ? routine_primary.total_cny <= budget_cny : null;
   const budgetLine =
     budget_cny != null
-      ? `预算：${formatCny(budget_cny)}（≈${formatUsd(budget_cny / USD_TO_CNY)}）。本方案合计≈${formatCny(routine.total_cny)}（${formatUsd(routine.total_usd)}），在预算内。`
-      : `本方案合计≈${formatUsd(routine.total_usd)}（≈${formatCny(routine.total_cny)}）。`;
+      ? `预算：${formatCny(budget_cny)}（≈${formatUsd(budget_cny / USD_TO_CNY)}）。主方案合计≈${formatCny(routine_primary.total_cny)}（${formatUsd(routine_primary.total_usd)}），${withinBudget ? "在预算内" : "可能略超预算"}。`
+      : `主方案合计≈${formatUsd(routine_primary.total_usd)}（≈${formatCny(routine_primary.total_cny)}）。`;
 
   const lines: string[] = [];
   lines.push("为你按「油痘肌 / 去闭口」做了一套早晚分开的入门流程（尽量省钱但有效）：");
   lines.push(`- ${budgetLine}`);
 
   lines.push("");
-  lines.push("AM：");
-  for (const step of routine.am) {
+  lines.push("AM（主方案）：");
+  for (const step of routine_primary.am) {
     lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${formatUsd(step.sku.price)}）`);
   }
 
   lines.push("");
-  lines.push("PM：");
-  for (const step of routine.pm) {
+  lines.push("PM（主方案）：");
+  for (const step of routine_primary.pm) {
     lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${formatUsd(step.sku.price)}）`);
+  }
+
+  if (budget_cny != null && !withinBudget && routine_budget) {
+    lines.push("");
+    lines.push("如果你必须严格不超预算（备选方案）：");
+    lines.push(`- 合计≈${formatCny(routine_budget.total_cny)}（${formatUsd(routine_budget.total_usd)}）`);
+
+    lines.push("");
+    lines.push("AM（备选）：");
+    for (const step of routine_budget.am) {
+      lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${formatUsd(step.sku.price)}）`);
+    }
+
+    lines.push("");
+    lines.push("PM（备选）：");
+    for (const step of routine_budget.pm) {
+      lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${formatUsd(step.sku.price)}）`);
+    }
   }
 
   lines.push("");
@@ -645,31 +816,62 @@ export async function POST(req: Request) {
     // Build a lightweight user vector from query text.
     const user = buildUserVectorFromQuery(query, budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined);
     const db = await getSkuDatabase();
-    const routine = buildBudgetRoutine(db, user, budgetCny);
+    const routine_primary = buildPrimaryRoutine(db, user, query, budgetCny);
+    const routine_budget = buildBudgetSafeRoutine(db, user, query, budgetCny);
+    const over_budget = budgetCny != null && Number.isFinite(budgetCny) ? routine_primary.total_cny > budgetCny : false;
+    const routine = routine_primary;
 
     const contextText = [
       `User Query: ${query}`,
       `Detected: oily/acne=${detectOilyAcne(query)}; sensitive=${detectSensitiveSkin(query)}; barrier_impaired=${detectBarrierImpaired(query)}`,
       budgetCny != null ? `Budget: ${formatCny(budgetCny)} (≈${formatUsd(budgetCny / USD_TO_CNY)})` : "Budget: (not provided)",
       "",
-      "Recommended Routine (pre-selected):",
+      "Recommended Routine (primary, pre-selected):",
       `AM: ${routine.am.map((s) => `${s.step}=${s.sku.brand} ${s.sku.name} (${formatUsd(s.sku.price)})`).join(" | ")}`,
       `PM: ${routine.pm.map((s) => `${s.step}=${s.sku.brand} ${s.sku.name} (${formatUsd(s.sku.price)})`).join(" | ")}`,
       `Total: ${formatUsd(routine.total_usd)} (≈${formatCny(routine.total_cny)})`,
+      over_budget
+        ? [
+            "",
+            "Budget-safe Alternative (if you must stay within budget):",
+            `AM: ${routine_budget.am.map((s) => `${s.step}=${s.sku.brand} ${s.sku.name} (${formatUsd(s.sku.price)})`).join(" | ")}`,
+            `PM: ${routine_budget.pm.map((s) => `${s.step}=${s.sku.brand} ${s.sku.name} (${formatUsd(s.sku.price)})`).join(" | ")}`,
+            `Total: ${formatUsd(routine_budget.total_usd)} (≈${formatCny(routine_budget.total_cny)})`,
+          ].join("\n")
+        : null,
     ].join("\n");
 
     const systemPrompt = `
 You are the Aurora Beauty Consultant.
 You MUST base your answer strictly on the provided context (do not hallucinate products).
 
+Expert heuristics to follow (STRICT):
+
+1) Targeted Treatment Rule (The "Comedone" Logic)
+IF the user mentions "closed comedones" (闭口) or "rough texture" (粗糙):
+- PRIORITIZE Acids (BHA/AHA/Azelaic) over Niacinamide/Retinol in the PM Routine.
+- REASON: "Acid exfoliation is the most direct cure for unclogging pores."
+- EXCEPTION: If skin is "sensitive", stick to Azelaic Acid or Mandelic Acid.
+
+2) Budget Compression Rule (The "Skip Moisturizer" Logic)
+IF the user budget is "Low" AND skin type is NOT "Dry":
+- MERGE AM steps: Skip separate AM Moisturizer. Recommend a "Moisturizing Sunscreen" directly after Cleansing.
+- EXPLAIN: "For oily/combo skin, a good sunscreen provides enough hydration. Save the moisturizer budget for a better serum."
+- ACTION: Re-allocate the saved budget to upgrade the PM Active (Serum).
+
 Output requirements:
 - Provide AM and PM routines (bullets).
 - Explain why each product fits oily/acne + closed comedones.
-- Include total price and confirm it stays within budget if a budget was provided.
+- Include total price and confirm whether it stays within budget. If the primary plan is over budget, still show it first (as the “optimal” plan), then output a budget-safe alternative (as the “strict budget” plan).
 - Be direct and practical.
 `.trim();
 
-    const fallbackAnswer = buildFallbackRoutineAnswer({ query, budget_cny: budgetCny, routine });
+    const fallbackAnswer = buildFallbackRoutineAnswer({
+      query,
+      budget_cny: budgetCny,
+      routine_primary,
+      routine_budget: over_budget ? routine_budget : undefined,
+    });
 
     let answer = "";
     let llm_error: string | null = null;
@@ -709,6 +911,9 @@ Output requirements:
         detected: { oily_acne: detectOilyAcne(query), sensitive_skin: detectSensitiveSkin(query), barrier_impaired: detectBarrierImpaired(query) },
         budget_cny: budgetCny,
         routine,
+        routine_primary,
+        routine_budget,
+        over_budget,
       },
     });
   }
