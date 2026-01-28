@@ -189,9 +189,21 @@ class GeminiClient:
     model_id = self.normalize_model_name(model)
     url = f"{self._api_base_url}/models/{model_id}:generateContent"
     body = {
-      "systemInstruction": {"parts": [{"text": system_prompt}]},
+      "systemInstruction": {
+        "parts": [
+          {
+            "text": system_prompt
+            + "\n\nOutput MUST be valid JSON (no markdown, no code fences, double quotes only, no trailing commas)."
+          }
+        ]
+      },
       "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-      "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 800},
+      "generationConfig": {
+        "temperature": 0.0,
+        "responseMimeType": "application/json",
+        # Give the model enough room; malformed JSON often comes from truncation.
+        "maxOutputTokens": 2048,
+      },
     }
 
     def _call():
@@ -205,11 +217,15 @@ class GeminiClient:
             f"Raw: {resp.text[:400]}"
           )
         raise RuntimeError(f"Gemini generateContent failed ({resp.status_code}): {resp.text[:500]}")
-      return resp.json()
+      payload = resp.json()
+      text = _get_first_candidate_text(payload)
+      # Parse inside retry so transient malformed outputs can be retried.
+      return _extract_json_object(text)
 
-    payload = _retry(_call, tries=3, base_sleep_s=1.0)
-    text = _get_first_candidate_text(payload)
-    return _extract_json_object(text)
+    data = _retry(_call, tries=3, base_sleep_s=1.0)
+    if not isinstance(data, dict):
+      raise RuntimeError(f"Gemini JSON output is not an object: {type(data)}")
+    return data
 
   def embed_text(self, *, model: str, text: str) -> List[float]:
     model_id = self.normalize_model_name(model)
