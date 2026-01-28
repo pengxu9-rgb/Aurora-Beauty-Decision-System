@@ -229,7 +229,10 @@ def normalize_embedding_dim(embedding: List[float], *, dim: int) -> List[float]:
   if len(embedding) < dim:
     # Zero-padding keeps cosine similarity identical in the original subspace.
     return embedding + [0.0] * (dim - len(embedding))
-  raise ValueError(f"Embedding dim too large: got {len(embedding)}, expected <= {dim}")
+  # Truncate to fit the DB column (vector(dim)). This is an MVP trade-off.
+  # If you want full fidelity, migrate the DB column to vector(len(embedding)).
+  print(f"⚠️ Embedding dim {len(embedding)} > {dim}; truncating to {dim}.")
+  return embedding[:dim]
 
 
 def get_vectors_from_llm(client: GeminiClient, *, model: str, brand: str, name: str, ingredients: str) -> Dict[str, Any]:

@@ -81,4 +81,4 @@ python3 worker/ingest.py \
 ## 5) 注意
 
 - LLM 输出的功效分数是 **0-100**，目前 Aurora 前端引擎使用的是 **0-1**；后续做 DB→API 映射时会做归一化。
-- `embedding` 是 `vector(1536)`；Gemini embedding 维度如果不是 1536，会自动 **补 0** 到 1536（不影响 cosine 相似度）。
+- `embedding` 列是 `vector(1536)`：如果 Gemini embedding 返回 3072 维，脚本会 **截断到 1536** 以便写入数据库（MVP 权衡）。
