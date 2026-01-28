@@ -3,7 +3,7 @@
 这个目录用于 **离线 ETL / 向量化提取**：
 
 - 输入：Excel/CSV（SKU 维度的成分表）
-- 处理：调用 OpenAI（LLM 做功效/风险向量，Embedding 做相似度向量）
+- 处理：调用 Google Gemini（LLM 做功效/风险向量，Embedding 做相似度向量）
 - 输出：写入 Railway Postgres（含 pgvector）
 
 ## 1) 安装依赖
@@ -22,13 +22,13 @@ pip install -r worker/requirements.txt
 需要两个：
 
 - `DATABASE_URL`：Railway Postgres 连接串
-- `OPENAI_API_KEY`：OpenAI Key
+- `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）：Google Gemini API Key
 
 你可以放在 `client/.env`（本项目已忽略 `.env`，不会提交到 git）：
 
 ```bash
 DATABASE_URL='postgresql://...'
-OPENAI_API_KEY='sk-...'
+GEMINI_API_KEY='...'
 ```
 
 ## 3) Demo 跑通（写入 3 个产品）
@@ -66,5 +66,4 @@ python3 worker/ingest.py \
 ## 5) 注意
 
 - LLM 输出的功效分数是 **0-100**，目前 Aurora 前端引擎使用的是 **0-1**；后续做 DB→API 映射时会做归一化。
-- `embedding` 是 `vector(1536)`，默认使用 `text-embedding-3-small`（1536 维）。
-
+- `embedding` 是 `vector(1536)`；Gemini embedding 维度如果不是 1536，会自动 **补 0** 到 1536（不影响 cosine 相似度）。

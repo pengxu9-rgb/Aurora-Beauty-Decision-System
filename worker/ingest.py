@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import psycopg2
+import requests
 from dotenv import load_dotenv
-from openai import OpenAI
 from psycopg2.extras import Json
 from openpyxl import load_workbook
 
@@ -44,6 +44,9 @@ Output Format (JSON):
 }
 """.strip()
 
+DEFAULT_GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_EMBEDDING_DIM = 1536
+
 
 @dataclass(frozen=True)
 class InputSku:
@@ -63,6 +66,14 @@ def _require_env(name: str) -> str:
   return value
 
 
+def _require_any_env(names: List[str]) -> str:
+  for name in names:
+    value = (os.getenv(name) or "").strip()
+    if value:
+      return value
+  raise RuntimeError(f"Missing required env var (one of): {', '.join(names)}")
+
+
 def _retry(fn, *, tries: int = 3, base_sleep_s: float = 1.0):
   last_err: Optional[BaseException] = None
   for i in range(tries):
@@ -76,22 +87,87 @@ def _retry(fn, *, tries: int = 3, base_sleep_s: float = 1.0):
   raise last_err
 
 
-def get_vectors_from_llm(client: OpenAI, *, model: str, brand: str, name: str, ingredients: str) -> Dict[str, Any]:
+def _extract_json_object(text: str) -> Dict[str, Any]:
+  try:
+    return json.loads(text)
+  except Exception:  # noqa: BLE001
+    # Best-effort: trim code fences / surrounding commentary.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+      return json.loads(text[start : end + 1])
+    raise
+
+
+def _get_first_candidate_text(payload: Dict[str, Any]) -> str:
+  candidates = payload.get("candidates") or []
+  if not candidates:
+    raise RuntimeError(f"Gemini response missing candidates: {payload}")
+  content = (candidates[0] or {}).get("content") or {}
+  parts = content.get("parts") or []
+  if not parts:
+    raise RuntimeError(f"Gemini response missing content parts: {payload}")
+  text = (parts[0] or {}).get("text")
+  if not isinstance(text, str) or not text.strip():
+    raise RuntimeError(f"Gemini response missing text: {payload}")
+  return text
+
+
+class GeminiClient:
+  def __init__(self, *, api_key: str, api_base_url: str):
+    self._api_key = api_key
+    self._api_base_url = api_base_url.rstrip("/")
+    self._session = requests.Session()
+    self._session.headers.update({"Content-Type": "application/json"})
+
+  def generate_json(self, *, model: str, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+    url = f"{self._api_base_url}/models/{model}:generateContent"
+    body = {
+      "systemInstruction": {"parts": [{"text": system_prompt}]},
+      "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+      "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 800},
+    }
+
+    def _call():
+      resp = self._session.post(url, params={"key": self._api_key}, json=body, timeout=60)
+      if resp.status_code >= 400:
+        raise RuntimeError(f"Gemini generateContent failed ({resp.status_code}): {resp.text[:500]}")
+      return resp.json()
+
+    payload = _retry(_call, tries=3, base_sleep_s=1.0)
+    text = _get_first_candidate_text(payload)
+    return _extract_json_object(text)
+
+  def embed_text(self, *, model: str, text: str) -> List[float]:
+    url = f"{self._api_base_url}/models/{model}:embedContent"
+    body = {"content": {"parts": [{"text": text}]}}
+
+    def _call():
+      resp = self._session.post(url, params={"key": self._api_key}, json=body, timeout=60)
+      if resp.status_code >= 400:
+        raise RuntimeError(f"Gemini embedContent failed ({resp.status_code}): {resp.text[:500]}")
+      return resp.json()
+
+    payload = _retry(_call, tries=3, base_sleep_s=1.0)
+    embedding = (payload.get("embedding") or {}).get("values")
+    if not isinstance(embedding, list) or not embedding:
+      raise RuntimeError(f"Gemini embedding missing values: {payload}")
+    return [float(x) for x in embedding]
+
+
+def normalize_embedding_dim(embedding: List[float], *, dim: int) -> List[float]:
+  if len(embedding) == dim:
+    return embedding
+  if len(embedding) < dim:
+    # Zero-padding keeps cosine similarity identical in the original subspace.
+    return embedding + [0.0] * (dim - len(embedding))
+  raise ValueError(f"Embedding dim too large: got {len(embedding)}, expected <= {dim}")
+
+
+def get_vectors_from_llm(client: GeminiClient, *, model: str, brand: str, name: str, ingredients: str) -> Dict[str, Any]:
   prompt = f"Product: {brand} {name}\nIngredients: {ingredients}"
 
-  def _call():
-    return client.chat.completions.create(
-      model=model,
-      messages=[
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-      ],
-      response_format={"type": "json_object"},
-    )
-
-  response = _retry(_call, tries=3, base_sleep_s=1.0)
-  raw = response.choices[0].message.content or "{}"
-  data = json.loads(raw)
+  data = client.generate_json(model=model, system_prompt=SYSTEM_PROMPT, user_prompt=prompt)
 
   mechanism = data.get("mechanism") or {}
   risk_flags = data.get("risk_flags") or []
@@ -128,18 +204,9 @@ def get_vectors_from_llm(client: OpenAI, *, model: str, brand: str, name: str, i
   return normalized
 
 
-def get_embedding(client: OpenAI, *, model: str, text: str) -> List[float]:
-  def _call():
-    return client.embeddings.create(input=text, model=model)
-
-  response = _retry(_call, tries=3, base_sleep_s=1.0)
-  embedding = response.data[0].embedding
-  if not isinstance(embedding, list) or not embedding:
-    raise ValueError("Embedding response invalid")
-  floats = [float(x) for x in embedding]
-  if len(floats) != 1536:
-    raise ValueError(f"Expected embedding dim=1536, got dim={len(floats)} (model={model})")
-  return floats
+def get_embedding(client: GeminiClient, *, model: str, text: str) -> List[float]:
+  floats = client.embed_text(model=model, text=text)
+  return normalize_embedding_dim(floats, dim=DEFAULT_EMBEDDING_DIM)
 
 
 def embedding_to_vector_literal(embedding: List[float]) -> str:
@@ -373,7 +440,7 @@ def demo_skus() -> List[InputSku]:
 def ingest_one(
   *,
   db: AuroraDb,
-  client: OpenAI,
+  client: GeminiClient,
   llm_model: str,
   embedding_model: str,
   sku: InputSku,
@@ -424,7 +491,7 @@ def ingest_one(
 
 
 def main() -> None:
-  parser = argparse.ArgumentParser(description="Aurora vectorization + embedding ETL (Excel → OpenAI → Railway Postgres)")
+  parser = argparse.ArgumentParser(description="Aurora vectorization + embedding ETL (Excel → Gemini → Railway Postgres)")
   parser.add_argument("--demo", action="store_true", help="Ingest 3 demo products (Tom Ford / The Ordinary / HR).")
   parser.add_argument("--input", type=str, help="Path to Excel (.xlsx) file.")
   parser.add_argument("--sheet", type=str, default=None, help="Excel sheet name (default: active sheet).")
@@ -439,22 +506,23 @@ def main() -> None:
   parser.add_argument("--col-product-url", type=str, default=None)
   parser.add_argument("--col-image-url", type=str, default=None)
 
-  parser.add_argument("--llm-model", type=str, default="gpt-4o")
-  parser.add_argument("--embedding-model", type=str, default="text-embedding-3-small")
+  parser.add_argument("--llm-model", type=str, default="gemini-1.5-flash")
+  parser.add_argument("--embedding-model", type=str, default="text-embedding-004")
   parser.add_argument("--no-embedding", action="store_true")
   parser.add_argument("--overwrite", action="store_true", help="Overwrite existing rows by (brand,name).")
-  parser.add_argument("--dry-run", action="store_true", help="Call OpenAI but do not write to DB.")
+  parser.add_argument("--dry-run", action="store_true", help="Call Gemini but do not write to DB.")
 
   args = parser.parse_args()
 
   load_dotenv()
   database_url = _require_env("DATABASE_URL")
-  api_key = _require_env("OPENAI_API_KEY")
+  api_key = _require_any_env(["GEMINI_API_KEY", "GOOGLE_API_KEY"])
+  api_base_url = (os.getenv("GEMINI_API_BASE_URL") or DEFAULT_GEMINI_API_BASE_URL).strip()
 
   if not args.demo and not args.input:
     raise SystemExit("Provide --demo or --input /path/to.xlsx")
 
-  openai_client = OpenAI(api_key=api_key)
+  gemini_client = GeminiClient(api_key=api_key, api_base_url=api_base_url)
 
   if args.demo:
     skus = demo_skus()
@@ -481,7 +549,7 @@ def main() -> None:
     for sku in skus:
       ingest_one(
         db=db,
-        client=openai_client,
+        client=gemini_client,
         llm_model=args.llm_model,
         embedding_model=args.embedding_model,
         sku=sku,

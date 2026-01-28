@@ -21,3 +21,8 @@ pnpm-debug.log*
 .env.production.local
 
 /lib/generated/prisma
+
+# Python worker venv/cache
+.venv-worker
+.venv*
+__pycache__/
