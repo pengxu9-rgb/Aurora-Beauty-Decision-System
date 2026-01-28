@@ -39,12 +39,12 @@ export async function POST(req: Request) {
     return withCors(NextResponse.json({ error: "`anchor_sku_id` and `user` are required" }, { status: 400 }));
   }
 
-  const anchor = getSkuById(body.anchor_sku_id);
+  const anchor = await getSkuById(body.anchor_sku_id);
   if (!anchor) return withCors(NextResponse.json({ error: "Anchor SKU not found" }, { status: 404 }));
 
   const anchor_score = calculateScore(anchor, body.user);
 
-  const db = filterDupeDatabase(anchor, getSkuDatabase());
+  const db = filterDupeDatabase(anchor, await getSkuDatabase());
   const dupeLimit = typeof body.dupe_limit === "number" && body.dupe_limit > 0 ? Math.min(20, body.dupe_limit) : 6;
   const dupes = findDupes(anchor, db, dupeLimit);
 

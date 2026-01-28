@@ -31,10 +31,10 @@ export async function POST(req: Request) {
     return withCors(NextResponse.json({ error: "`anchor_sku_id` is required" }, { status: 400 }));
   }
 
-  const anchor = getSkuById(body.anchor_sku_id);
+  const anchor = await getSkuById(body.anchor_sku_id);
   if (!anchor) return withCors(NextResponse.json({ error: "Anchor SKU not found" }, { status: 404 }));
 
-  const db = filterDupeDatabase(anchor, getSkuDatabase());
+  const db = filterDupeDatabase(anchor, await getSkuDatabase());
   const limit = typeof body.limit === "number" && body.limit > 0 ? Math.min(20, body.limit) : 6;
   const dupes = findDupes(anchor, db, limit);
 

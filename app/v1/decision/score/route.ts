@@ -23,7 +23,7 @@ export async function POST(req: Request) {
     return withCors(NextResponse.json({ error: "`sku_id` and `user` are required" }, { status: 400 }));
   }
 
-  const sku = getSkuById(body.sku_id);
+  const sku = await getSkuById(body.sku_id);
   if (!sku) return withCors(NextResponse.json({ error: "SKU not found" }, { status: 404 }));
 
   const score = calculateScore(sku, body.user);
