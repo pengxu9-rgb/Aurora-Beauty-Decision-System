@@ -174,9 +174,13 @@ async function geminiGenerateContent(input: {
 
   const url = `${apiBaseUrl}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
+  // NOTE:
+  // Some Gemini REST variants reject `systemInstruction` (400: Unknown name "systemInstruction").
+  // To maximize compatibility, we inline the system prompt into the user prompt.
+  const combinedPrompt = `${input.system_prompt}\n\nContext:\n${input.user_prompt}`;
+
   const body = {
-    systemInstruction: { parts: [{ text: input.system_prompt }] },
-    contents: [{ role: "user", parts: [{ text: input.user_prompt }] }],
+    contents: [{ role: "user", parts: [{ text: combinedPrompt }] }],
     generationConfig: { temperature, maxOutputTokens: 1024 },
   };
 
