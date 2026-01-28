@@ -121,7 +121,7 @@ function inferCategory(name: string): SkuCategory {
   if (n.includes("cleanser") || n.includes("facial wash") || n.includes("face wash") || n.includes("foaming")) return "cleanser";
   if (n.includes("toner") || n.includes("essence") || (n.includes("lotion") && !n.includes("cream"))) return "toner";
   if (n.includes("spf") || n.includes("sunscreen") || n.includes("uv")) return "sunscreen";
-  if (n.includes("cream") || n.includes("moistur") || n.includes("baume") || n.includes("balm")) return "moisturizer";
+  if (n.includes("cream") || n.includes("creme") || n.includes("crème") || n.includes("moistur") || n.includes("baume") || n.includes("balm")) return "moisturizer";
   if (n.includes("treatment") || n.includes("retinol") || n.includes("adapalene") || n.includes("acid")) return "treatment";
   if (n.includes("serum") || n.includes("ampoule")) return "serum";
 

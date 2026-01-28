@@ -41,10 +41,34 @@ function detectSensitiveSkin(query: string) {
     q.includes("sensitive") ||
     q.includes("irritat") ||
     q.includes("redness") ||
+    q.includes("stinging") ||
+    q.includes("burning") ||
     query.includes("敏感") ||
     query.includes("泛红") ||
     query.includes("刺痛") ||
+    query.includes("疼") ||
+    query.includes("痛") ||
     query.includes("红血丝")
+  );
+}
+
+function detectBarrierImpaired(query: string) {
+  const q = query.toLowerCase();
+  return (
+    q.includes("barrier") ||
+    q.includes("broken barrier") ||
+    q.includes("compromised") ||
+    q.includes("peeling") ||
+    q.includes("burning") ||
+    q.includes("stinging") ||
+    query.includes("屏障") ||
+    query.includes("受损") ||
+    query.includes("烂脸") ||
+    query.includes("爆皮") ||
+    query.includes("疼") ||
+    query.includes("痛") ||
+    query.includes("刺痛") ||
+    query.includes("火辣")
   );
 }
 
@@ -95,7 +119,7 @@ async function findAnchorProductId(query: string): Promise<string | null> {
     return product?.id ?? null;
   }
 
-  // Fallback: try a loose match on product name (use a short token to keep it practical).
+  // Fallback: try a loose match on product name OR brand.
   const tokens = query
     .split(/[\s,，。.!?？、/]+/g)
     .map((t) => t.trim())
@@ -104,7 +128,12 @@ async function findAnchorProductId(query: string): Promise<string | null> {
 
   for (const token of tokens) {
     const product = await prisma.product.findFirst({
-      where: { name: { contains: token, mode: "insensitive" } },
+      where: {
+        OR: [
+          { name: { contains: token, mode: "insensitive" } },
+          { brand: { contains: token, mode: "insensitive" } },
+        ],
+      },
       orderBy: { updatedAt: "desc" },
       select: { id: true },
     });
@@ -252,19 +281,29 @@ export async function POST(req: Request) {
   }
 
   const sensitive = detectSensitiveSkin(query);
+  const barrierImpaired = detectBarrierImpaired(query);
   const anchorRisk = mapRiskFlags(anchor.vectors.riskFlags);
+  const anchorBurnRate = Math.max(0, Math.min(1, coerceNumber(anchor.socialStats?.burnRate ?? 0)));
+  const anchorVetoed = barrierImpaired && (anchorRisk.includes("high_irritation") || anchorBurnRate > 0.1);
 
   const similar = await findSimilarProductsByAnchorProductId(anchorProductId, { limit, cheaper_than_anchor: true });
-  const candidates = sensitive ? similar.filter((c) => !c.sku.risk_flags.includes("alcohol")) : similar;
+  let candidates = similar;
+  if (sensitive) candidates = candidates.filter((c) => !c.sku.risk_flags.includes("alcohol"));
+  if (barrierImpaired) {
+    candidates = candidates.filter(
+      (c) => !c.sku.risk_flags.includes("high_irritation") && (c.sku.social_stats.burn_rate ?? 0) <= 0.1,
+    );
+  }
 
   const context = {
     user_query: query,
-    detected: { sensitive_skin: sensitive },
+    detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
     anchor: {
       id: anchor.id,
       brand: anchor.brand,
       name: anchor.name,
       price_usd: coerceNumber(anchor.priceUsd),
+      vetoed: anchorVetoed,
       risk_flags: anchor.vectors.riskFlags ?? [],
       risk_flags_canonical: anchorRisk,
       mechanism: anchor.vectors.mechanism,
@@ -273,7 +312,7 @@ export async function POST(req: Request) {
         ? {
             red_score: anchor.socialStats.redScore,
             reddit_score: anchor.socialStats.redditScore,
-            burn_rate: anchor.socialStats.burnRate,
+            burn_rate: coerceNumber(anchor.socialStats.burnRate),
             top_keywords: anchor.socialStats.topKeywords ?? [],
           }
         : null,
@@ -308,6 +347,7 @@ Base your answer STRICTLY on the provided "Context Data" (database results). Do 
 Rules:
 - If recommending a Dupe, explicitly state the trade-off based on the "experience" vector (e.g., "Texture is stickier").
 - If the user has sensitive skin (Context Data detected.sensitive_skin=true) and a product has an alcohol risk flag (risk_flags contains alcohol/high_alcohol/alcohol_high), VETO it (do not recommend it).
+- If the user has an impaired barrier (Context Data detected.barrier_impaired=true) and a product has high irritation signals (risk_flags includes high_irritation OR burn_rate > 0.10), VETO it (do not recommend it).
 - Be concise, actionable, and use bullet points when helpful.
 `.trim();
 

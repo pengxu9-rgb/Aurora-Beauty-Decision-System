@@ -101,6 +101,30 @@
       "name": "The Concentrate",
       "price_usd": 400,
       "ingredients_text": "Cyclopentasiloxane, Algae Extract, Glycerin, Dimethicone, Tocopherol"
+    },
+    {
+      "brand": "La Mer",
+      "name": "Crème de la Mer",
+      "price_usd": 390,
+      "ingredients_text": "Mineral Oil, Petrolatum, Glycerin, Lanolin Alcohol, Panthenol, Magnesium Sulfate, Algae Extract, Sesame Seed Oil, Lime Extract"
+    },
+    {
+      "brand": "Nivea",
+      "name": "Creme",
+      "price_usd": 12,
+      "ingredients_text": "Water, Mineral Oil, Petrolatum, Glycerin, Lanolin Alcohol, Panthenol, Decyl Oleate, Magnesium Sulfate, Fragrance"
+    },
+    {
+      "brand": "First Aid Beauty",
+      "name": "Ultra Repair Cream",
+      "price_usd": 36,
+      "ingredients_text": "Water, Colloidal Oatmeal, Shea Butter, Glycerin, Ceramide 3, Allantoin, Licorice Root Extract"
+    },
+    {
+      "brand": "Murad",
+      "name": "Retinol Youth Renewal Serum",
+      "price_usd": 95,
+      "ingredients_text": "Water, Alcohol Denat, Retinol, Glycolic Acid, Dimethicone, Glycerin, Tocopherol"
     }
   ]
 }

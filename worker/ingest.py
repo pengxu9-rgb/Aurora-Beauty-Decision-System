@@ -51,6 +51,26 @@ Output Format (JSON):
 }
 """.strip()
 
+SOCIAL_PROMPT = """
+You are a Beauty Trend Analyst. Based on your internal training data (internet discussions from Reddit/SkincareAddiction, XiaoHongShu/RED, TikTok), estimate the social sentiment for this product.
+
+Product: {brand} - {name}
+
+Rules for Estimation:
+1) RED Score (0-100): High if popular in Asia, whitening/texture focused. Penalty for "Fake Slip" (假滑).
+2) Reddit Score (0-100): High if ingredient-focused, fragrance-free, matte finish.
+3) Burn Rate (0.0 - 1.0): Estimate probability of irritation complaints (e.g., 0.15 for high acid/retinol, 0.01 for gentle cleansers). Use >0.30 only for extremely irritating formulas.
+4) Keywords: Extract 3-5 typical user tags (e.g., "HolyGrail", "Stings", "Pilling").
+
+Output JSON:
+{
+  "redScore": int,
+  "redditScore": int,
+  "burnRate": float,
+  "topKeywords": [str]
+}
+""".strip()
+
 DEFAULT_GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_EMBEDDING_DIM = 1536
 ENV_TEMPLATE_RE = re.compile(r"\$\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
@@ -257,6 +277,94 @@ def normalize_embedding_dim(embedding: List[float], *, dim: int) -> List[float]:
   return embedding[:dim]
 
 
+def _clamp_int(value: Any, *, min_value: int, max_value: int) -> int:
+  try:
+    n = int(float(value))
+  except Exception:  # noqa: BLE001
+    n = min_value
+  if n < min_value:
+    return min_value
+  if n > max_value:
+    return max_value
+  return n
+
+
+def _clamp_float(value: Any, *, min_value: float, max_value: float) -> float:
+  try:
+    n = float(value)
+  except Exception:  # noqa: BLE001
+    n = min_value
+  if n < min_value:
+    return min_value
+  if n > max_value:
+    return max_value
+  return n
+
+
+def _coerce_keywords(value: Any) -> List[str]:
+  if isinstance(value, list):
+    out = [str(x).strip() for x in value if str(x).strip()]
+    return out[:8]
+  if isinstance(value, str) and value.strip():
+    # Allow comma-separated strings.
+    parts = [p.strip() for p in value.split(",")]
+    return [p for p in parts if p][:8]
+  return []
+
+
+def get_social_simulation_openai(
+  *,
+  brand: str,
+  name: str,
+  ingredients_text: Optional[str],
+  api_key: str,
+  model: str,
+  api_base_url: str,
+) -> Dict[str, Any]:
+  url = api_base_url.rstrip("/") + "/chat/completions"
+
+  system_prompt = SOCIAL_PROMPT.format(brand=brand, name=name)
+  user_prompt = f"Product: {brand} - {name}\n"
+  if ingredients_text:
+    user_prompt += f"Ingredients: {ingredients_text}\n"
+
+  body = {
+    "model": model,
+    "temperature": 0.2,
+    "response_format": {"type": "json_object"},
+    "messages": [
+      {"role": "system", "content": system_prompt},
+      {"role": "user", "content": user_prompt},
+    ],
+  }
+
+  headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+  def _call():
+    resp = requests.post(url, headers=headers, json=body, timeout=60)
+    if resp.status_code >= 400:
+      raise RuntimeError(f"OpenAI chat.completions failed ({resp.status_code}): {resp.text[:500]}")
+    payload = resp.json()
+    content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+      raise RuntimeError(f"OpenAI response missing content: {payload}")
+    data = _extract_json_object(content)
+    if not isinstance(data, dict):
+      raise RuntimeError("OpenAI social simulation output is not an object")
+    return data
+
+  raw = _retry(_call, tries=3, base_sleep_s=1.0)
+
+  # Normalize to internal schema expected by DB insert (snake_case), keep both keys for debugging if needed.
+  return {
+    "red_score": _clamp_int(raw.get("redScore"), min_value=0, max_value=100),
+    "reddit_score": _clamp_int(raw.get("redditScore"), min_value=0, max_value=100),
+    "burn_rate": _clamp_float(raw.get("burnRate"), min_value=0.0, max_value=1.0),
+    "top_keywords": _coerce_keywords(raw.get("topKeywords")),
+    "_raw": raw,
+  }
+
+
 def get_vectors_from_llm(client: GeminiClient, *, model: str, brand: str, name: str, ingredients: str) -> Dict[str, Any]:
   prompt = f"Product: {brand} {name}\nIngredients: {ingredients}"
 
@@ -382,6 +490,44 @@ class AuroraDb:
   def delete_product(self, product_id: str) -> None:
     with self.conn.cursor() as cur:
       cur.execute('DELETE FROM "products" WHERE id = %s;', (product_id,))
+
+  def upsert_product(self, sku: InputSku, *, product_id: str) -> None:
+    with self.conn.cursor() as cur:
+      cur.execute(
+        """
+        INSERT INTO "products" (id, brand, name, price_usd, price_cny, product_url, image_url, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ON CONFLICT (id) DO UPDATE SET
+          brand = EXCLUDED.brand,
+          name = EXCLUDED.name,
+          price_usd = EXCLUDED.price_usd,
+          price_cny = EXCLUDED.price_cny,
+          product_url = EXCLUDED.product_url,
+          image_url = EXCLUDED.image_url,
+          updated_at = NOW();
+        """,
+        (
+          product_id,
+          sku.brand,
+          sku.name,
+          sku.price_usd,
+          sku.price_cny,
+          sku.product_url,
+          sku.image_url,
+        ),
+      )
+
+  def delete_vectors_for_product(self, product_id: str) -> None:
+    with self.conn.cursor() as cur:
+      cur.execute('DELETE FROM "sku_vectors" WHERE product_id = %s;', (product_id,))
+
+  def delete_ingredients_for_product(self, product_id: str) -> None:
+    with self.conn.cursor() as cur:
+      cur.execute('DELETE FROM "ingredients" WHERE product_id = %s;', (product_id,))
+
+  def delete_social_stats_for_product(self, product_id: str) -> None:
+    with self.conn.cursor() as cur:
+      cur.execute('DELETE FROM "social_stats" WHERE product_id = %s;', (product_id,))
 
   def insert_product(self, sku: InputSku, *, product_id: str) -> None:
     with self.conn.cursor() as cur:
@@ -654,6 +800,10 @@ def ingest_one(
   client: GeminiClient,
   llm_model: str,
   embedding_model: str,
+  social_provider: str,
+  social_model: str,
+  openai_api_key: Optional[str],
+  openai_api_base_url: str,
   sku: InputSku,
   overwrite: bool,
   enable_embedding: bool,
@@ -666,26 +816,62 @@ def ingest_one(
   if enable_embedding:
     embedding = get_embedding(client, model=embedding_model, text=sku.ingredients_text)
 
+  social_payload: Dict[str, Any] = {}
+  if social_provider == "openai":
+    if not openai_api_key:
+      raise RuntimeError("OPENAI_API_KEY is required when --social-provider=openai")
+    print(f"   ...Simulating social stats for {sku.name}")
+    social_payload = get_social_simulation_openai(
+      brand=sku.brand,
+      name=sku.name,
+      ingredients_text=(sku.ingredients_text[:2000] if sku.ingredients_text else None),
+      api_key=openai_api_key,
+      model=social_model,
+      api_base_url=openai_api_base_url,
+    )
+  elif social_provider == "llm":
+    ss = vectors.get("social_stats") or {}
+    if isinstance(ss, dict):
+      social_payload = {
+        "red_score": _clamp_int(ss.get("red_score") or ss.get("redScore"), min_value=0, max_value=100),
+        "reddit_score": _clamp_int(ss.get("reddit_score") or ss.get("redditScore"), min_value=0, max_value=100),
+        "burn_rate": _clamp_float(ss.get("burn_rate") or ss.get("burnRate"), min_value=0.0, max_value=1.0),
+        "top_keywords": _coerce_keywords(ss.get("top_keywords") or ss.get("topKeywords")),
+        "_raw": ss,
+      }
+  elif social_provider == "none":
+    social_payload = {"red_score": 0, "reddit_score": 0, "burn_rate": 0.0, "top_keywords": []}
+
   if dry_run:
-    print(json.dumps({"product": {"brand": sku.brand, "name": sku.name}, "vectors": vectors}, ensure_ascii=False))
+    print(
+      json.dumps(
+        {"product": {"brand": sku.brand, "name": sku.name}, "vectors": vectors, "social": social_payload},
+        ensure_ascii=False,
+      )
+    )
     return
 
   existing_id = db.find_product_id(brand=sku.brand, name=sku.name)
-  if existing_id and overwrite:
-    db.delete_product(existing_id)
-    db.conn.commit()
-
   if existing_id and not overwrite:
     print(f"↩️  Skipped (exists): {sku.brand} - {sku.name}")
     return
 
-  product_id = str(uuid.uuid4())
+  if existing_id and overwrite:
+    product_id = existing_id
+    # Keep product_id stable; replace dependent tables.
+    db.upsert_product(sku, product_id=product_id)
+    db.delete_vectors_for_product(product_id)
+    db.delete_ingredients_for_product(product_id)
+    db.delete_social_stats_for_product(product_id)
+  else:
+    product_id = str(uuid.uuid4())
   vector_id = str(uuid.uuid4())
   ingredient_id = str(uuid.uuid4())
   social_id = str(uuid.uuid4())
 
   try:
-    db.insert_product(sku, product_id=product_id)
+    if not existing_id:
+      db.insert_product(sku, product_id=product_id)
     db.insert_vectors(
       product_id=product_id,
       vector_id=vector_id,
@@ -695,14 +881,13 @@ def ingest_one(
       embedding=embedding,
     )
     db.insert_ingredients(product_id=product_id, ingredient_id=ingredient_id, full_list=parse_ingredients_list(sku.ingredients_text))
-    ss = vectors.get("social_stats") or {}
     db.insert_social_stats(
       product_id=product_id,
       social_id=social_id,
-      red_score=int(ss.get("red_score", 0)),
-      reddit_score=int(ss.get("reddit_score", 0)),
-      burn_rate=float(ss.get("burn_rate", 0.0)),
-      top_keywords=list(ss.get("top_keywords", []) if isinstance(ss.get("top_keywords", []), list) else []),
+      red_score=int(social_payload.get("red_score", 0)),
+      reddit_score=int(social_payload.get("reddit_score", 0)),
+      burn_rate=float(social_payload.get("burn_rate", 0.0)),
+      top_keywords=list(social_payload.get("top_keywords", []) if isinstance(social_payload.get("top_keywords", []), list) else []),
     )
     db.conn.commit()
     print(f"✅ Ingested: {sku.brand} - {sku.name}")
@@ -731,6 +916,13 @@ def main() -> None:
 
   parser.add_argument("--llm-model", type=str, default="gemini-2.5-flash")
   parser.add_argument("--embedding-model", type=str, default="gemini-embedding-001")
+  parser.add_argument(
+    "--social-provider",
+    type=str,
+    default=None,
+    help="Social stats source: openai|llm|none (default: openai if OPENAI_API_KEY set, else llm).",
+  )
+  parser.add_argument("--social-model", type=str, default="gpt-4o", help="OpenAI model for social simulation (default: gpt-4o).")
   parser.add_argument("--no-embedding", action="store_true")
   parser.add_argument("--overwrite", action="store_true", help="Overwrite existing rows by (brand,name).")
   parser.add_argument("--dry-run", action="store_true", help="Call Gemini but do not write to DB.")
@@ -741,6 +933,14 @@ def main() -> None:
   database_url = resolve_env_templates(_require_env("DATABASE_URL"))
   api_key = _require_any_env(["GEMINI_API_KEY", "GOOGLE_API_KEY"])
   api_base_url = (os.getenv("GEMINI_API_BASE_URL") or DEFAULT_GEMINI_API_BASE_URL).strip()
+  openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+  openai_api_base_url = (os.getenv("OPENAI_API_BASE_URL") or "https://api.openai.com/v1").strip()
+
+  social_provider = (args.social_provider or "").strip().lower() or ("openai" if openai_api_key else "llm")
+  if social_provider not in ("openai", "llm", "none"):
+    raise SystemExit("--social-provider must be one of: openai|llm|none")
+  if social_provider == "openai" and not openai_api_key:
+    raise RuntimeError("OPENAI_API_KEY is required when --social-provider=openai (or when OPENAI_API_KEY is set default to openai).")
 
   gemini_client = GeminiClient(api_key=api_key, api_base_url=api_base_url)
 
@@ -787,6 +987,10 @@ def main() -> None:
         client=gemini_client,
         llm_model=args.llm_model,
         embedding_model=args.embedding_model,
+        social_provider=social_provider,
+        social_model=args.social_model,
+        openai_api_key=openai_api_key if social_provider == "openai" else None,
+        openai_api_base_url=openai_api_base_url,
         sku=sku,
         overwrite=bool(args.overwrite),
         enable_embedding=not bool(args.no_embedding),

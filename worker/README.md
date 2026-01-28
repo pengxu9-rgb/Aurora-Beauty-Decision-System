@@ -19,16 +19,21 @@ pip install -r worker/requirements.txt
 
 ## 2) 环境变量
 
-需要两个：
+基础需要两个：
 
 - `DATABASE_URL`：Railway Postgres 连接串
 - `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）：Google Gemini API Key
+
+为了解决 **Social(60%) 冷启动**（没有爬虫时），可选再加一个：
+
+- `OPENAI_API_KEY`：用于调用 `gpt-4o` 做“舆情模拟”（写入 `social_stats` 表）
 
 你可以放在 `client/.env`（本项目已忽略 `.env`，不会提交到 git）：
 
 ```bash
 DATABASE_URL='postgresql://...'
 GEMINI_API_KEY='...'
+OPENAI_API_KEY='...'
 ```
 
 ⚠️ 注意：如果你从 Railway 复制到的是这种模板（包含 `\${{RAILWAY_TCP_PROXY_PORT}}` 之类），它只会在 Railway 运行环境里被替换，
@@ -45,6 +50,17 @@ python3 worker/ingest.py --demo --overwrite
 
 默认 LLM 模型是 `gemini-2.5-flash`（可用 `--llm-model` 覆盖）。
 默认 embedding 模型是 `gemini-embedding-001`（可用 `--embedding-model` 覆盖）。
+
+默认会优先用 OpenAI 做 Social 模拟（如果检测到 `OPENAI_API_KEY`）；否则退回用 Gemini 在同一个 JSON 里生成占位 social_stats。
+你也可以显式指定：
+
+```bash
+# 强制用 OpenAI 做 Social（推荐）
+python3 worker/ingest.py --demo --overwrite --social-provider openai --social-model gpt-4o
+
+# 只用 Gemini 生成 social_stats（不调用 OpenAI）
+python3 worker/ingest.py --demo --overwrite --social-provider llm
+```
 
 如果你遇到 `model not found`，先列出你这个 key 可用的模型：
 
