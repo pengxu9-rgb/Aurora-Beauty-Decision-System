@@ -541,7 +541,7 @@ def main() -> None:
   parser.add_argument("--col-product-url", type=str, default=None)
   parser.add_argument("--col-image-url", type=str, default=None)
 
-  parser.add_argument("--llm-model", type=str, default="gemini-1.5-flash")
+  parser.add_argument("--llm-model", type=str, default="gemini-2.5-flash-preview")
   parser.add_argument("--embedding-model", type=str, default="text-embedding-004")
   parser.add_argument("--no-embedding", action="store_true")
   parser.add_argument("--overwrite", action="store_true", help="Overwrite existing rows by (brand,name).")
