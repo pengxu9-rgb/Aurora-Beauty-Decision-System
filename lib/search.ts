@@ -34,15 +34,33 @@ type SimilarRow = {
 
 const DEFAULT_LIMIT = 8;
 
-const CATEGORY_OVERRIDES: Array<{
+const PRODUCT_OVERRIDES: Array<{
+  sku_id: string;
   brand: string;
   name: string;
   category: SkuCategory;
   actives?: string[];
 }> = [
-  { brand: "Tom Ford", name: "Research Serum Concentrate", category: "serum", actives: ["Vitamin C"] },
-  { brand: "The Ordinary", name: "Buffet + Copper Peptides 1%", category: "treatment", actives: ["Copper Peptides"] },
-  { brand: "Helena Rubinstein", name: "Re-Plasty Age Recovery Night Cream (Black Bandage)", category: "moisturizer" },
+  {
+    sku_id: "tf_research_serum",
+    brand: "Tom Ford",
+    name: "Research Serum Concentrate",
+    category: "serum",
+    actives: ["Vitamin C"],
+  },
+  {
+    sku_id: "to_copper_peptides",
+    brand: "The Ordinary",
+    name: "Buffet + Copper Peptides 1%",
+    category: "treatment",
+    actives: ["Copper Peptides"],
+  },
+  {
+    sku_id: "hr_black_bandage",
+    brand: "Helena Rubinstein",
+    name: "Re-Plasty Age Recovery Night Cream (Black Bandage)",
+    category: "moisturizer",
+  },
 ];
 
 function clamp01(value: number) {
@@ -131,7 +149,7 @@ function buildSocialStats(row: SimilarRow): SocialStats {
 }
 
 function categoryOverride(brand: string, name: string) {
-  return CATEGORY_OVERRIDES.find((o) => o.brand === brand && o.name === name) ?? null;
+  return PRODUCT_OVERRIDES.find((o) => o.brand === brand && o.name === name) ?? null;
 }
 
 function toSkuVector(row: SimilarRow): SkuVector {
@@ -151,7 +169,7 @@ function toSkuVector(row: SimilarRow): SkuVector {
   const priceUsd = toNumber(row.price_usd ?? 0);
 
   return {
-    sku_id: row.product_id,
+    sku_id: override?.sku_id ?? row.product_id,
     name: row.name,
     brand: row.brand,
     category: override?.category ?? "serum",
@@ -322,4 +340,3 @@ export async function findSimilarProductsByEmbedding(embedding: number[], opts: 
     } satisfies SimilarSku;
   });
 }
-

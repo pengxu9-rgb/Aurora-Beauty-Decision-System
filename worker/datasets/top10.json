@@ -1,0 +1,95 @@
+{
+  "items": [
+    {
+      "brand": "CeraVe",
+      "name": "Foaming Facial Cleanser",
+      "price_usd": 15,
+      "ingredients_text": "Water, Cocamidopropyl Hydroxysultaine, Sodium Lauroyl Sarcosinate, Niacinamide, Ceramide NP, Ceramide AP, Ceramide EOP, Hyaluronic Acid, Cholesterol"
+    },
+    {
+      "brand": "CeraVe",
+      "name": "Hydrating Facial Cleanser",
+      "price_usd": 15,
+      "ingredients_text": "Water, Glycerin, Cetearyl Alcohol, Ceramide NP, Ceramide AP, Ceramide EOP, Hyaluronic Acid, Cholesterol, Fatty Acids"
+    },
+    {
+      "brand": "La Roche-Posay",
+      "name": "Cicaplast Baume B5",
+      "price_usd": 20,
+      "ingredients_text": "Water, Glycerin, Shea Butter, Panthenol, Madecassoside, Zinc Gluconate, Dimethicone"
+    },
+    {
+      "brand": "Paula's Choice",
+      "name": "Skin Perfecting 2% BHA Liquid Exfoliant",
+      "price_usd": 35,
+      "ingredients_text": "Water, Salicylic Acid (BHA), Methylpropanediol, Green Tea Extract, Panthenol"
+    },
+    {
+      "brand": "The Ordinary",
+      "name": "Niacinamide 10% + Zinc 1%",
+      "price_usd": 10,
+      "ingredients_text": "Water, Niacinamide, Zinc PCA, Glycerin, Dimethyl Isosorbide"
+    },
+    {
+      "brand": "The Ordinary",
+      "name": "Hyaluronic Acid 2% + B5",
+      "price_usd": 12,
+      "ingredients_text": "Water, Sodium Hyaluronate (Hyaluronic Acid), Panthenol (Vitamin B5), Glycerin"
+    },
+    {
+      "brand": "SkinCeuticals",
+      "name": "C E Ferulic",
+      "price_usd": 182,
+      "ingredients_text": "Water, L-Ascorbic Acid (Vitamin C), Tocopherol (Vitamin E), Ferulic Acid, Glycerin"
+    },
+    {
+      "brand": "COSRX",
+      "name": "Advanced Snail 96 Mucin Power Essence",
+      "price_usd": 18,
+      "ingredients_text": "Snail Secretion Filtrate, Butylene Glycol, Sodium Hyaluronate, Panthenol, Allantoin"
+    },
+    {
+      "brand": "Hada Labo",
+      "name": "Gokujyun Hyaluronic Acid Lotion",
+      "price_usd": 14,
+      "ingredients_text": "Water, Glycerin, Sodium Hyaluronate, Hydrolyzed Hyaluronic Acid"
+    },
+    {
+      "brand": "Differin",
+      "name": "Adapalene Gel 0.1%",
+      "price_usd": 15,
+      "ingredients_text": "Adapalene 0.1% (retinoid), Propylene Glycol, Carbomer, Sodium Hydroxide"
+    },
+    {
+      "brand": "Vanicream",
+      "name": "Moisturizing Cream",
+      "price_usd": 15,
+      "ingredients_text": "Water, Petrolatum, Glycerin, Sorbitol, Cetearyl Alcohol, Dimethicone"
+    },
+    {
+      "brand": "Neutrogena",
+      "name": "Hydro Boost Water Gel",
+      "price_usd": 20,
+      "ingredients_text": "Water, Glycerin, Dimethicone, Sodium Hyaluronate, Trehalose"
+    },
+    {
+      "brand": "Beauty of Joseon",
+      "name": "Relief Sun SPF50+ PA++++",
+      "price_usd": 14,
+      "ingredients_text": "Water, UV Filters, Rice Extract, Niacinamide, Panthenol, Tocopherol"
+    },
+    {
+      "brand": "La Roche-Posay",
+      "name": "Anthelios Melt-In Milk SPF 60",
+      "price_usd": 28,
+      "ingredients_text": "Water, UV Filters (Avobenzone, Octocrylene, Homosalate), Glycerin"
+    },
+    {
+      "brand": "Kiehl's",
+      "name": "Ultra Facial Cream",
+      "price_usd": 38,
+      "ingredients_text": "Water, Glycerin, Squalane, Shea Butter, Panthenol"
+    }
+  ]
+}
+

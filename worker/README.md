@@ -85,6 +85,17 @@ python3 worker/ingest.py \
   --overwrite
 ```
 
+## 4.1) 从 JSON 批量导入（Top 10 快速喂数）
+
+仓库内置了一份「Top 10 Skincare」示例数据：`worker/datasets/top10.json`。
+
+```bash
+cd client
+python3 worker/ingest.py --input-json worker/datasets/top10.json --overwrite
+```
+
+你也可以把自己准备的 JSON 列表保存成文件后用 `--input-json` 导入（支持格式：`[{...}, ...]` 或 `{ "items": [...] }`）。
+
 ## 5) 注意
 
 - LLM 输出的功效分数是 **0-100**，目前 Aurora 前端引擎使用的是 **0-1**；后续做 DB→API 映射时会做归一化。

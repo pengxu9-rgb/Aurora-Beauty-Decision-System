@@ -203,6 +203,21 @@ function shouldUseDb() {
   return true;
 }
 
+export async function resolveProductIdForSkuId(skuId: string): Promise<string | null> {
+  if (!shouldUseDb()) return null;
+  if (looksLikeUuid(skuId)) return skuId;
+
+  const alias = aliasForSkuId(skuId);
+  if (!alias) return null;
+
+  const product = await prisma.product.findFirst({
+    where: { brand: alias.brand, name: alias.name },
+    select: { id: true },
+  });
+
+  return product?.id ?? null;
+}
+
 export async function getSkuById(skuId: string): Promise<SkuVector | null> {
   if (!shouldUseDb()) {
     return AURORA_SKU_DB.find((s) => s.sku_id === skuId) ?? null;

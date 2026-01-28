@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server";
 
 import { calculateScore, findDupes } from "@/lib/engine";
+import { buildTradeoffNote, findSimilarProductsByAnchorProductId } from "@/lib/search";
 import type { DupeMatch, SkuScoreBreakdown, SkuVector, UserVector } from "@/types";
 
 import { corsPreflight, withCors } from "../_cors";
-import { getSkuById, getSkuDatabase } from "../_lib";
+import { getSkuById, getSkuDatabase, resolveProductIdForSkuId } from "../_lib";
 
 type AnalyzeRequest = {
   anchor_sku_id: string;
@@ -44,9 +45,29 @@ export async function POST(req: Request) {
 
   const anchor_score = calculateScore(anchor, body.user);
 
-  const db = filterDupeDatabase(anchor, await getSkuDatabase());
   const dupeLimit = typeof body.dupe_limit === "number" && body.dupe_limit > 0 ? Math.min(20, body.dupe_limit) : 6;
-  const dupes = findDupes(anchor, db, dupeLimit);
+  let dupes: DupeMatch[] = [];
+
+  const anchorProductId = await resolveProductIdForSkuId(body.anchor_sku_id);
+  if (anchorProductId) {
+    const candidates = await findSimilarProductsByAnchorProductId(anchorProductId, {
+      limit: Math.min(50, dupeLimit * 5),
+      cheaper_than_anchor: true,
+    });
+    dupes = candidates
+      .map((c) => ({ sku: c.sku, similarity: c.similarity, tradeoff_note: buildTradeoffNote(anchor, c.sku) }))
+      .filter((d) => d.sku.sku_id !== anchor.sku_id);
+
+    dupes =
+      anchor.category === "serum" || anchor.category === "treatment"
+        ? dupes.filter((d) => d.sku.category === "serum" || d.sku.category === "treatment")
+        : dupes;
+
+    dupes = dupes.slice(0, dupeLimit);
+  } else {
+    const db = filterDupeDatabase(anchor, await getSkuDatabase());
+    dupes = findDupes(anchor, db, dupeLimit);
+  }
 
   const preferBrand = (body.prefer_brand ?? "The Ordinary").trim();
   const recommended_dupe = dupes.find((d) => d.sku.brand === preferBrand) ?? dupes[0] ?? null;

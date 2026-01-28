@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Calculator,
   Cuboid,
@@ -229,8 +229,54 @@ export function AuroraApp() {
   const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [skuDb, setSkuDb] = useState<SkuVector[]>(() => AURORA_SKU_DB);
+  const [skuDbStatus, setSkuDbStatus] = useState<"mock" | "loading" | "db">("mock");
+  const [skuDbError, setSkuDbError] = useState<string | null>(null);
 
-  const run = useMemo(() => runAurora(user, AURORA_SKU_DB, anchorSkuId), [user, anchorSkuId]);
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadSkuDatabase() {
+      setSkuDbStatus("loading");
+      setSkuDbError(null);
+
+      try {
+        const base = (process.env.NEXT_PUBLIC_AURORA_SERVICE_URL ?? "").replace(/\/$/, "");
+        const url = `${base}/v1/decision/skus`;
+        const res = await fetch(url, { method: "GET" });
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          throw new Error(text || `Failed to load SKUs (${res.status})`);
+        }
+
+        const json = (await res.json()) as { skus?: SkuVector[] };
+        const skus = Array.isArray(json.skus) ? json.skus : [];
+
+        if (!cancelled && skus.length > 0) {
+          setSkuDb(skus);
+          setSkuDbStatus("db");
+          // Keep the currently-selected anchor if it still exists; otherwise fall back to the first DB SKU.
+          setAnchorSkuId((current) =>
+            skus.some((s) => s.sku_id === current) ? current : (skus[0]?.sku_id ?? DEFAULT_ANCHOR_SKU_ID),
+          );
+        } else if (!cancelled) {
+          setSkuDbStatus("mock");
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setSkuDbStatus("mock");
+          setSkuDbError(err instanceof Error ? err.message : "Failed to load SKUs");
+        }
+      }
+    }
+
+    void loadSkuDatabase();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const run = useMemo(() => runAurora(user, skuDb, anchorSkuId), [user, skuDb, anchorSkuId]);
   const anchor = run.anchor;
 
   const localAnchorScore = useMemo(() => calculateScore(anchor, user), [anchor, user]);
@@ -239,10 +285,10 @@ export function AuroraApp() {
   const dupeDatabase = useMemo(() => {
     // If the anchor is a serum/treatment, keep dupes in the same “active” lane.
     if (anchor.category === "serum" || anchor.category === "treatment") {
-      return AURORA_SKU_DB.filter((s) => s.category === "serum" || s.category === "treatment");
+      return skuDb.filter((s) => s.category === "serum" || s.category === "treatment");
     }
-    return AURORA_SKU_DB;
-  }, [anchor.category]);
+    return skuDb;
+  }, [anchor.category, skuDb]);
 
   const localDupes = useMemo(() => findDupes(anchor, dupeDatabase, 6), [anchor, dupeDatabase]);
   const dupes = analysis?.dupes ?? localDupes;
@@ -253,8 +299,8 @@ export function AuroraApp() {
   const recommendedDupe = analysis?.recommended_dupe ?? localRecommendedDupe;
 
   const selectedDupe = pickSku(
-    AURORA_SKU_DB,
-    selectedDupeId || recommendedDupe?.sku.sku_id || dupes[0]?.sku.sku_id || AURORA_SKU_DB[0]?.sku_id || "",
+    skuDb,
+    selectedDupeId || recommendedDupe?.sku.sku_id || dupes[0]?.sku.sku_id || skuDb[0]?.sku_id || "",
   );
 
   const subtitle = `${formatSkinType(user.skin_type)} / barrier:${user.barrier_status} / budget:${user.budget.total_monthly}`;
@@ -341,6 +387,16 @@ export function AuroraApp() {
         <div className="mb-8">
           <h2 className="text-2xl font-bold text-slate-800">1. 输入解析与画像向量</h2>
           <p className="text-slate-500 mt-2">将用户信号转化为结构化向量，驱动后续的权重计算。</p>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {skuDbStatus === "db" ? (
+              <SummaryPill text={`DB Connected (${skuDb.length} SKUs)`} tone="emerald" />
+            ) : skuDbStatus === "loading" ? (
+              <SummaryPill text="Loading SKUs..." tone="amber" />
+            ) : (
+              <SummaryPill text="Using Mock SKUs" tone="slate" />
+            )}
+            {skuDbError ? <SummaryPill text={`SKU Load Error: ${skuDbError}`} tone="amber" /> : null}
+          </div>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
@@ -415,7 +471,7 @@ export function AuroraApp() {
                     value={anchorSkuId}
                     onChange={(e) => setAnchorSkuId(e.target.value)}
                   >
-                    {AURORA_SKU_DB.map((s) => (
+                    {skuDb.map((s) => (
                       <option key={s.sku_id} value={s.sku_id}>
                         {s.brand} — {s.name}
                       </option>

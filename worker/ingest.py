@@ -565,6 +565,61 @@ def load_input_skus_from_excel(
   return skus
 
 
+def load_input_skus_from_json(*, path: str, price_cny_rate: float, limit: Optional[int]) -> List[InputSku]:
+  with open(path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+
+  items = payload.get("items") if isinstance(payload, dict) else payload
+  if not isinstance(items, list):
+    raise RuntimeError("JSON input must be a list of items (or {\"items\": [...]}).")
+
+  skus: List[InputSku] = []
+  for i, raw in enumerate(items):
+    if not isinstance(raw, dict):
+      print(f"Skipping JSON row {i}: not an object")
+      continue
+
+    brand = str(raw.get("brand") or "").strip()
+    name = str(raw.get("name") or "").strip()
+    ingredients = str(raw.get("ingredients_text") or raw.get("ingredients") or "").strip()
+
+    price_usd_raw = raw.get("price_usd", raw.get("price"))
+    try:
+      price_usd = float(price_usd_raw) if price_usd_raw is not None else 0.0
+    except Exception:  # noqa: BLE001
+      price_usd = 0.0
+
+    price_cny_raw = raw.get("price_cny")
+    try:
+      price_cny = float(price_cny_raw) if price_cny_raw is not None else float(price_usd) * float(price_cny_rate)
+    except Exception:  # noqa: BLE001
+      price_cny = float(price_usd) * float(price_cny_rate)
+
+    product_url = raw.get("product_url")
+    image_url = raw.get("image_url")
+
+    if not brand or not name or not ingredients:
+      print(f"Skipping JSON row {i}: missing brand/name/ingredients_text")
+      continue
+
+    skus.append(
+      InputSku(
+        brand=brand,
+        name=name,
+        ingredients_text=ingredients,
+        price_usd=price_usd,
+        price_cny=price_cny,
+        product_url=str(product_url).strip() if product_url else None,
+        image_url=str(image_url).strip() if image_url else None,
+      )
+    )
+
+    if limit is not None and len(skus) >= limit:
+      break
+
+  return skus
+
+
 def demo_skus() -> List[InputSku]:
   return [
     InputSku(
@@ -660,6 +715,7 @@ def main() -> None:
   parser = argparse.ArgumentParser(description="Aurora vectorization + embedding ETL (Excel → Gemini → Railway Postgres)")
   parser.add_argument("--demo", action="store_true", help="Ingest 3 demo products (Tom Ford / The Ordinary / HR).")
   parser.add_argument("--input", type=str, help="Path to Excel (.xlsx) file.")
+  parser.add_argument("--input-json", type=str, help="Path to JSON file (list of SKUs) to ingest.")
   parser.add_argument("--sheet", type=str, default=None, help="Excel sheet name (default: active sheet).")
   parser.add_argument("--limit", type=int, default=None, help="Max rows to ingest (for testing).")
   parser.add_argument("--list-models", action="store_true", help="List available Gemini models and exit.")
@@ -698,11 +754,13 @@ def main() -> None:
       print(f"{short}  full={name}  methods={methods}")
     return
 
-  if not args.demo and not args.input:
-    raise SystemExit("Provide --demo or --input /path/to.xlsx (or --list-models)")
+  if not args.demo and not args.input and not args.input_json:
+    raise SystemExit("Provide --demo, --input /path/to.xlsx, or --input-json /path/to.json (or --list-models)")
 
   if args.demo:
     skus = demo_skus()
+  elif args.input_json:
+    skus = load_input_skus_from_json(path=args.input_json, price_cny_rate=float(args.price_cny_rate), limit=args.limit)
   else:
     skus = load_input_skus_from_excel(
       path=args.input,
