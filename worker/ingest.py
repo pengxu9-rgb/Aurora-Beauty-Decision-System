@@ -41,6 +41,12 @@ Output Format (JSON):
   "experience_prediction": {
     "texture": str,
     "finish": "matte|dewy|natural"
+  },
+  "social_stats": {
+    "red_score": int,
+    "reddit_score": int,
+    "burn_rate": number,
+    "top_keywords": [str]
   }
 }
 """.strip()
@@ -243,6 +249,7 @@ def get_vectors_from_llm(client: GeminiClient, *, model: str, brand: str, name: 
   mechanism = data.get("mechanism") or {}
   risk_flags = data.get("risk_flags") or []
   experience = data.get("experience_prediction") or {}
+  social = data.get("social_stats") or {}
 
   if not isinstance(mechanism, dict):
     raise ValueError("LLM output invalid: `mechanism` must be an object")
@@ -250,6 +257,8 @@ def get_vectors_from_llm(client: GeminiClient, *, model: str, brand: str, name: 
     raise ValueError("LLM output invalid: `risk_flags` must be a list")
   if not isinstance(experience, dict):
     raise ValueError("LLM output invalid: `experience_prediction` must be an object")
+  if social and not isinstance(social, dict):
+    raise ValueError("LLM output invalid: `social_stats` must be an object when present")
 
   def _clamp_int_0_100(value: Any) -> int:
     try:
@@ -258,6 +267,41 @@ def get_vectors_from_llm(client: GeminiClient, *, model: str, brand: str, name: 
       return 0
     return max(0, min(100, n))
 
+  def _clamp_float_0_1(value: Any) -> float:
+    try:
+      n = float(value)
+    except Exception:  # noqa: BLE001
+      return 0.0
+    if n < 0:
+      return 0.0
+    if n > 1:
+      return 1.0
+    return n
+
+  cleaned_risk_flags = [str(x).strip() for x in risk_flags if str(x).strip()]
+
+  def _default_burn_rate(flags: List[str]) -> float:
+    lower = [f.lower() for f in flags]
+    if any("high_irritation" in f or "irritation" in f for f in lower):
+      return 0.15
+    if any("alcohol" in f for f in lower) or any("acid" in f for f in lower):
+      return 0.08
+    return 0.03
+
+  # Social stats are often not available from ingredients alone; we accept LLM-provided estimates
+  # but also provide safe defaults so the pipeline is usable out-of-the-box.
+  red_score = _clamp_int_0_100(social.get("red_score", 60) if isinstance(social, dict) else 60)
+  reddit_score = _clamp_int_0_100(social.get("reddit_score", 60) if isinstance(social, dict) else 60)
+  burn_rate = _clamp_float_0_1(social.get("burn_rate", _default_burn_rate(cleaned_risk_flags)) if isinstance(social, dict) else _default_burn_rate(cleaned_risk_flags))
+
+  top_keywords_raw = social.get("top_keywords", []) if isinstance(social, dict) else []
+  if isinstance(top_keywords_raw, str):
+    top_keywords = [t.strip() for t in top_keywords_raw.split(",") if t.strip()]
+  elif isinstance(top_keywords_raw, list):
+    top_keywords = [str(t).strip() for t in top_keywords_raw if str(t).strip()]
+  else:
+    top_keywords = []
+
   normalized = {
     "mechanism": {
       "oil_control": _clamp_int_0_100(mechanism.get("oil_control", 0)),
@@ -265,10 +309,16 @@ def get_vectors_from_llm(client: GeminiClient, *, model: str, brand: str, name: 
       "soothing": _clamp_int_0_100(mechanism.get("soothing", 0)),
       "barrier_repair": _clamp_int_0_100(mechanism.get("barrier_repair", 0)),
     },
-    "risk_flags": [str(x).strip() for x in risk_flags if str(x).strip()],
+    "risk_flags": cleaned_risk_flags,
     "experience_prediction": {
       "texture": str(experience.get("texture", "")).strip() or "unknown",
       "finish": str(experience.get("finish", "")).strip() or "natural",
+    },
+    "social_stats": {
+      "red_score": red_score,
+      "reddit_score": reddit_score,
+      "burn_rate": burn_rate,
+      "top_keywords": top_keywords[:20],
     },
   }
 
@@ -372,6 +422,25 @@ class AuroraDb:
         VALUES (%s, %s, %s, %s);
         """,
         (ingredient_id, product_id, full_list, Json([])),
+      )
+
+  def insert_social_stats(
+    self,
+    *,
+    product_id: str,
+    social_id: str,
+    red_score: int,
+    reddit_score: int,
+    burn_rate: float,
+    top_keywords: List[str],
+  ) -> None:
+    with self.conn.cursor() as cur:
+      cur.execute(
+        """
+        INSERT INTO "social_stats" (id, product_id, red_score, reddit_score, burn_rate, top_keywords, last_updated)
+        VALUES (%s, %s, %s, %s, %s, %s, NOW());
+        """,
+        (social_id, product_id, red_score, reddit_score, burn_rate, top_keywords),
       )
 
 
@@ -542,6 +611,7 @@ def ingest_one(
   product_id = str(uuid.uuid4())
   vector_id = str(uuid.uuid4())
   ingredient_id = str(uuid.uuid4())
+  social_id = str(uuid.uuid4())
 
   try:
     db.insert_product(sku, product_id=product_id)
@@ -554,6 +624,15 @@ def ingest_one(
       embedding=embedding,
     )
     db.insert_ingredients(product_id=product_id, ingredient_id=ingredient_id, full_list=parse_ingredients_list(sku.ingredients_text))
+    ss = vectors.get("social_stats") or {}
+    db.insert_social_stats(
+      product_id=product_id,
+      social_id=social_id,
+      red_score=int(ss.get("red_score", 0)),
+      reddit_score=int(ss.get("reddit_score", 0)),
+      burn_rate=float(ss.get("burn_rate", 0.0)),
+      top_keywords=list(ss.get("top_keywords", []) if isinstance(ss.get("top_keywords", []), list) else []),
+    )
     db.conn.commit()
     print(f"✅ Ingested: {sku.brand} - {sku.name}")
   except BaseException:  # noqa: BLE001

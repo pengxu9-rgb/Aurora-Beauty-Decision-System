@@ -89,3 +89,4 @@ python3 worker/ingest.py \
 
 - LLM 输出的功效分数是 **0-100**，目前 Aurora 前端引擎使用的是 **0-1**；后续做 DB→API 映射时会做归一化。
 - `embedding` 列是 `vector(1536)`：如果 Gemini embedding 返回 3072 维，脚本会 **截断到 1536** 以便写入数据库（MVP 权衡）。
+- Worker 也会写入 `social_stats`（由 LLM 生成/估计的占位数据），让线上 `SocialScore` 不再是 0。

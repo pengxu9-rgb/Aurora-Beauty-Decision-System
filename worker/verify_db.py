@@ -83,18 +83,23 @@ def main() -> None:
 
       cur.execute(
         """
-        select p.brand, p.name, (v.product_id is not null) as has_vectors, (i.product_id is not null) as has_ingredients
+        select p.brand,
+               p.name,
+               (v.product_id is not null) as has_vectors,
+               (i.product_id is not null) as has_ingredients,
+               (s.product_id is not null) as has_social
           from "products" p
           left join "sku_vectors" v on v.product_id = p.id
           left join "ingredients" i on i.product_id = p.id
+          left join "social_stats" s on s.product_id = p.id
          order by p.created_at desc
          limit 20;
         """
       )
-      rows: List[Tuple[str, str, bool, bool]] = cur.fetchall()
+      rows: List[Tuple[str, str, bool, bool, bool]] = cur.fetchall()
       print("latest_products (up to 20):")
-      for brand, name, has_vec, has_ing in rows:
-        print(f"- {brand} | {name} | vectors={has_vec} ingredients={has_ing}")
+      for brand, name, has_vec, has_ing, has_social in rows:
+        print(f"- {brand} | {name} | vectors={has_vec} ingredients={has_ing} social={has_social}")
 
       # Demo products
       cur.execute(
@@ -103,9 +108,14 @@ def main() -> None:
                p.name,
                (v.embedding is not null) as has_embedding,
                coalesce(vector_dims(v.embedding), 0) as embedding_dim,
-               coalesce(array_length(v.risk_flags, 1), 0) as risk_flags_count
+               coalesce(array_length(v.risk_flags, 1), 0) as risk_flags_count,
+               coalesce(s.red_score, 0) as red_score,
+               coalesce(s.reddit_score, 0) as reddit_score,
+               coalesce(s.burn_rate, 0) as burn_rate,
+               coalesce(array_length(s.top_keywords, 1), 0) as top_keywords_count
           from "products" p
           left join "sku_vectors" v on v.product_id = p.id
+          left join "social_stats" s on s.product_id = p.id
          where (p.brand, p.name) in (
             ('Tom Ford', 'Research Serum Concentrate'),
             ('The Ordinary', 'Buffet + Copper Peptides 1%'),
@@ -116,9 +126,11 @@ def main() -> None:
       )
       demo = cur.fetchall()
       print("demo_products:")
-      for brand, name, has_embedding, embedding_dim, risk_flags_count in demo:
+      for brand, name, has_embedding, embedding_dim, risk_flags_count, red_score, reddit_score, burn_rate, top_keywords_count in demo:
         print(
-          f"- {brand} | {name} | embedding={bool(has_embedding)} dim={int(embedding_dim or 0)} risk_flags={int(risk_flags_count or 0)}"
+          f"- {brand} | {name} | embedding={bool(has_embedding)} dim={int(embedding_dim or 0)} "
+          f"risk_flags={int(risk_flags_count or 0)} red={int(red_score or 0)} reddit={int(reddit_score or 0)} "
+          f"burn_rate={float(burn_rate or 0)} keywords={int(top_keywords_count or 0)}"
         )
   finally:
     conn.close()
@@ -126,4 +138,3 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-
