@@ -1,7 +1,8 @@
+// 1. Database Configuration for Railway
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
-  extensions = [vector]
+  extensions = [vector] // Enable pgvector extension for similarity search
 }
 
 generator client {
@@ -9,7 +10,7 @@ generator client {
   previewFeatures = ["postgresqlExtensions"]
 }
 
-// Product Identity
+// 2. Product Identity (SKU 身份证)
 model Product {
   id         String  @id @default(uuid())
   brand      String
@@ -19,6 +20,7 @@ model Product {
   productUrl String? @map("product_url")
   imageUrl   String? @map("image_url")
 
+  // Relations
   vectors     SkuVector?
   ingredients IngredientData?
   socialStats SocialStats?
@@ -31,44 +33,58 @@ model Product {
   @@map("products")
 }
 
-// Logic Core (Vectors)
+// 3. The Logic Core (SKU 基因组) - Most Critical Table
 model SkuVector {
   id        String  @id @default(uuid())
   productId String  @unique @map("product_id")
   product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
 
-  mechanism  Json     // { oil_control: 85, soothing: 20 }
-  experience Json     // { texture: "gel", pilling_risk: 0.8 }
-  riskFlags  String[] @map("risk_flags")
+  // Mechanism Scores (0-100) - Stored as JSON for flexibility
+  // Schema: { "oil_control": 85, "soothing": 20, "anti_aging": 90 }
+  mechanism Json
 
-  // Vector embedding for similarity search (Unsupported type in Prisma, managed by raw SQL)
+  // Experience Factors - Stored as JSON
+  // Schema: { "texture": "gel", "finish": "matte", "pilling_risk": 0.8 }
+  experience Json
+
+  // Risk Flags (e.g., ["alcohol", "strong_acid"])
+  riskFlags String[] @map("risk_flags")
+
+  // Vector Embedding for Dupe Discovery (1536 dimensions for OpenAI ada-002)
+  // Note: Requires Prisma specific setup for vector types, using Unsupported for raw SQL mapping if needed,
+  // but standard practice usually maps this via raw queries.
+  // Here we define a field to hold it, but pgvector interaction is often done via raw SQL in API.
   embedding Unsupported("vector(1536)")?
 
   @@map("sku_vectors")
 }
 
-// Ingredient Data
+// 4. Ingredient Data (Source of Truth)
 model IngredientData {
   id        String  @id @default(uuid())
   productId String  @unique @map("product_id")
   product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
 
-  fullList    String[] @map("full_list")
-  heroActives Json     @map("hero_actives")
+  fullList    String[] @map("full_list") // Ordered list
+  heroActives Json     @map("hero_actives") // e.g. [{"name": "Retinol", "pct": "0.3%"}]
 
   @@map("ingredients")
 }
 
-// Social Stats
+// 5. Social Pulse (舆情指纹)
 model SocialStats {
-  id        String   @id @default(uuid())
-  productId String   @unique @map("product_id")
-  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  id        String  @id @default(uuid())
+  productId String  @unique @map("product_id")
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
 
-  redScore    Int      @default(0) @map("red_score")
-  redditScore Int      @default(0) @map("reddit_score")
-  burnRate    Decimal  @default(0.0) @map("burn_rate")
-  topKeywords String[] @map("top_keywords")
+  // Platform specific scores (0-100)
+  redScore    Int @default(0) @map("red_score")
+  redditScore Int @default(0) @map("reddit_score")
+
+  // Safety signal
+  burnRate Decimal @default(0.0) @map("burn_rate") // 0.0 - 1.0
+
+  topKeywords String[] @map("top_keywords") // e.g. ["假滑", "HolyGrail"]
 
   lastUpdated DateTime @default(now()) @map("last_updated")
 
