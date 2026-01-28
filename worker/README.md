@@ -31,6 +31,9 @@ DATABASE_URL='postgresql://...'
 GEMINI_API_KEY='...'
 ```
 
+⚠️ 注意：如果你从 Railway 复制到的是这种模板（包含 `\${{RAILWAY_TCP_PROXY_PORT}}` 之类），它只会在 Railway 运行环境里被替换，
+本地运行脚本会报错。请在 Railway 的 Postgres `Connect` 页面复制 **Public connection string**（带真实 host/port）。
+
 ## 3) Demo 跑通（写入 3 个产品）
 
 会把 **Tom Ford / The Ordinary / Helena Rubinstein** 写入 `products`/`sku_vectors`/`ingredients`。

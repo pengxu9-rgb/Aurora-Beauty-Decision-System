@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ Output Format (JSON):
 
 DEFAULT_GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_EMBEDDING_DIM = 1536
+ENV_TEMPLATE_RE = re.compile(r"\$\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,39 @@ def _retry(fn, *, tries: int = 3, base_sleep_s: float = 1.0):
       time.sleep(sleep_s)
   assert last_err is not None
   raise last_err
+
+
+def resolve_env_templates(value: str) -> str:
+  # Railway sometimes provides templated variables like:
+  # postgresql://...@${{RAILWAY_TCP_PROXY_DOMAIN}}:${{RAILWAY_TCP_PROXY_PORT}}/railway
+  # These only resolve inside Railway. For local runs, we either substitute from env vars
+  # (if provided) or raise a friendly error.
+  if "${{" not in value:
+    return value
+
+  missing: List[str] = []
+
+  def _repl(match: re.Match[str]) -> str:
+    key = match.group(1)
+    resolved = (os.getenv(key) or "").strip()
+    if not resolved:
+      missing.append(key)
+      return match.group(0)
+    return resolved
+
+  rendered = ENV_TEMPLATE_RE.sub(_repl, value)
+  if missing:
+    raise RuntimeError(
+      "DATABASE_URL contains Railway template placeholders that are not resolvable locally: "
+      + ", ".join(sorted(set(missing)))
+      + ".\nFix: set DATABASE_URL to Railway Postgres **Public connection string** (with real host/port), "
+      + "or export those variables before running the script."
+    )
+
+  if "${{" in rendered:
+    raise RuntimeError("DATABASE_URL still contains unresolved template placeholders after substitution.")
+
+  return rendered
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
@@ -515,7 +550,7 @@ def main() -> None:
   args = parser.parse_args()
 
   load_dotenv()
-  database_url = _require_env("DATABASE_URL")
+  database_url = resolve_env_templates(_require_env("DATABASE_URL"))
   api_key = _require_any_env(["GEMINI_API_KEY", "GOOGLE_API_KEY"])
   api_base_url = (os.getenv("GEMINI_API_BASE_URL") or DEFAULT_GEMINI_API_BASE_URL).strip()
 
