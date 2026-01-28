@@ -155,6 +155,15 @@ class GeminiClient:
     self._session = requests.Session()
     self._session.headers.update({"Content-Type": "application/json"})
 
+  @staticmethod
+  def normalize_model_name(model: str) -> str:
+    # ListModels returns names like "models/gemini-2.5-flash". Our URL already includes "/models/".
+    # Accept either "gemini-2.5-flash" or "models/gemini-2.5-flash".
+    model = model.strip()
+    if model.startswith("models/"):
+      return model[len("models/") :]
+    return model
+
   def list_models(self) -> List[Dict[str, Any]]:
     url = f"{self._api_base_url}/models"
 
@@ -171,7 +180,8 @@ class GeminiClient:
     return models
 
   def generate_json(self, *, model: str, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
-    url = f"{self._api_base_url}/models/{model}:generateContent"
+    model_id = self.normalize_model_name(model)
+    url = f"{self._api_base_url}/models/{model_id}:generateContent"
     body = {
       "systemInstruction": {"parts": [{"text": system_prompt}]},
       "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
@@ -196,7 +206,8 @@ class GeminiClient:
     return _extract_json_object(text)
 
   def embed_text(self, *, model: str, text: str) -> List[float]:
-    url = f"{self._api_base_url}/models/{model}:embedContent"
+    model_id = self.normalize_model_name(model)
+    url = f"{self._api_base_url}/models/{model_id}:embedContent"
     body = {"content": {"parts": [{"text": text}]}}
 
     def _call():
@@ -564,8 +575,8 @@ def main() -> None:
   parser.add_argument("--col-product-url", type=str, default=None)
   parser.add_argument("--col-image-url", type=str, default=None)
 
-  parser.add_argument("--llm-model", type=str, default="gemini-2.5-flash-preview")
-  parser.add_argument("--embedding-model", type=str, default="text-embedding-004")
+  parser.add_argument("--llm-model", type=str, default="gemini-2.5-flash")
+  parser.add_argument("--embedding-model", type=str, default="gemini-embedding-001")
   parser.add_argument("--no-embedding", action="store_true")
   parser.add_argument("--overwrite", action="store_true", help="Overwrite existing rows by (brand,name).")
   parser.add_argument("--dry-run", action="store_true", help="Call Gemini but do not write to DB.")
@@ -585,7 +596,8 @@ def main() -> None:
     for m in models:
       name = m.get("name")
       methods = m.get("supportedGenerationMethods") or []
-      print(f"{name}  methods={methods}")
+      short = GeminiClient.normalize_model_name(str(name or ""))
+      print(f"{short}  full={name}  methods={methods}")
     return
 
   if not args.demo and not args.input:

@@ -43,7 +43,8 @@ cd client
 python3 worker/ingest.py --demo --overwrite
 ```
 
-默认 LLM 模型是 `gemini-2.5-flash-preview`（可用 `--llm-model` 覆盖）。
+默认 LLM 模型是 `gemini-2.5-flash`（可用 `--llm-model` 覆盖）。
+默认 embedding 模型是 `gemini-embedding-001`（可用 `--embedding-model` 覆盖）。
 
 如果你遇到 `model not found`，先列出你这个 key 可用的模型：
 
