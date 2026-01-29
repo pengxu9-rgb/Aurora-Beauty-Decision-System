@@ -179,6 +179,7 @@ export function ConsultWizard({ onComplete }: { onComplete?: (answers: ConsultWi
     if (!canContinue) return;
     if (step === 3) {
       if (answers) onComplete?.(answers);
+      if (onComplete) return;
       go(4);
       return;
     }

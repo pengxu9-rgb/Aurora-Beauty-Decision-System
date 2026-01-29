@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { createTextStreamResponse } from "ai";
+
 import { getSkuById, getSkuDatabase } from "@/app/v1/decision/_lib";
 import { calculateScore } from "@/lib/engine";
 import { prisma } from "@/lib/server/prisma";
@@ -14,11 +16,12 @@ type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 type ChatRequest = {
   query?: string;
   message?: string;
-  messages?: ChatMessage[];
+  messages?: unknown[];
   anchor_product_id?: string;
   limit?: number;
   llm_provider?: "gemini" | "openai";
   llm_model?: string;
+  stream?: boolean;
 };
 
 const USD_TO_CNY = 7.2;
@@ -27,13 +30,34 @@ function looksLikeUuid(value: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+function extractTextFromUnknownMessage(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+
+  if ("content" in message && typeof (message as any).content === "string") return (message as any).content;
+  if ("text" in message && typeof (message as any).text === "string") return (message as any).text;
+
+  if ("parts" in message && Array.isArray((message as any).parts)) {
+    const texts = (message as any).parts
+      .map((p: unknown) => {
+        if (!p || typeof p !== "object") return "";
+        if ((p as any).type === "text" && typeof (p as any).text === "string") return (p as any).text;
+        return "";
+      })
+      .filter(Boolean);
+    if (texts.length) return texts.join("\n");
+  }
+
+  return "";
+}
+
 function normalizeQuery(body: ChatRequest): string {
   if (typeof body.query === "string" && body.query.trim()) return body.query.trim();
   if (typeof body.message === "string" && body.message.trim()) return body.message.trim();
 
   if (Array.isArray(body.messages) && body.messages.length > 0) {
-    const lastUser = [...body.messages].reverse().find((m) => m.role === "user");
-    if (lastUser?.content?.trim()) return lastUser.content.trim();
+    const lastUser = [...body.messages].reverse().find((m) => Boolean(m && typeof m === "object" && (m as any).role === "user"));
+    const text = extractTextFromUnknownMessage(lastUser);
+    if (text.trim()) return text.trim();
   }
 
   return "";
@@ -123,7 +147,7 @@ function detectClosedComedonesOrRoughTexture(query: string) {
 function parseBudgetCny(query: string): number | null {
   // Examples: "预算 500 块人民币", "500元", "¥500"
   const normalized = query.replace(/，/g, ",");
-  const m1 = normalized.match(/(?:预算|budget)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:元|块|rmb|人民币)/i);
+  const m1 = normalized.match(/(?:预算|budget)\s*(?:[:：=]|is)?\s*(\d+(?:\.\d+)?)\s*(?:元|块|rmb|cny|人民币)/i);
   if (m1?.[1]) return Number(m1[1]);
   const m2 = normalized.match(/[¥￥]\s*(\d+(?:\.\d+)?)/);
   if (m2?.[1]) return Number(m2[1]);
@@ -774,6 +798,26 @@ function buildFallbackRoutineAnswer(input: {
   return lines.join("\n").trim();
 }
 
+function streamTextResponse(text: string, opts: { chunkChars?: number; delayMs?: number } = {}) {
+  const chunkChars = typeof opts.chunkChars === "number" && opts.chunkChars > 0 ? opts.chunkChars : 48;
+  const delayMs = typeof opts.delayMs === "number" && opts.delayMs > 0 ? opts.delayMs : 0;
+
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += chunkChars) chunks.push(text.slice(i, i + chunkChars));
+
+  const textStream = new ReadableStream<string>({
+    async start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(chunk);
+        if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+      }
+      controller.close();
+    },
+  });
+
+  return createTextStreamResponse({ textStream });
+}
+
 export async function POST(req: Request) {
   let body: ChatRequest;
   try {
@@ -810,6 +854,7 @@ export async function POST(req: Request) {
       ? (process.env.AURORA_CHAT_PROVIDER as "openai" | "gemini")
       : (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY ? "gemini" : "openai"));
   const requestedModel = typeof body.llm_model === "string" && body.llm_model.trim() ? body.llm_model.trim() : undefined;
+  const wantsStream = Boolean(body.stream);
 
   // ROUTINE PATH
   if (shouldPlanRoutine) {
@@ -895,6 +940,8 @@ Output requirements:
       llm_error = e instanceof Error ? e.message : "Unknown error";
       answer = fallbackAnswer;
     }
+
+    if (wantsStream) return streamTextResponse(answer);
 
     return NextResponse.json({
       query,
@@ -1095,6 +1142,8 @@ For suitability questions:
     llm_error = e instanceof Error ? e.message : "Unknown error";
     answer = fallbackAnswer;
   }
+
+  if (wantsStream) return streamTextResponse(answer);
 
   return NextResponse.json({
     query,
