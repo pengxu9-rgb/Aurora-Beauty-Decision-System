@@ -1274,8 +1274,15 @@ function isLowBudgetCny(budgetCny: number | null) {
   return budgetCny <= 500;
 }
 
-function pickCheapest(db: SkuVector[], category: SkuVector["category"]): SkuVector | null {
-  const candidates = db.filter((s) => s.category === category);
+function pickCheapest(db: SkuVector[], category: SkuVector["category"], user?: UserVector): SkuVector | null {
+  let candidates = db.filter((s) => s.category === category);
+
+  // Safety-first: when we have a user profile, avoid picking a vetoed product just because it's cheap.
+  if (user) {
+    const safe = candidates.filter((s) => calculateScore(s, user).total > 0);
+    if (safe.length > 0) candidates = safe;
+  }
+
   const priced = candidates.filter((s) => Number.isFinite(s.price) && s.price > 0);
   const pool = priced.length ? priced : candidates;
   return [...pool].sort((a, b) => a.price - b.price)[0] ?? null;
@@ -1353,8 +1360,8 @@ function buildPrimaryRoutine(db: SkuVector[], user: UserVector, query: string, b
   const skipAmMoisturizer = lowBudget && !hasDrySkin(user);
   const comedones = detectClosedComedonesOrRoughTexture(query);
 
-  const cleanser = pickCheapest(db, "cleanser");
-  const sunscreen = pickCheapest(db, "sunscreen");
+  const cleanser = pickCheapest(db, "cleanser", user);
+  const sunscreen = pickCheapest(db, "sunscreen", user);
 
   // Targeted comedone logic: prioritize acids (BHA/AHA/Azelaic) in PM over Niacinamide/Retinol.
   let treatment: SkuVector | null = null;
@@ -1364,8 +1371,8 @@ function buildPrimaryRoutine(db: SkuVector[], user: UserVector, query: string, b
   // Budget compression: if low budget and not dry, keep moisturizer simple/cheap and invest in the PM active.
   const moisturizer: SkuVector | null =
     lowBudget && !hasDrySkin(user)
-      ? pickCheapest(db, "moisturizer")
-      : pickBestByScore(db, "moisturizer", user) ?? pickCheapest(db, "moisturizer");
+      ? pickCheapest(db, "moisturizer", user)
+      : pickBestByScore(db, "moisturizer", user) ?? pickCheapest(db, "moisturizer", user);
 
   const am: RoutineRec["am"] = [];
   const pm: RoutineRec["pm"] = [];
@@ -1423,8 +1430,8 @@ function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string
   const lowBudget = isLowBudgetCny(budgetCny);
   const skipAmMoisturizer = lowBudget && !hasDrySkin(user);
 
-  const cleanser = pickCheapest(db, "cleanser");
-  const sunscreen = pickCheapest(db, "sunscreen");
+  const cleanser = pickCheapest(db, "cleanser", user);
+  const sunscreen = pickCheapest(db, "sunscreen", user);
 
   // Start from the same treatment/moisturizer choices as primary.
   let treatment = primary.pm.find((s) => s.step === "Treatment")?.sku ?? null;
@@ -1436,7 +1443,7 @@ function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string
 
   if (totalUsd > budgetUsd) {
     // First attempt: ensure moisturizer is cheapest.
-    const cheapMoist = pickCheapest(db, "moisturizer");
+    const cheapMoist = pickCheapest(db, "moisturizer", user);
     if (cheapMoist) moisturizer = cheapMoist;
     totalUsd = sumUniqueUsd(budgetSkus());
   }
@@ -1504,9 +1511,13 @@ function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string
 
 function isTooShort(answer: string) {
   const trimmed = answer.trim();
-  if (trimmed.length < 160) return true;
-  // Heuristic: require at least one list marker for our acceptance tests.
-  return !(trimmed.includes("*") || trimmed.includes("-") || trimmed.includes("1)") || trimmed.includes("•"));
+  // Gemini sometimes returns concise but valid answers; keep this check lightweight to avoid discarding good outputs.
+  if (trimmed.length < 80) return true;
+
+  // Reject obvious "unfinished bullet" stubs that commonly happen with streaming truncation.
+  if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
+
+  return false;
 }
 
 function buildFallbackProductAnswer(input: {
@@ -1857,9 +1868,9 @@ export async function POST(req: Request) {
 
         const essentials = mergeSkuPool([
           // Always include at least one option per core step.
-          countByCategory(retrievedSkus, "cleanser") ? null : pickCheapest(dbAll, "cleanser"),
-          countByCategory(retrievedSkus, "sunscreen") ? null : pickCheapest(dbAll, "sunscreen"),
-          countByCategory(retrievedSkus, "moisturizer") ? null : pickCheapest(dbAll, "moisturizer"),
+          countByCategory(retrievedSkus, "cleanser") ? null : pickCheapest(dbAll, "cleanser", user),
+          countByCategory(retrievedSkus, "sunscreen") ? null : pickCheapest(dbAll, "sunscreen", user),
+          countByCategory(retrievedSkus, "moisturizer") ? null : pickCheapest(dbAll, "moisturizer", user),
           countByCategory(retrievedSkus, "treatment") || countByCategory(retrievedSkus, "serum")
             ? null
             : (pickBestByScore(dbAll, "treatment", user) ?? pickBestByScore(dbAll, "serum", user)),
