@@ -1,6 +1,9 @@
 import { AURORA_SKU_DB } from "@/data/mock-db";
+import { fetchLatestPriceSnapshotsByProductIds } from "@/lib/pricing";
 import { prisma } from "@/lib/server/prisma";
 import type { ExperienceVector, RiskFlag, SkuCategory, SkuVector, SocialStats } from "@/types";
+
+const USD_TO_CNY = 7.2;
 
 type AliasSku = {
   sku_id: string;
@@ -55,6 +58,22 @@ function toNumber(value: unknown) {
     return (value as any).toNumber();
   }
   return Number(value);
+}
+
+function resolveUsdPrice(product: any, snapshot?: { price_usd: number | null; price_cny: number | null } | null) {
+  const snapUsd = snapshot?.price_usd ?? null;
+  if (snapUsd != null && Number.isFinite(snapUsd) && snapUsd > 0) return snapUsd;
+
+  const prodUsd = toNumber(product?.priceUsd ?? 0);
+  if (Number.isFinite(prodUsd) && prodUsd > 0) return prodUsd;
+
+  const snapCny = snapshot?.price_cny ?? null;
+  if (snapCny != null && Number.isFinite(snapCny) && snapCny > 0) return snapCny / USD_TO_CNY;
+
+  const prodCny = toNumber(product?.priceCny ?? 0);
+  if (Number.isFinite(prodCny) && prodCny > 0) return prodCny / USD_TO_CNY;
+
+  return 0;
 }
 
 function normalizeTexture(value: unknown): ExperienceVector["texture"] {
@@ -132,7 +151,7 @@ function looksLikeUuid(value: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
-function mapProductToSkuVector(product: any): SkuVector | null {
+function mapProductToSkuVector(product: any, opts: { price_snapshot?: { price_usd: number | null; price_cny: number | null } | null } = {}): SkuVector | null {
   const vectors = product?.vectors;
   if (!vectors) return null;
 
@@ -150,7 +169,7 @@ function mapProductToSkuVector(product: any): SkuVector | null {
   const redness = normalizeScore01((mechanismRaw as any).redness ?? (mechanismRaw as any).soothing);
   const acne = normalizeScore01((mechanismRaw as any).acne_comedonal ?? (mechanismRaw as any).oil_control);
 
-  const price = toNumber(product.priceUsd ?? 0);
+  const price = resolveUsdPrice(product, opts.price_snapshot);
 
   const sku: SkuVector = {
     sku_id: alias?.sku_id ?? product.id,
@@ -187,7 +206,10 @@ async function fetchAllSkusFromDb(): Promise<SkuVector[]> {
     orderBy: { updatedAt: "desc" },
   });
 
-  return products.map(mapProductToSkuVector).filter((s): s is SkuVector => Boolean(s));
+  const priceById = await fetchLatestPriceSnapshotsByProductIds(products.map((p) => p.id));
+  return products
+    .map((p) => mapProductToSkuVector(p, { price_snapshot: priceById.get(p.id) ?? null }))
+    .filter((s): s is SkuVector => Boolean(s));
 }
 
 async function fetchSkuByIdentity(brand: string, name: string): Promise<SkuVector | null> {
@@ -196,7 +218,9 @@ async function fetchSkuByIdentity(brand: string, name: string): Promise<SkuVecto
     include: { vectors: true, socialStats: true },
   });
 
-  return product ? mapProductToSkuVector(product) : null;
+  if (!product) return null;
+  const priceById = await fetchLatestPriceSnapshotsByProductIds([product.id]);
+  return mapProductToSkuVector(product, { price_snapshot: priceById.get(product.id) ?? null });
 }
 
 async function fetchSkuByProductId(productId: string): Promise<SkuVector | null> {
@@ -205,7 +229,9 @@ async function fetchSkuByProductId(productId: string): Promise<SkuVector | null>
     include: { vectors: true, socialStats: true },
   });
 
-  return product ? mapProductToSkuVector(product) : null;
+  if (!product) return null;
+  const priceById = await fetchLatestPriceSnapshotsByProductIds([product.id]);
+  return mapProductToSkuVector(product, { price_snapshot: priceById.get(product.id) ?? null });
 }
 
 function shouldUseDb() {

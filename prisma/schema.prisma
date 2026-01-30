@@ -26,6 +26,7 @@ model Product {
   ingredients IngredientData?
   socialStats SocialStats?
   kbSnippets  ProductKbSnippet[]
+  priceSnapshots ProductPriceSnapshot[]
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -109,4 +110,32 @@ model ProductKbSnippet {
   @@unique([productId, sourceSheet, field], map: "product_kb_snippets_product_sheet_field_uidx")
   @@index([productId])
   @@map("product_kb_snippets")
+}
+
+model ProductPriceSnapshot {
+  id        String  @id @default(uuid())
+  productId String  @map("product_id")
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // Optional region scoping: "CN" | "US" | "EU" | "Global" | null
+  region   String?
+  currency String?
+
+  // Monetary snapshots (nullable to allow partial sources)
+  priceUsd Decimal? @map("price_usd") @db.Decimal(10, 2)
+  priceCny Decimal? @map("price_cny") @db.Decimal(10, 2)
+
+  // Provenance
+  source     String
+  sourceUrl  String? @map("source_url")
+  confidence Float?
+  metadata   Json?
+
+  capturedAt DateTime @default(now()) @map("captured_at")
+
+  @@index([productId])
+  @@index([region])
+  @@index([capturedAt])
+  @@index([productId, region, capturedAt])
+  @@map("product_price_snapshots")
 }

@@ -49,6 +49,7 @@ export async function findSimilarSkusByAnchorProductId(
   const raw = await findSimilarProductsByAnchorProductId(anchorProductId, {
     limit: overfetch,
     cheaper_than_anchor: opts.cheaper_than_anchor,
+    region,
   });
 
   const availabilityById = await fetchAvailabilityByProductIds(raw.map((r) => r.product_id));
@@ -72,7 +73,7 @@ export async function findSimilarSkusByEmbedding(
   const region = opts.region ?? null;
 
   const overfetch = Math.min(50, Math.max(limit, limit * 10));
-  const raw = await findSimilarProductsByEmbedding(embedding, { limit: overfetch });
+  const raw = await findSimilarProductsByEmbedding(embedding, { limit: overfetch, region });
 
   const availabilityById = await fetchAvailabilityByProductIds(raw.map((r) => r.product_id));
 
@@ -91,4 +92,3 @@ export async function findSimilarSkusByEmbedding(
 export async function findSimilarSkus(embedding: number[], limit = 5, region: RegionPreference = null) {
   return await findSimilarSkusByEmbedding(embedding, { limit, region });
 }
-

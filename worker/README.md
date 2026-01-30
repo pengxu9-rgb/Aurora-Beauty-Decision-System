@@ -117,3 +117,33 @@ python3 worker/ingest.py --input-json worker/datasets/top10.json --overwrite
 - LLM 输出的功效分数是 **0-100**，目前 Aurora 前端引擎使用的是 **0-1**；后续做 DB→API 映射时会做归一化。
 - `embedding` 列是 `vector(1536)`：如果 Gemini embedding 返回 3072 维，脚本会 **截断到 1536** 以便写入数据库（MVP 权衡）。
 - Worker 也会写入 `social_stats`（由 LLM 生成/估计的占位数据），让线上 `SocialScore` 不再是 0。
+
+## 6) PRICE_ORACLE（离线价格补全）
+
+Aurora 的 Excel/知识库数据通常 **没有价格列**，会导致 DB 里出现 `price_usd=0`（价格未知）。
+为了避免 UI/Chat 出现 `$0` 或预算计算失真，我们引入了 **价格快照表** `product_price_snapshots`：
+
+- 在线（Next.js）**只读**：优先读快照；没有快照时才回退到 `products.price_usd/price_cny`。
+- 离线（脚本）写入快照：定期跑一次同步即可。
+
+### 6.1 需要的环境变量
+
+- `DATABASE_URL`：Aurora Railway Postgres
+- `PIVOTA_SHOP_GATEWAY_BASE_URL`：Pivota Shop Gateway（默认：`https://web-production-fedb.up.railway.app`）
+- `PIVOTA_SHOP_GATEWAY_API_KEY`：调用 Shop Gateway 的 `X-API-Key`
+
+### 6.2 同步价格快照
+
+```bash
+cd client
+python3 worker/price_oracle.py --only-missing-price
+```
+
+可选：把同步到的价格回填到 `products.price_usd/price_cny`（只在原来为 0 的情况下写入）：
+
+```bash
+cd client
+python3 worker/price_oracle.py --only-missing-price --backfill-products
+```
+
+> 生产建议：用 Cron（GitHub Actions / Railway 定时任务）每天或每周跑一次即可。

@@ -2,6 +2,7 @@ import "server-only";
 
 import { Prisma } from "@prisma/client";
 
+import { fetchLatestPriceSnapshotsByProductIds } from "@/lib/pricing";
 import { prisma } from "@/lib/server/prisma";
 import type { ExperienceVector, RiskFlag, SkuCategory, SkuVector, SocialStats } from "@/types";
 
@@ -15,6 +16,7 @@ export type SimilarSku = {
 type FindSimilarOptions = {
   limit?: number;
   cheaper_than_anchor?: boolean;
+  region?: string | null;
 };
 
 type SimilarRow = {
@@ -33,6 +35,7 @@ type SimilarRow = {
 };
 
 const DEFAULT_LIMIT = 8;
+const REGION_CODES = new Set(["CN", "US", "EU"]);
 
 const PRODUCT_OVERRIDES: Array<{
   sku_id: string;
@@ -165,7 +168,7 @@ function inferCategory(name: string): SkuCategory {
   return "serum";
 }
 
-function toSkuVector(row: SimilarRow): SkuVector {
+function toSkuVector(row: SimilarRow, opts: { price_usd_override?: number | null } = {}): SkuVector {
   const override = categoryOverride(row.brand, row.name);
 
   const mechanismRaw = parseJson(row.mechanism);
@@ -179,7 +182,7 @@ function toSkuVector(row: SimilarRow): SkuVector {
   const redness = normalizeScore01((mechanismRaw as any).redness ?? (mechanismRaw as any).soothing);
   const acne = normalizeScore01((mechanismRaw as any).acne_comedonal ?? (mechanismRaw as any).oil_control);
 
-  const priceUsd = toNumber(row.price_usd ?? 0);
+  const priceUsd = opts.price_usd_override != null ? opts.price_usd_override : toNumber(row.price_usd ?? 0);
 
   return {
     sku_id: override?.sku_id ?? row.product_id,
@@ -242,6 +245,13 @@ function vectorLiteral(embedding: number[]) {
   return `[${cleaned.join(",")}]`;
 }
 
+function normalizeRegion(value: unknown): "CN" | "US" | "EU" | null {
+  if (typeof value !== "string") return null;
+  const upper = value.trim().toUpperCase();
+  if (REGION_CODES.has(upper)) return upper as "CN" | "US" | "EU";
+  return null;
+}
+
 /**
  * findSimilarProducts (pgvector cosine distance)
  *
@@ -286,15 +296,21 @@ export async function findSimilarProductsByAnchorProductId(
       LEFT JOIN social_stats ss ON ss.product_id = p.id
       WHERE anchor.embedding IS NOT NULL
         AND v.embedding IS NOT NULL
-        AND (${cheaper} = false OR p.price_usd < anchor.price_usd)
+        AND (${cheaper} = false OR (anchor.price_usd > 0 AND p.price_usd > 0 AND p.price_usd < anchor.price_usd))
       ORDER BY v.embedding <=> anchor.embedding
       LIMIT ${limit};
     `,
   );
 
+  const priceById = await fetchLatestPriceSnapshotsByProductIds(
+    rows.map((r) => r.product_id),
+    normalizeRegion(opts.region) ?? null,
+  );
+
   return rows
     .map((row) => {
-      const sku = toSkuVector(row);
+      const snap = priceById.get(row.product_id);
+      const sku = toSkuVector(row, { price_usd_override: snap?.price_usd ?? null });
       const distance = toNumber(row.distance ?? 0);
       return {
         product_id: row.product_id,
@@ -312,7 +328,10 @@ export async function findSimilarProductsByAnchorProductId(
  * Useful when you have a query/product embedding vector in JS and want to run DB search.
  * Crucial: we cast the parameter to pgvector via `$1::vector`.
  */
-export async function findSimilarProductsByEmbedding(embedding: number[], opts: { limit?: number } = {}) {
+export async function findSimilarProductsByEmbedding(
+  embedding: number[],
+  opts: { limit?: number; region?: string | null } = {},
+) {
   ensureUsableDatabaseUrl();
 
   const limit = typeof opts.limit === "number" && opts.limit > 0 ? Math.min(50, opts.limit) : DEFAULT_LIMIT;
@@ -342,8 +361,11 @@ export async function findSimilarProductsByEmbedding(embedding: number[], opts: 
     `,
   );
 
+  const priceById = await fetchLatestPriceSnapshotsByProductIds(rows.map((r) => r.product_id), normalizeRegion(opts.region));
+
   return rows.map((row) => {
-    const sku = toSkuVector(row);
+    const snap = priceById.get(row.product_id);
+    const sku = toSkuVector(row, { price_usd_override: snap?.price_usd ?? null });
     const distance = toNumber(row.distance ?? 0);
     return {
       product_id: row.product_id,

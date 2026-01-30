@@ -1404,7 +1404,7 @@ export async function POST(req: Request) {
       id: anchor.id,
       brand: anchor.brand,
       name: anchor.name,
-      price_usd: coerceNumber(anchor.priceUsd),
+      price_usd: anchorSku.price,
       availability: Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [],
       score: anchorScore,
       vetoed: anchorVetoed || anchorScore.vetoed,
