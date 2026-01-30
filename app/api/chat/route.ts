@@ -7,7 +7,7 @@ import { getSkuById, getSkuDatabase, resolveProductIdForSkuId } from "@/app/v1/d
 import { calculateScore } from "@/lib/engine";
 import { buildKbProfile, type KbProfile, type KbSnippet, inferKbCanonicalKey } from "@/lib/kb-profile";
 import { prisma } from "@/lib/server/prisma";
-import { findSimilarSkusByAnchorProductId, type RegionPreference } from "@/lib/vector-service";
+import { findSimilarSkus, findSimilarSkusByAnchorProductId, type RegionPreference } from "@/lib/vector-service";
 import type { Budget, MechanismKey, RiskFlag, SkinType, SkuScoreBreakdown, SkuVector, UserGoal, UserVector } from "@/types";
 
 export const runtime = "nodejs";
@@ -846,6 +846,14 @@ async function openaiChatCompletion(input: { messages: ChatMessage[]; model?: st
   return content.trim();
 }
 
+function optionalAnyEnv(names: string[]): string | null {
+  for (const name of names) {
+    const value = (process.env[name] ?? "").trim();
+    if (value) return value;
+  }
+  return null;
+}
+
 function requireAnyEnv(names: string[]) {
   for (const name of names) {
     const value = (process.env[name] ?? "").trim();
@@ -907,6 +915,90 @@ async function geminiGenerateContent(input: {
 
   if (!text.trim()) throw new Error("Gemini response missing text");
   return text.trim();
+}
+
+function normalizeEmbeddingDim(embedding: number[], dim = 1536) {
+  if (embedding.length === dim) return embedding;
+  if (embedding.length < dim) return [...embedding, ...new Array(dim - embedding.length).fill(0)];
+  // MVP trade-off: truncate to fit vector(1536)
+  console.warn(`Embedding dim ${embedding.length} > ${dim}; truncating to ${dim}.`);
+  return embedding.slice(0, dim);
+}
+
+async function geminiEmbedContent(input: { text: string; model?: string }) {
+  const apiKey = optionalAnyEnv(["GEMINI_API_KEY", "GOOGLE_API_KEY"]);
+  if (!apiKey) throw new Error("Missing GEMINI_API_KEY / GOOGLE_API_KEY");
+  const apiBaseUrl = (process.env.GEMINI_API_BASE_URL ?? "https://generativelanguage.googleapis.com/v1").trim().replace(/\/$/, "");
+  const model = normalizeGeminiModelName(input.model ?? process.env.GEMINI_EMBEDDING_MODEL ?? "text-embedding-004");
+  const url = `${apiBaseUrl}/models/${encodeURIComponent(model)}:embedContent?key=${encodeURIComponent(apiKey)}`;
+
+  const body = { content: { parts: [{ text: input.text }] } };
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Gemini embedContent failed (${res.status}): ${text}`);
+  }
+  const payload = (await res.json()) as any;
+  const values = payload?.embedding?.values;
+  if (!Array.isArray(values) || values.length === 0) throw new Error("Gemini embedding missing values");
+  const embedding = values.map((v: unknown) => Number(v)).filter((n: number) => Number.isFinite(n));
+  if (!embedding.length) throw new Error("Gemini embedding values invalid");
+  return { embedding, model };
+}
+
+async function openaiEmbedText(input: { text: string; model?: string }) {
+  const apiKey = (process.env.OPENAI_API_KEY ?? "").trim();
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
+  const model = (input.model ?? process.env.OPENAI_EMBEDDING_MODEL ?? "text-embedding-3-small").trim();
+
+  const res = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model, input: input.text }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`OpenAI embeddings failed (${res.status}): ${text}`);
+  }
+  const payload = (await res.json()) as any;
+  const embedding = payload?.data?.[0]?.embedding;
+  if (!Array.isArray(embedding) || embedding.length === 0) throw new Error("OpenAI embedding missing values");
+  return { embedding: embedding.map((v: unknown) => Number(v)).filter((n: number) => Number.isFinite(n)), model };
+}
+
+function buildEmbeddingQueryForRoutine(userQuery: string, user: UserVector) {
+  const parts: string[] = [];
+  parts.push(userQuery.trim());
+
+  const goals = Array.isArray(user.goals) ? user.goals.map((g) => g.track) : [];
+  const skin = user.skin_type;
+  const skinText = Array.isArray(skin) ? skin.join(",") : String(skin ?? "");
+  parts.push(`skin_type=${skinText}`);
+  parts.push(`barrier_status=${user.barrier_status}`);
+  if (user.budget?.total_monthly) parts.push(`budget_monthly=${user.budget.total_monthly}`);
+
+  const add = (s: string) => parts.push(s);
+
+  // Translate concerns into "ingredient-space" keywords so embeddings (trained on ingredient text) retrieve relevant SKUs.
+  if (goals.includes("brightening")) {
+    add("brightening actives: vitamin c, niacinamide, tranexamic acid, arbutin, azelaic acid, kojic acid");
+  }
+  if (goals.includes("acne_comedonal") || goals.includes("oil_control")) {
+    add("acne actives: salicylic acid, bha, azelaic acid, niacinamide, zinc, adapalene");
+  }
+  if (goals.includes("soothing") || goals.includes("redness") || user.barrier_status === "impaired") {
+    add("soothing/barrier: panthenol, centella, allantoin, ceramides, glycerin, oat");
+  }
+  if (goals.includes("repair")) {
+    add("barrier repair: ceramides, cholesterol, fatty acids, petrolatum, panthenol");
+  }
+
+  // Safety hints help retrieve gentler formulas when the user reports stinging/redness.
+  if (user.barrier_status === "impaired") {
+    add("avoid irritants: alcohol denat, fragrance, essential oils, strong acids, high retinol");
+  }
+
+  return parts.filter(Boolean).join("\n");
 }
 
 type IngredientContext = {
@@ -1716,9 +1808,93 @@ export async function POST(req: Request) {
 
     // Build a lightweight user vector from query text.
     const user = buildUserVectorFromQuery(query, budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined);
-    const db = await getSkuDatabase();
-    const routine_primary = buildPrimaryRoutine(db, user, query, budgetCny);
-    const routine_budget = buildBudgetSafeRoutine(db, user, query, budgetCny);
+    const dbAll = await getSkuDatabase();
+
+    const mergeSkuPool = (items: Array<SkuVector | null | undefined>) => {
+      const out: SkuVector[] = [];
+      const seen = new Set<string>();
+      for (const sku of items) {
+        if (!sku) continue;
+        const key = sku.sku_id;
+        if (!key) continue;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(sku);
+      }
+      return out;
+    };
+
+    const countByCategory = (pool: SkuVector[], category: SkuVector["category"]) => pool.filter((s) => s.category === category).length;
+
+    let dbForRoutine = dbAll;
+    let retrieval: null | {
+      used: boolean;
+      provider: "gemini" | "openai";
+      embedding_model: string;
+      embedding_query: string;
+      retrieved: Array<{ product_id: string; brand: string; name: string; category: string; similarity: number; availability: string[] }>;
+      error?: string;
+    } = null;
+
+    // Vector-first candidate pool for "no anchor" queries.
+    // Uses the same embedding model as ingestion (default: text-embedding-004 truncated/padded to 1536).
+    if (process.env.DATABASE_URL && !process.env.DATABASE_URL.includes("${{")) {
+      try {
+        const embeddingQuery = buildEmbeddingQueryForRoutine(query, user);
+        const providerForEmbedding: "gemini" | "openai" =
+          optionalAnyEnv(["GEMINI_API_KEY", "GOOGLE_API_KEY"]) ? "gemini" : (process.env.OPENAI_API_KEY ? "openai" : "gemini");
+
+        const embedResult =
+          providerForEmbedding === "gemini"
+            ? await geminiEmbedContent({ text: embeddingQuery })
+            : await openaiEmbedText({ text: embeddingQuery });
+
+        const embedding = normalizeEmbeddingDim(embedResult.embedding, 1536);
+        const found = await findSimilarSkus(embedding, 32, detectedRegion);
+
+        // Use retrieved SKUs first, then patch category holes with a tiny deterministic fallback set.
+        const retrievedSkus = found.map((r) => r.sku);
+
+        const essentials = mergeSkuPool([
+          // Always include at least one option per core step.
+          countByCategory(retrievedSkus, "cleanser") ? null : pickCheapest(dbAll, "cleanser"),
+          countByCategory(retrievedSkus, "sunscreen") ? null : pickCheapest(dbAll, "sunscreen"),
+          countByCategory(retrievedSkus, "moisturizer") ? null : pickCheapest(dbAll, "moisturizer"),
+          countByCategory(retrievedSkus, "treatment") || countByCategory(retrievedSkus, "serum")
+            ? null
+            : (pickBestByScore(dbAll, "treatment", user) ?? pickBestByScore(dbAll, "serum", user)),
+        ]);
+
+        dbForRoutine = mergeSkuPool([...retrievedSkus, ...essentials]);
+        retrieval = {
+          used: true,
+          provider: providerForEmbedding,
+          embedding_model: embedResult.model,
+          embedding_query: embeddingQuery,
+          retrieved: found.slice(0, 10).map((r) => ({
+            product_id: r.product_id,
+            brand: r.sku.brand,
+            name: r.sku.name,
+            category: r.sku.category,
+            similarity: r.similarity,
+            availability: (r as any).availability ?? [],
+          })),
+        };
+      } catch (e) {
+        retrieval = {
+          used: false,
+          provider: optionalAnyEnv(["GEMINI_API_KEY", "GOOGLE_API_KEY"]) ? "gemini" : "openai",
+          embedding_model: "unknown",
+          embedding_query: query,
+          retrieved: [],
+          error: e instanceof Error ? e.message : String(e),
+        };
+        dbForRoutine = dbAll;
+      }
+    }
+
+    const routine_primary = buildPrimaryRoutine(dbForRoutine, user, query, budgetCny);
+    const routine_budget = buildBudgetSafeRoutine(dbForRoutine, user, query, budgetCny);
     const over_budget = budgetCny != null && Number.isFinite(budgetCny) ? routine_primary.total_cny > budgetCny : false;
     const routine = routine_primary;
 
@@ -1774,6 +1950,7 @@ export async function POST(req: Request) {
       },
       user_profile_inferred: user,
       routine_evidence_summary: evidenceSummary,
+      retrieval,
       price_summary: {
         primary: summarizeRoutinePrices(routine_primary),
         strict_budget: over_budget ? summarizeRoutinePrices(routine_budget) : null,
