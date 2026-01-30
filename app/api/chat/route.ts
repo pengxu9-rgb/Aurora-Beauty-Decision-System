@@ -726,6 +726,16 @@ function buildUserVectorFromQuery(query: string, budgetOverride?: Budget): UserV
   };
 }
 
+function sanitizeUserForLlm(user: UserVector) {
+  return {
+    skin_type: user.skin_type,
+    barrier_status: user.barrier_status,
+    budget: user.budget,
+    goals: user.goals,
+    constraints: user.constraints ?? [],
+  };
+}
+
 function coerceNumber(value: unknown) {
   if (typeof value === "number") return value;
   if (typeof value === "string") return Number(value);
@@ -742,6 +752,16 @@ function normalizeUsdPrice(value: unknown): number | null {
 }
 
 function sanitizeSkuForLlm(sku: SkuVector) {
+  const social = sku.social_stats as any;
+  const red = social?.RED_score ?? social?.platform_scores?.RED ?? null;
+  const reddit = social?.Reddit_score ?? social?.platform_scores?.Reddit ?? null;
+  const burn = social?.burn_rate ?? null;
+  const topKeywords = Array.isArray(social?.top_keywords)
+    ? social.top_keywords
+    : Array.isArray(social?.topKeywords)
+      ? social.topKeywords
+      : null;
+
   return {
     sku_id: sku.sku_id,
     brand: sku.brand,
@@ -752,7 +772,13 @@ function sanitizeSkuForLlm(sku: SkuVector) {
     mechanism: sku.mechanism,
     experience: sku.experience,
     risk_flags: sku.risk_flags,
-    social_stats: sku.social_stats,
+    // Keep social stats compact to preserve output budget.
+    social_stats: {
+      RED_score: typeof red === "number" ? red : red == null ? null : Number(red),
+      Reddit_score: typeof reddit === "number" ? reddit : reddit == null ? null : Number(reddit),
+      burn_rate: typeof burn === "number" ? burn : burn == null ? null : Number(burn),
+      ...(topKeywords ? { top_keywords: topKeywords } : {}),
+    },
   };
 }
 
@@ -1959,7 +1985,7 @@ export async function POST(req: Request) {
         sensitive_skin: detectSensitiveSkin(query),
         barrier_impaired: detectBarrierImpaired(query),
       },
-      user_profile_inferred: user,
+      user_profile_inferred: sanitizeUserForLlm(user),
       routine_evidence_summary: evidenceSummary,
       retrieval,
       price_summary: {
@@ -2095,7 +2121,7 @@ export async function POST(req: Request) {
       user_query: query,
       region_preference: detectedRegion,
       detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
-      user_profile_inferred: user,
+      user_profile_inferred: sanitizeUserForLlm(user),
       limitations: ["Anchor product is present in KB, but vectors/embedding are missing.", "Similarity search and scoring are unavailable for this product."],
       anchor: {
         id: anchor.id,
@@ -2276,28 +2302,26 @@ export async function POST(req: Request) {
 
   const contextText = `User request: ${query}`;
 
+  const anchorSkuForLlm = sanitizeSkuForLlm(anchorSku);
+
   const productContextData = {
     user_query: query,
     region_preference: detectedRegion,
     detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
-    user_profile_inferred: user,
+    user_profile_inferred: sanitizeUserForLlm(user),
     anchor: {
       id: anchor.id,
       brand: anchor.brand,
       name: anchor.name,
-      price_usd: normalizeUsdPrice(anchorSku.price),
+      price_usd: anchorSkuForLlm.price_usd,
       availability: Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [],
       score: anchorScore,
       vetoed: anchorVetoed || anchorScore.vetoed,
-      risk_flags: anchor.vectors.riskFlags ?? [],
-      risk_flags_canonical: anchorRisk,
+      risk_flags: anchorRisk,
       burn_rate: anchorBurnRate,
-      vectors: {
-        mechanism: anchorSku.mechanism,
-        experience: anchorSku.experience,
-        risk_flags: anchorSku.risk_flags,
-      },
-      social_stats: anchorSku.social_stats,
+      mechanism: anchorSkuForLlm.mechanism,
+      experience: anchorSkuForLlm.experience,
+      social_stats: anchorSkuForLlm.social_stats,
       ingredients: anchorIngredientCtx,
       expert_knowledge: anchorExpertKnowledge,
       kb_profile: anchorKbProfile,
@@ -2305,6 +2329,7 @@ export async function POST(req: Request) {
     candidates: candidates.slice(0, 5).map((c) => {
       const ing = ingredientByProductId.get(c.product_id);
       const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives);
+      const skuLlm = sanitizeSkuForLlm(c.sku);
       const ex = c.sku.experience;
       const tradeoff =
         ex.texture === "sticky" || (ex.stickiness ?? 0) > 0.6
@@ -2319,16 +2344,15 @@ export async function POST(req: Request) {
         id: c.product_id,
         brand: c.sku.brand,
         name: c.sku.name,
-        price_usd: normalizeUsdPrice(c.sku.price),
+        price_usd: skuLlm.price_usd,
         availability: c.availability,
         similarity: c.similarity,
         tradeoff,
-        vectors: {
-          mechanism: c.sku.mechanism,
-          experience: c.sku.experience,
-          risk_flags: c.sku.risk_flags,
-        },
-        social_stats: c.sku.social_stats,
+        risk_flags: skuLlm.risk_flags,
+        burn_rate: (skuLlm.social_stats as any)?.burn_rate ?? null,
+        mechanism: skuLlm.mechanism,
+        experience: skuLlm.experience,
+        social_stats: skuLlm.social_stats,
         ingredients: ingCtx,
         expert_knowledge: buildExpertKnowledgeFromKb(kbByProductId.get(c.product_id) ?? []),
         kb_profile: buildKbProfile({
