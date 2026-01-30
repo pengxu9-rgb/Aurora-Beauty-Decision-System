@@ -1570,8 +1570,11 @@ function isBadAnswer(answer: string, mode: "routine" | "product") {
   if (mode === "product") {
     // Require at least one "actionable" section marker (dupes / alternatives / recommendation).
     // This avoids returning partial diagnosis-only answers when the model runs out of output budget.
-    const hasActionable = /推荐|平替|Trade-off|相似度|Dupe|Alternatives?|1\)|1\./i.test(trimmed);
-    if (!hasActionable) return true;
+    if (trimmed.length < 180) return true;
+
+    const hasListMarkers = /\n\s*[-*•]\s+/.test(trimmed) || /\n\s*\d+[\)\.]\s+/.test(trimmed);
+    const hasActionable = /Trade-off|相似度|Dupe|Alternatives?|推荐平替|推荐替代/i.test(trimmed);
+    if (!hasListMarkers && !hasActionable) return true;
   }
 
   return false;
