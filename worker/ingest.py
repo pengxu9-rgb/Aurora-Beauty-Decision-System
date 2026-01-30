@@ -1635,14 +1635,25 @@ def main() -> None:
       if snippets:
         product_ids = db.load_all_product_ids()
         product_ids_norm = db.load_all_product_ids_normalized()
+        product_ids_full_norm: Dict[str, str] = {}
+        for (b, n), pid in product_ids.items():
+          full_key = normalize_match_key(f"{b} {n}")
+          if full_key:
+            product_ids_full_norm.setdefault(full_key, pid)
         upserted = 0
         skipped = 0
+        missing_counts: Dict[str, int] = {}
         for snip in snippets:
           pid = product_ids.get((snip.brand, snip.name))
           if not pid:
             pid = product_ids_norm.get((normalize_match_key(snip.brand), normalize_match_key(snip.name)))
           if not pid:
+            full_name = str(snip.metadata.get("product_full_name") or f"{snip.brand} {snip.name}").strip()
+            pid = product_ids_full_norm.get(normalize_match_key(full_name))
+          if not pid:
             skipped += 1
+            full_name = str(snip.metadata.get("product_full_name") or f"{snip.brand} {snip.name}").strip()
+            missing_counts[full_name] = missing_counts.get(full_name, 0) + 1
             continue
           db.upsert_kb_snippet(
             product_id=pid,
@@ -1654,6 +1665,10 @@ def main() -> None:
           upserted += 1
         db.conn.commit()
         print(f"📚 KB snippets upserted: {upserted} (skipped missing products: {skipped})")
+        if missing_counts:
+          print("⚠️  Missing products (top 20 by missing snippet count):")
+          for name, count in sorted(missing_counts.items(), key=lambda x: x[1], reverse=True)[:20]:
+            print(f"  - {name}  missing_snippets={count}")
       else:
         print("📚 No KB snippets found in workbook.")
     return
@@ -1748,12 +1763,20 @@ def main() -> None:
       if snippets:
         product_ids = db.load_all_product_ids()
         product_ids_norm = db.load_all_product_ids_normalized()
+        product_ids_full_norm: Dict[str, str] = {}
+        for (b, n), pid in product_ids.items():
+          full_key = normalize_match_key(f"{b} {n}")
+          if full_key:
+            product_ids_full_norm.setdefault(full_key, pid)
         upserted = 0
         skipped = 0
         for snip in snippets:
           pid = product_ids.get((snip.brand, snip.name))
           if not pid:
             pid = product_ids_norm.get((normalize_match_key(snip.brand), normalize_match_key(snip.name)))
+          if not pid:
+            full_name = str(snip.metadata.get("product_full_name") or f"{snip.brand} {snip.name}").strip()
+            pid = product_ids_full_norm.get(normalize_match_key(full_name))
           if not pid:
             skipped += 1
             continue
