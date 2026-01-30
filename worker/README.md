@@ -133,6 +133,17 @@ cd client
 python3 worker/ingest.py --kb-only --input /path/to/skus.xlsx
 ```
 
+## 4.3) 回填 Product Aliases（Anchor/别名召回）
+
+为了提升线上 Chat 的 “品牌/昵称/俗称 → productId” 解析能力，Aurora 会使用 DB 表 `product_aliases` 做别名匹配。
+
+如果你已经灌入了很多产品，但历史数据没有写入 alias，可以跑一次离线回填（不跑 LLM）：
+
+```bash
+cd client
+python3 worker/ingest.py --aliases-only
+```
+
 ## 5) 注意
 
 - LLM 输出的功效分数是 **0-100**，目前 Aurora 前端引擎使用的是 **0-1**；后续做 DB→API 映射时会做归一化。

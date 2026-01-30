@@ -77,6 +77,56 @@ DEFAULT_GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_EMBEDDING_DIM = 1536
 ENV_TEMPLATE_RE = re.compile(r"\$\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
+# Brand/product aliases (DB-backed) for better anchor resolution in chat.
+#
+# - Keys are normalized via `normalize_alias_text`.
+# - Values are aliases users may type (CN/EN/nicknames).
+BRAND_ALIAS_SYNONYMS: Dict[str, List[str]] = {
+  "skinceuticals": ["修丽可", "杜克", "skinceuticals"],
+  "larocheposay": ["理肤泉", "lrp", "la roche posay"],
+  "curel": ["珂润", "curel", "curél"],
+  "winona": ["薇诺娜", "winona", "winnona"],
+  "freeplus": ["芙丽芳丝", "freeplus"],
+  "cerave": ["cerave", "适乐肤"],
+  "lamer": ["海蓝之谜", "la mer", "lamer"],
+  "esteelauder": ["雅诗兰黛", "estee lauder", "estée lauder", "anr"],
+  "paulaschoice": ["宝拉", "paula's choice", "paulas choice", "pc"],
+  "theordinary": ["the ordinary", "ordinary", "to", "theordinary"],
+  "avene": ["雅漾", "avène", "avene"],
+  "bioderma": ["贝德玛", "bioderma"],
+  "vichy": ["薇姿", "vichy"],
+  "neutrogena": ["露得清", "neutrogena"],
+  "hadalabo": ["肌研", "hada labo", "hadalabo"],
+  "cosrx": ["cosrx"],
+  "vanicream": ["vanicream"],
+  "murad": ["murad", "慕拉得", "慕拉德"],
+}
+
+# Product nicknames keyed by normalized "brand+name".
+PRODUCT_NICKNAMES: Dict[str, List[str]] = {
+  "larocheposaycicaplastbaumeb5": ["b5修护霜", "b5面霜", "b5霜", "cicaplast b5", "baume b5"],
+  "skinceuticalsceferulic": ["cef", "ce ferulic", "ceferulic", "修丽可ce"],
+  "lamercrmedelamer": ["海蓝之谜面霜", "la mer 面霜", "creme de la mer", "crème de la mer"],
+  "niveacreme": ["妮维雅蓝罐", "蓝罐", "nivea 蓝罐"],
+  "paulaschoiceskinperfecting2bhaliquidexfoliant": ["宝拉2%水杨酸", "2% bha", "pc2bha", "水杨酸2%"],
+}
+
+
+def normalize_alias_text(text: str) -> str:
+  """
+  Normalize user-entered aliases while keeping CJK characters.
+
+  - NFKC (full-width -> half-width)
+  - lowercase
+  - remove whitespace/punctuation
+  - keep only [a-z0-9] + CJK range
+  """
+  raw = unicodedata.normalize("NFKC", str(text or ""))
+  raw = raw.lower()
+  raw = re.sub(r"\s+", "", raw)
+  raw = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", raw)
+  return raw
+
 
 @dataclass(frozen=True)
 class InputSku:
@@ -738,12 +788,14 @@ class AuroraDb:
     self._database_url = database_url
     self._has_region_availability = False
     self._has_kb_snippets_table = False
+    self._has_product_aliases_table = False
 
   def __enter__(self):
     self.conn = psycopg2.connect(self._database_url)
     self.conn.autocommit = False
     self._has_region_availability = self._ensure_region_availability_column()
     self._has_kb_snippets_table = self._ensure_kb_snippets_table()
+    self._has_product_aliases_table = self._ensure_product_aliases_table()
     return self
 
   def __exit__(self, exc_type, exc, tb):
@@ -823,6 +875,44 @@ class AuroraDb:
       print("⚠️  Could not ensure product_kb_snippets table; continuing without KB ingestion.")
       return False
 
+  def _ensure_product_aliases_table(self) -> bool:
+    """
+    Best-effort table for DB-managed product aliases (anchor resolution).
+
+    Production should use Prisma migrations; this is a safety net for local runs.
+    """
+    try:
+      with self.conn.cursor() as cur:
+        cur.execute(
+          """
+          CREATE TABLE IF NOT EXISTS "product_aliases" (
+            id TEXT PRIMARY KEY,
+            product_id TEXT NOT NULL REFERENCES "products"(id) ON DELETE CASCADE,
+            alias TEXT NOT NULL,
+            alias_normalized TEXT NOT NULL,
+            kind TEXT,
+            weight INTEGER NOT NULL DEFAULT 0,
+            locale TEXT,
+            created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP(3) NOT NULL
+          );
+          """
+        )
+        cur.execute(
+          'CREATE UNIQUE INDEX IF NOT EXISTS product_aliases_product_alias_norm_uidx ON "product_aliases"(product_id, alias_normalized);'
+        )
+        cur.execute('CREATE INDEX IF NOT EXISTS product_aliases_alias_normalized_idx ON "product_aliases"(alias_normalized);')
+        cur.execute('CREATE INDEX IF NOT EXISTS product_aliases_product_id_idx ON "product_aliases"(product_id);')
+      self.conn.commit()
+      return True
+    except BaseException:  # noqa: BLE001
+      try:
+        self.conn.rollback()
+      except BaseException:  # noqa: BLE001
+        pass
+      print("⚠️  Could not ensure product_aliases table; continuing without alias upserts.")
+      return False
+
   def find_product_id(self, *, brand: str, name: str) -> Optional[str]:
     with self.conn.cursor() as cur:
       cur.execute('SELECT id FROM "products" WHERE brand = %s AND name = %s LIMIT 1;', (brand, name))
@@ -837,6 +927,12 @@ class AuroraDb:
       for brand, name, pid in rows:
         out[(str(brand), str(name))] = str(pid)
       return out
+
+  def load_all_products_basic(self) -> List[Tuple[str, str, str]]:
+    with self.conn.cursor() as cur:
+      cur.execute('SELECT id, brand, name FROM "products" ORDER BY updated_at DESC;')
+      rows = cur.fetchall()
+      return [(str(pid), str(brand), str(name)) for (pid, brand, name) in rows]
 
   def load_all_product_ids_normalized(self) -> Dict[Tuple[str, str], str]:
     with self.conn.cursor() as cur:
@@ -1029,6 +1125,71 @@ class AuroraDb:
         """,
         (str(uuid.uuid4()), product_id, source_sheet, field, content, Json(metadata)),
       )
+
+  def upsert_product_alias(
+    self,
+    *,
+    product_id: str,
+    alias: str,
+    kind: Optional[str],
+    weight: int,
+    locale: Optional[str] = None,
+  ) -> None:
+    if not self._has_product_aliases_table:
+      return
+
+    raw = str(alias or "").strip()
+    if len(raw) < 2:
+      return
+    alias_norm = normalize_alias_text(raw)
+    if len(alias_norm) < 2:
+      return
+
+    with self.conn.cursor() as cur:
+      cur.execute(
+        """
+        INSERT INTO "product_aliases" (
+          id, product_id, alias, alias_normalized, kind, weight, locale, created_at, updated_at
+        ) VALUES (
+          %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
+        )
+        ON CONFLICT (product_id, alias_normalized) DO UPDATE SET
+          alias = EXCLUDED.alias,
+          kind = EXCLUDED.kind,
+          weight = EXCLUDED.weight,
+          locale = EXCLUDED.locale,
+          updated_at = NOW();
+        """,
+        (str(uuid.uuid4()), product_id, raw, alias_norm, kind, int(weight), locale),
+      )
+
+  def upsert_default_aliases_for_product(self, *, product_id: str, brand: str, name: str) -> None:
+    if not self._has_product_aliases_table:
+      return
+
+    b = str(brand or "").strip()
+    n = str(name or "").strip()
+    if not b or not n:
+      return
+
+    full = f"{b} {n}".strip()
+
+    aliases: List[Tuple[str, str, int]] = [
+      (b, "brand", 10),
+      (n, "name", 5),
+      (full, "full_name", 20),
+    ]
+
+    brand_key = normalize_alias_text(b)
+    for a in BRAND_ALIAS_SYNONYMS.get(brand_key, []):
+      aliases.append((a, "brand_alias", 8))
+
+    full_key = normalize_alias_text(full)
+    for a in PRODUCT_NICKNAMES.get(full_key, []):
+      aliases.append((a, "nickname", 50))
+
+    for alias, kind, weight in aliases:
+      self.upsert_product_alias(product_id=product_id, alias=alias, kind=kind, weight=weight, locale=None)
 
 
 def _get_excel_rows(path: str, sheet: Optional[str]) -> Tuple[List[str], Iterable[List[Any]]]:
@@ -1387,6 +1548,8 @@ def ingest_one(
   try:
     if not existing_id:
       db.insert_product(sku, product_id=product_id)
+    # Keep alias table warm for better anchor resolution in chat (best-effort).
+    db.upsert_default_aliases_for_product(product_id=str(product_id), brand=sku.brand, name=sku.name)
     db.insert_vectors(
       product_id=product_id,
       vector_id=vector_id,
@@ -1422,6 +1585,7 @@ def main() -> None:
   parser.add_argument("--list-models", action="store_true", help="List available Gemini models and exit.")
   parser.add_argument("--ingest-kb", action="store_true", help="Also ingest non-ingredient notes into product_kb_snippets.")
   parser.add_argument("--kb-only", action="store_true", help="Only upsert KB snippets from the workbook (no LLM calls). Requires --input.")
+  parser.add_argument("--aliases-only", action="store_true", help="Only upsert default Product Aliases from existing products (no LLM calls).")
 
   parser.add_argument("--col-brand", type=str, default="brand")
   parser.add_argument("--col-name", type=str, default="name")
@@ -1448,6 +1612,18 @@ def main() -> None:
   args = parser.parse_args()
 
   load_dotenv()
+
+  if args.aliases_only:
+    database_url = resolve_env_templates(_require_env("DATABASE_URL"))
+    with AuroraDb(database_url) as db:
+      rows = db.load_all_products_basic()
+      upserted = 0
+      for product_id, brand, name in rows:
+        db.upsert_default_aliases_for_product(product_id=product_id, brand=brand, name=name)
+        upserted += 1
+      db.conn.commit()
+      print(f"🔤 Product aliases upserted for {upserted} products.")
+    return
 
   if args.kb_only:
     if not args.input:

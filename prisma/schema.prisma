@@ -27,6 +27,7 @@ model Product {
   socialStats SocialStats?
   kbSnippets  ProductKbSnippet[]
   priceSnapshots ProductPriceSnapshot[]
+  aliases ProductAlias[]
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -138,4 +139,26 @@ model ProductPriceSnapshot {
   @@index([capturedAt])
   @@index([productId, region, capturedAt])
   @@map("product_price_snapshots")
+}
+
+model ProductAlias {
+  id        String  @id @default(uuid())
+  productId String  @map("product_id")
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  alias          String
+  aliasNormalized String @map("alias_normalized")
+
+  // Optional: "brand" | "name" | "full_name" | "nickname" | etc.
+  kind   String?
+  weight Int     @default(0)
+  locale String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([productId, aliasNormalized], map: "product_aliases_product_alias_norm_uidx")
+  @@index([aliasNormalized])
+  @@index([productId])
+  @@map("product_aliases")
 }

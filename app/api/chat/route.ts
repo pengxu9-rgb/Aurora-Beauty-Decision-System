@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { createTextStreamResponse } from "ai";
+import { Prisma } from "@prisma/client";
 
 import { getSkuById, getSkuDatabase, resolveProductIdForSkuId } from "@/app/v1/decision/_lib";
 import { calculateScore } from "@/lib/engine";
@@ -279,6 +280,141 @@ function detectRegionPreference(query: string): RegionPreference {
   return null;
 }
 
+function normalizeAliasText(value: string) {
+  // Keep CJK characters; remove whitespace/punctuation; normalize full-width chars.
+  const nkfc = String(value ?? "").normalize("NFKC").toLowerCase();
+  return nkfc.replace(/\s+/g, "").replace(/[^0-9a-z\u4e00-\u9fff]+/g, "");
+}
+
+type AnchorCandidate = {
+  product_id: string;
+  confidence: number; // 0-1
+  matched_alias: string;
+  alias_kind?: string | null;
+  alias_len: number;
+  weight: number;
+};
+
+type AliasMatchRow = {
+  product_id: string;
+  alias: string;
+  alias_normalized: string;
+  kind: string | null;
+  weight: number | null;
+  alias_len: number;
+};
+
+function clamp01(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
+function scoreAliasMatch(row: AliasMatchRow) {
+  const aliasLen = Number(row.alias_len ?? row.alias_normalized?.length ?? 0);
+  const weight = Number(row.weight ?? 0);
+  const kind = String(row.kind ?? "").toLowerCase();
+
+  const lengthBoost = Math.min(0.45, aliasLen * 0.03); // 15 chars -> +0.45
+  const weightBoost = Math.min(0.15, Math.max(0, weight) / 100); // 0-100 -> +0.15
+
+  const kindBoost = kind.includes("nickname") ? 0.22 : kind.includes("full") ? 0.15 : kind.includes("brand") ? -0.12 : 0;
+
+  const base = 0.35;
+  return clamp01(base + lengthBoost + weightBoost + kindBoost);
+}
+
+async function findAnchorCandidatesFromAliases(query: string): Promise<AnchorCandidate[]> {
+  const normalizedQuery = normalizeAliasText(query);
+  if (normalizedQuery.length < 2) return [];
+
+  let rows: AliasMatchRow[] = [];
+  try {
+    rows = await prisma.$queryRaw<AliasMatchRow[]>(
+      Prisma.sql`
+        SELECT
+          pa.product_id AS product_id,
+          pa.alias AS alias,
+          pa.alias_normalized AS alias_normalized,
+          pa.kind AS kind,
+          pa.weight AS weight,
+          LENGTH(pa.alias_normalized) AS alias_len
+        FROM "product_aliases" pa
+        WHERE pa.alias_normalized IS NOT NULL
+          AND pa.alias_normalized <> ''
+          AND LENGTH(pa.alias_normalized) >= 2
+          AND ${normalizedQuery} LIKE '%' || pa.alias_normalized || '%'
+        ORDER BY LENGTH(pa.alias_normalized) DESC, COALESCE(pa.weight, 0) DESC
+        LIMIT 25;
+      `,
+    );
+  } catch (e) {
+    // Backward-compatible: aliases table might not be migrated yet.
+    return [];
+  }
+
+  const bestByProduct = new Map<string, AnchorCandidate>();
+  for (const r of rows) {
+    const productId = String(r.product_id ?? "").trim();
+    if (!productId) continue;
+
+    const candidate: AnchorCandidate = {
+      product_id: productId,
+      confidence: scoreAliasMatch(r),
+      matched_alias: String(r.alias ?? "").trim() || String(r.alias_normalized ?? ""),
+      alias_kind: r.kind,
+      alias_len: Number(r.alias_len ?? 0),
+      weight: Number(r.weight ?? 0),
+    };
+
+    const prev = bestByProduct.get(productId);
+    if (!prev) {
+      bestByProduct.set(productId, candidate);
+      continue;
+    }
+
+    // Prefer longer alias matches; then higher confidence.
+    if (candidate.alias_len > prev.alias_len || candidate.confidence > prev.confidence) {
+      bestByProduct.set(productId, candidate);
+    }
+  }
+
+  return Array.from(bestByProduct.values()).sort((a, b) => b.confidence - a.confidence).slice(0, 5);
+}
+
+function detectDupeIntent(query: string) {
+  const q = query.toLowerCase();
+  return (
+    q.includes("dupe") ||
+    q.includes("alternative") ||
+    q.includes("alternatives") ||
+    q.includes("similar") ||
+    query.includes("平替") ||
+    query.includes("替代") ||
+    query.includes("对比") ||
+    query.includes("类似") ||
+    query.includes("同款")
+  );
+}
+
+function detectProductEvaluationIntent(query: string) {
+  const q = query.toLowerCase();
+  return (
+    q.includes("worth") ||
+    q.includes("good") ||
+    q.includes("ok") ||
+    q.includes("works") ||
+    q.includes("怎么样") ||
+    query.includes("好用吗") ||
+    query.includes("值吗") ||
+    query.includes("适合吗") ||
+    query.includes("能用吗") ||
+    query.includes("可以用吗") ||
+    query.includes("怎么样")
+  );
+}
+
 function mapRiskFlags(rawFlags: unknown): RiskFlag[] {
   const flags = Array.isArray(rawFlags) ? rawFlags.map((f) => String(f).toLowerCase()) : [];
   const out = new Set<RiskFlag>();
@@ -333,6 +469,141 @@ function parseBudgetCny(query: string): number | null {
   const m3 = normalized.match(/(\d+(?:\.\d+)?)\s*(?:元|块)\b/);
   if (m3?.[1]) return Number(m3[1]);
   return null;
+}
+
+type ClarificationQuestion = { id: string; question: string; options: string[] };
+
+function hasExplicitSkinTypeMention(query: string) {
+  const q = query.toLowerCase();
+  return (
+    q.includes("oily") ||
+    q.includes("dry") ||
+    q.includes("combination") ||
+    q.includes("combo") ||
+    q.includes("normal") ||
+    q.includes("sensitive") ||
+    query.includes("油") ||
+    query.includes("干") ||
+    query.includes("混合") ||
+    query.includes("中性") ||
+    query.includes("敏感")
+  );
+}
+
+function hasExplicitPrimaryConcern(query: string) {
+  const q = query.toLowerCase();
+  return (
+    detectOilyAcne(query) ||
+    detectClosedComedonesOrRoughTexture(query) ||
+    q.includes("brighten") ||
+    q.includes("whitening") ||
+    q.includes("dark spot") ||
+    q.includes("hyperpig") ||
+    q.includes("anti-aging") ||
+    q.includes("aging") ||
+    query.includes("美白") ||
+    query.includes("提亮") ||
+    query.includes("淡斑") ||
+    query.includes("祛斑") ||
+    query.includes("暗沉") ||
+    query.includes("痘印") ||
+    query.includes("抗老") ||
+    query.includes("皱纹") ||
+    query.includes("细纹") ||
+    query.includes("修护") ||
+    query.includes("屏障")
+  );
+}
+
+function mentionsBudgetButMissing(query: string, budgetCny: number | null) {
+  if (budgetCny != null) return false;
+  const q = query.toLowerCase();
+  return q.includes("budget") || query.includes("预算") || query.includes("便宜") || query.includes("省钱") || /[¥￥]/.test(query);
+}
+
+function mentionsStrongActives(query: string) {
+  const q = query.toLowerCase();
+  return (
+    q.includes("retinol") ||
+    q.includes("adapalene") ||
+    q.includes("tretinoin") ||
+    q.includes("aha") ||
+    q.includes("bha") ||
+    q.includes("glycolic") ||
+    q.includes("salicylic") ||
+    q.includes("mandelic") ||
+    q.includes("azelaic") ||
+    query.includes("a醇") ||
+    query.includes("维a") ||
+    query.includes("阿达帕林") ||
+    query.includes("水杨酸") ||
+    query.includes("果酸") ||
+    query.includes("杏仁酸") ||
+    query.includes("壬二酸") ||
+    query.includes("酸")
+  );
+}
+
+function buildRoutineClarification(query: string, budgetCny: number | null): { questions: ClarificationQuestion[]; missing: string[] } {
+  const questions: ClarificationQuestion[] = [];
+  const missing: string[] = [];
+
+  const hasSkin = hasExplicitSkinTypeMention(query) || detectSensitiveSkin(query);
+  const hasConcern = hasExplicitPrimaryConcern(query);
+  const needsBudget = mentionsBudgetButMissing(query, budgetCny);
+  const barrierUnknown = !detectSensitiveSkin(query) && !detectBarrierImpaired(query) && mentionsStrongActives(query);
+
+  // Priority 1: budget only when the user explicitly cares.
+  if (needsBudget) {
+    missing.push("budget");
+    questions.push({
+      id: "budget",
+      question: "你的月预算大概是多少？",
+      options: ["¥200", "¥500", "¥1000+", "不确定"],
+    });
+  }
+
+  // Priority 2: skin type (only if not implied by sensitivity).
+  if (!hasSkin && questions.length < 2) {
+    missing.push("skin_type");
+    questions.push({
+      id: "skin_type",
+      question: "你的肤质更接近哪一种？",
+      options: ["油皮", "干皮", "混合皮", "敏感肌", "不确定"],
+    });
+  }
+
+  // Priority 3: concern (if truly missing).
+  if (!hasConcern && questions.length < 2) {
+    missing.push("concerns");
+    questions.push({
+      id: "concerns",
+      question: "你最想优先解决的 1-2 个问题是？",
+      options: ["闭口/黑头", "痘痘", "暗沉/美白", "泛红敏感", "抗老", "补水修护"],
+    });
+  }
+
+  // Optional: barrier status only when actives are mentioned and we still have space.
+  if (barrierUnknown && questions.length < 2) {
+    missing.push("barrier_status");
+    questions.push({
+      id: "barrier_status",
+      question: "你最近是否有刺痛/泛红/爆皮（屏障受损）？",
+      options: ["没有", "轻微", "明显（刺痛泛红）", "不确定"],
+    });
+  }
+
+  return { questions, missing };
+}
+
+function formatClarificationAnswer(questions: ClarificationQuestion[]) {
+  const lines: string[] = [];
+  lines.push("为了给你更准的建议，我需要先确认 1-2 个信息：");
+  for (const [idx, q] of questions.entries()) {
+    lines.push(`${idx + 1}) ${q.question}（${q.options.join(" / ")}）`);
+  }
+  lines.push("你直接回复选项即可，我再生成完整的 AM/PM 流程。");
+  return lines.join("\n");
 }
 
 function inferSkinTypes(query: string): SkinType[] {
@@ -1566,13 +1837,42 @@ export async function POST(req: Request) {
 
   const explicitAnchorId =
     typeof body.anchor_product_id === "string" && body.anchor_product_id.trim() ? body.anchor_product_id.trim() : null;
-  const inferredAnchorId = explicitAnchorId ?? (await findAnchorProductId(query));
+  const dupeIntent = detectDupeIntent(query);
+  const evalIntent = detectProductEvaluationIntent(query);
+  const routineIntent = query.includes("流程") || query.includes("早晚") || query.toLowerCase().includes("routine");
 
-  // If the user didn't mention a specific product, treat this as a "routine planning" request.
-  const shouldPlanRoutine =
-    !inferredAnchorId || query.includes("流程") || query.includes("早晚") || query.toLowerCase().includes("routine");
+  const aliasCandidates = explicitAnchorId ? [] : await findAnchorCandidatesFromAliases(query);
+  const bestAlias = aliasCandidates[0] ?? null;
+  const highConfidenceAlias = bestAlias != null && bestAlias.confidence >= 0.72;
 
-  const anchorProductId = inferredAnchorId;
+  // Legacy fallback (brand heuristics + loose token match).
+  const legacyAnchorId = !explicitAnchorId && (dupeIntent || evalIntent) ? await findAnchorProductId(query) : null;
+
+  const anchorProductId = explicitAnchorId ?? (highConfidenceAlias ? bestAlias.product_id : null) ?? legacyAnchorId;
+
+  // If the user is asking for a dupe/compare, we should not silently drift into a routine.
+  if ((dupeIntent || evalIntent) && (!anchorProductId || !looksLikeUuid(anchorProductId))) {
+    const suggestions = aliasCandidates.slice(0, 3).map((c) => c.matched_alias).filter(Boolean);
+    const hint = suggestions.length ? `\n\n我猜你可能在说：${suggestions.join(" / ")}。` : "";
+    const answer = dupeIntent
+      ? `为了帮你找“平替/替代”，我需要你明确 **想对比的具体产品**（发产品名或链接即可）。${hint}`
+      : `我需要你提供具体产品名（或传 \`anchor_product_id\`），我才能基于数据库做“适配/风险/替代”分析。${hint}`;
+    if (Boolean(body.stream)) return streamTextResponse(answer);
+    return NextResponse.json({
+      query,
+      intent: "clarify",
+      answer,
+      clarification: {
+        questions: [
+          { id: "anchor", question: "你想对比/评估的具体产品是？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] },
+        ],
+        candidates: aliasCandidates,
+      },
+    });
+  }
+
+  // Default: Routine planning unless the user explicitly wants dupe/evaluation (or provides an explicit anchor id).
+  const shouldPlanRoutine = routineIntent || (!explicitAnchorId && !dupeIntent && !evalIntent);
 
   const provider =
     body.llm_provider ??
@@ -1584,6 +1884,18 @@ export async function POST(req: Request) {
 
   // ROUTINE PATH
   if (shouldPlanRoutine) {
+    const clarify = buildRoutineClarification(query, budgetCny);
+    if (clarify.questions.length) {
+      const answer = formatClarificationAnswer(clarify.questions);
+      if (wantsStream) return streamTextResponse(answer);
+      return NextResponse.json({
+        query,
+        intent: "clarify",
+        answer,
+        clarification: { questions: clarify.questions, missing_fields: clarify.missing, region_preference: detectedRegion },
+      });
+    }
+
     // Build a lightweight user vector from query text.
     const user = buildUserVectorFromQuery(query, budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined);
     const db = await getSkuDatabase();
