@@ -364,6 +364,26 @@ function inferGoals(query: string): UserGoal[] {
     push("repair", 3);
   }
 
+  // Brightening / dark spots
+  if (
+    q.includes("brighten") ||
+    q.includes("whitening") ||
+    q.includes("dark spot") ||
+    q.includes("dark spots") ||
+    q.includes("hyperpig") ||
+    query.includes("美白") ||
+    query.includes("提亮") ||
+    query.includes("淡斑") ||
+    query.includes("祛斑") ||
+    query.includes("暗沉") ||
+    query.includes("黄气") ||
+    query.includes("痘印") ||
+    query.includes("色沉")
+  ) {
+    const sensitiveOrImpaired = detectSensitiveSkin(query) || detectBarrierImpaired(query) || query.includes("刺痛");
+    push("brightening", sensitiveOrImpaired ? 2 : 1);
+  }
+
   // Anti-aging
   if (q.includes("anti-aging") || q.includes("aging") || query.includes("抗老") || query.includes("皱纹") || query.includes("细纹")) {
     push("brightening", 1);
@@ -1064,12 +1084,7 @@ export async function POST(req: Request) {
 
   // If the user didn't mention a specific product, treat this as a "routine planning" request.
   const shouldPlanRoutine =
-    !inferredAnchorId &&
-    (query.includes("流程") ||
-      query.includes("早晚") ||
-      query.toLowerCase().includes("routine") ||
-      detectOilyAcne(query) ||
-      (budgetCny != null && budgetCny > 0));
+    !inferredAnchorId || query.includes("流程") || query.includes("早晚") || query.toLowerCase().includes("routine");
 
   const anchorProductId = inferredAnchorId;
 
