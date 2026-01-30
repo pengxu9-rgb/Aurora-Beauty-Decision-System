@@ -87,6 +87,7 @@ class InputSku:
   availability: Optional[List[str]] = None
   product_url: Optional[str] = None
   image_url: Optional[str] = None
+  expert_knowledge: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -1054,7 +1055,17 @@ def load_input_skus_from_json(*, path: str, price_cny_rate: float, limit: Option
 
     brand = str(raw.get("brand") or "").strip()
     name = str(raw.get("name") or "").strip()
+    # Many CSV pipelines put the full product name (including brand) into `name`.
+    # Attempt to split it to reduce duplicates when ingesting.
+    if name and (not brand or name.lower().startswith(brand.lower())):
+      split_brand, split_name = split_brand_and_name(name)
+      if not brand and split_brand and split_brand != "Unknown":
+        brand = split_brand
+      if split_name:
+        name = split_name
     ingredients = str(raw.get("ingredients_text") or raw.get("ingredients") or "").strip()
+
+    expert_raw = raw.get("expert_knowledge") if isinstance(raw.get("expert_knowledge"), dict) else None
 
     price_usd_raw = raw.get("price_usd", raw.get("price"))
     try:
@@ -1093,6 +1104,7 @@ def load_input_skus_from_json(*, path: str, price_cny_rate: float, limit: Option
         availability=availability,
         product_url=str(product_url).strip() if product_url else None,
         image_url=str(image_url).strip() if image_url else None,
+        expert_knowledge=expert_raw,
       )
     )
 
@@ -1150,6 +1162,79 @@ def ingest_one(
 ) -> None:
   print(f"🧪 Processing: {sku.brand} - {sku.name} ...")
 
+  if dry_run:
+    vectors = get_vectors_from_llm(client, model=llm_model, brand=sku.brand, name=sku.name, ingredients=sku.ingredients_text)
+
+    embedding: Optional[List[float]] = None
+    if enable_embedding:
+      embedding = get_embedding(client, model=embedding_model, text=sku.ingredients_text)
+
+    social_payload: Dict[str, Any] = {}
+    if social_provider == "openai":
+      if not openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY is required when --social-provider=openai")
+      print(f"   ...Simulating social stats for {sku.name}")
+      social_payload = get_social_simulation_openai(
+        brand=sku.brand,
+        name=sku.name,
+        ingredients_text=(sku.ingredients_text[:2000] if sku.ingredients_text else None),
+        api_key=openai_api_key,
+        model=social_model,
+        api_base_url=openai_api_base_url,
+      )
+    elif social_provider == "llm":
+      ss = vectors.get("social_stats") or {}
+      if isinstance(ss, dict):
+        social_payload = {
+          "red_score": _clamp_int(ss.get("red_score") or ss.get("redScore"), min_value=0, max_value=100),
+          "reddit_score": _clamp_int(ss.get("reddit_score") or ss.get("redditScore"), min_value=0, max_value=100),
+          "burn_rate": _clamp_float(ss.get("burn_rate") or ss.get("burnRate"), min_value=0.0, max_value=1.0),
+          "top_keywords": _coerce_keywords(ss.get("top_keywords") or ss.get("topKeywords")),
+          "_raw": ss,
+        }
+    elif social_provider == "none":
+      social_payload = {"red_score": 0, "reddit_score": 0, "burn_rate": 0.0, "top_keywords": []}
+
+    print(
+      json.dumps(
+        {"product": {"brand": sku.brand, "name": sku.name}, "vectors": vectors, "social": social_payload, "expert_knowledge": sku.expert_knowledge},
+        ensure_ascii=False,
+      )
+    )
+    return
+
+  if db is None:
+    raise RuntimeError("Internal error: db is required unless --dry-run is set.")
+
+  def _upsert_expert_knowledge(*, product_id: str) -> int:
+    ek = sku.expert_knowledge
+    if not isinstance(ek, dict) or not ek:
+      return 0
+
+    upserted = 0
+    for key, value in ek.items():
+      content = str(value).strip() if value is not None else ""
+      if len(content) < 2:
+        continue
+      db.upsert_kb_snippet(
+        product_id=product_id,
+        source_sheet="expert_knowledge",
+        field=canonicalize_kb_field(str(key)),
+        content=content,
+        metadata={"source": "expert_knowledge", "brand": sku.brand, "name": sku.name},
+      )
+      upserted += 1
+    return upserted
+
+  existing_id = db.find_product_id(brand=sku.brand, name=sku.name)
+  if existing_id and not overwrite:
+    upserted = _upsert_expert_knowledge(product_id=str(existing_id))
+    if upserted:
+      db.conn.commit()
+      print(f"📝 Expert knowledge upserted: {upserted}")
+    print(f"↩️  Skipped (exists): {sku.brand} - {sku.name}")
+    return
+
   vectors = get_vectors_from_llm(client, model=llm_model, brand=sku.brand, name=sku.name, ingredients=sku.ingredients_text)
   embedding: Optional[List[float]] = None
   if enable_embedding:
@@ -1180,23 +1265,6 @@ def ingest_one(
       }
   elif social_provider == "none":
     social_payload = {"red_score": 0, "reddit_score": 0, "burn_rate": 0.0, "top_keywords": []}
-
-  if dry_run:
-    print(
-      json.dumps(
-        {"product": {"brand": sku.brand, "name": sku.name}, "vectors": vectors, "social": social_payload},
-        ensure_ascii=False,
-      )
-    )
-    return
-
-  if db is None:
-    raise RuntimeError("Internal error: db is required unless --dry-run is set.")
-
-  existing_id = db.find_product_id(brand=sku.brand, name=sku.name)
-  if existing_id and not overwrite:
-    print(f"↩️  Skipped (exists): {sku.brand} - {sku.name}")
-    return
 
   if existing_id and overwrite:
     product_id = existing_id
@@ -1231,6 +1299,7 @@ def ingest_one(
       burn_rate=float(social_payload.get("burn_rate", 0.0)),
       top_keywords=list(social_payload.get("top_keywords", []) if isinstance(social_payload.get("top_keywords", []), list) else []),
     )
+    _upsert_expert_knowledge(product_id=str(product_id))
     db.conn.commit()
     print(f"✅ Ingested: {sku.brand} - {sku.name}")
   except BaseException:  # noqa: BLE001

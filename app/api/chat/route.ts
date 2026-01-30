@@ -113,6 +113,12 @@ Serum/Ampoule: Recommend higher budget. "Deep penetration requires better delive
 - If a product availability includes "Global", explicitly mention it is widely available.
 - If no products match the user's region, say so and provide Global options.
 
+7. Expert Insight Integration (Footnotes)
+
+- Context Data may contain 'expert_knowledge' and/or expert notes (e.g., sensitivity flags, comparison notes).
+- YOU MUST quote or paraphrase these notes when they exist (treat them as "footnotes" / evidence).
+- If 'expert_knowledge.sensitivity_notes' flags a risk (e.g., fragrance/alcohol/strong acids) AND the user is sensitive or barrier is impaired, you MUST VETO and start with a clear warning.
+
 ${modeAddendum}
 
 Response Format (Markdown)
@@ -151,6 +157,9 @@ Professional yet Accessible: Use clear terms. Explain "why" briefly.
 Honest: If the retrieved products don't match the user (e.g., no safe options found), admit it and suggest generic ingredients (e.g., "Look for a plain 5% Panthenol cream").
 
 No Fluff: Go straight to the solution.
+
+Formatting:
+- Use emoji bullets for readability (e.g., ✅ / ⚠️ / 💡) while keeping the structure requested above.
 
 Few-Shot Examples (format reference only; do not copy products unless present in Context Data)
 
@@ -243,13 +252,16 @@ function detectBarrierImpaired(query: string) {
 function detectRegionPreference(query: string): RegionPreference {
   const q = query.toLowerCase();
 
-  if (q.includes("china") || query.includes("国内") || query.includes("淘宝") || query.includes("中国")) return "CN";
-
   const mentionsUs = /\b(us|usa)\b/i.test(query) || q.includes("sephora") || q.includes("amazon") || query.includes("美国");
   if (mentionsUs) return "US";
 
   const mentionsEu = /\b(eu)\b/i.test(query) || q.includes("europe") || query.includes("欧洲");
   if (mentionsEu) return "EU";
+
+  if (q.includes("china") || query.includes("国内") || query.includes("淘宝") || query.includes("中国")) return "CN";
+
+  // If the user is chatting in Chinese and didn't specify a different region, default to CN for better availability filtering.
+  if (/[\u4e00-\u9fff]/.test(query)) return "CN";
 
   return null;
 }
@@ -562,6 +574,61 @@ type IngredientContext = {
   hero_actives?: unknown;
   highlights: string[];
 };
+
+type ExpertKnowledge = {
+  sensitivity_notes?: string;
+  comparison_notes?: string;
+  key_actives_summary?: string;
+  sources?: Array<{ source_sheet: string; field: string }>;
+};
+
+function buildExpertKnowledgeFromKb(
+  snippets: Array<{ source_sheet: string; field: string; content: string }>,
+): ExpertKnowledge | null {
+  if (!snippets.length) return null;
+
+  const sensitivity: string[] = [];
+  const comparison: string[] = [];
+  const keyActives: string[] = [];
+  const sources: ExpertKnowledge["sources"] = [];
+
+  const pushUnique = (list: string[], value: string) => {
+    const cleaned = value.trim();
+    if (!cleaned) return;
+    if (list.includes(cleaned)) return;
+    list.push(cleaned);
+  };
+
+  for (const s of snippets) {
+    const field = String(s.field ?? "").toLowerCase();
+    const content = String(s.content ?? "").trim();
+    if (!content) continue;
+
+    sources.push({ source_sheet: String(s.source_sheet ?? ""), field: String(s.field ?? "") });
+
+    if (field.includes("sensitivity")) {
+      pushUnique(sensitivity, content);
+      continue;
+    }
+    if (field.includes("comparison") || field.endsWith("_notes") || field === "notes") {
+      pushUnique(comparison, content);
+      continue;
+    }
+    if (field.includes("key") && (field.includes("active") || field.includes("actives"))) {
+      pushUnique(keyActives, content);
+      continue;
+    }
+  }
+
+  if (!sensitivity.length && !comparison.length && !keyActives.length) return null;
+
+  return {
+    sensitivity_notes: sensitivity.length ? sensitivity.join(" | ") : undefined,
+    comparison_notes: comparison.length ? comparison.join(" | ") : undefined,
+    key_actives_summary: keyActives.length ? keyActives.join(" | ") : undefined,
+    sources: sources.length ? sources : undefined,
+  };
+}
 
 function normalizeIngredientList(fullList: unknown): string[] {
   if (!fullList) return [];
@@ -1186,8 +1253,20 @@ export async function POST(req: Request) {
   const ingredientByProductId = new Map<string, { fullList: unknown; heroActives: unknown }>();
   for (const row of ingredientRows) ingredientByProductId.set(row.productId, { fullList: row.fullList, heroActives: row.heroActives });
 
+  const kbRows = await prisma.productKbSnippet.findMany({
+    where: { productId: { in: [anchor.id, ...candidateIds] } },
+    select: { productId: true, sourceSheet: true, field: true, content: true },
+  });
+  const kbByProductId = new Map<string, Array<{ source_sheet: string; field: string; content: string }>>();
+  for (const row of kbRows) {
+    const list = kbByProductId.get(row.productId) ?? [];
+    list.push({ source_sheet: row.sourceSheet, field: row.field, content: row.content });
+    kbByProductId.set(row.productId, list);
+  }
+
   const anchorIngredients = ingredientByProductId.get(anchor.id);
   const anchorIngredientCtx = summarizeIngredients(anchorIngredients?.fullList, anchorIngredients?.heroActives);
+  const anchorExpertKnowledge = buildExpertKnowledgeFromKb(kbByProductId.get(anchor.id) ?? []);
 
   const mappedCandidates = candidates.map((c) => {
     const ing = ingredientByProductId.get(c.product_id);
@@ -1207,6 +1286,7 @@ export async function POST(req: Request) {
         return "Lower-cost alternative.";
       })(),
       ingredients: ingCtx,
+      expert_knowledge: buildExpertKnowledgeFromKb(kbByProductId.get(c.product_id) ?? []),
     };
   });
 
@@ -1235,6 +1315,7 @@ export async function POST(req: Request) {
       },
       social_stats: anchorSku.social_stats,
       ingredients: anchorIngredientCtx,
+      expert_knowledge: anchorExpertKnowledge,
     },
     candidates: candidates.slice(0, 5).map((c) => {
       const ing = ingredientByProductId.get(c.product_id);
@@ -1264,6 +1345,7 @@ export async function POST(req: Request) {
         },
         social_stats: c.sku.social_stats,
         ingredients: ingCtx,
+        expert_knowledge: buildExpertKnowledgeFromKb(kbByProductId.get(c.product_id) ?? []),
       };
     }),
   };
