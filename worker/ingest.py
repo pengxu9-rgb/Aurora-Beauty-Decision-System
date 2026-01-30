@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 import unicodedata
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -27,9 +28,16 @@ Rules (high-level heuristics):
 - Barrier repair: High if Ceramides, Cholesterol, Fatty Acids, Panthenol.
 
 Risk flags:
-- Flag 'alcohol_high' if 'Alcohol Denat' appears in top 5.
-- Flag 'fungal_acne' if Polysorbates are present.
-- Flag 'high_irritation' if strong acids/retinoids are present and the formula looks aggressive.
+- Use this controlled vocabulary (only set when you are confident from the ingredient list):
+  - 'alcohol_high' if 'Alcohol Denat' (denatured alcohol) appears in top 5.
+  - 'strong_acid' if strong exfoliating acids (e.g., glycolic/lactic/salicylic) are present as key actives.
+  - 'mild_acid' if milder acids (e.g., azelaic/mandelic/PHA) are present.
+  - 'retinol_high' if retinoids are present (retinol/retinal/tretinoin/adapalene).
+  - 'benzoyl_peroxide' if benzoyl peroxide is present.
+  - 'fragrance' if Fragrance/Parfum or common fragrance allergens are present.
+  - 'mint' if menthol/peppermint/camphor/eucalyptus are present.
+  - 'fungal_acne' if Polysorbates are present.
+  - 'high_irritation' ONLY if strong_acid/retinol_high/benzoyl_peroxide is present (leave-on "strong actives").
 
 Output Format (JSON):
 {
@@ -210,6 +218,31 @@ def resolve_env_templates(value: str) -> str:
     raise RuntimeError("DATABASE_URL still contains unresolved template placeholders after substitution.")
 
   return rendered
+
+
+def sanitize_database_url_for_psycopg2(database_url: str) -> str:
+  """
+  psycopg2/libpq accepts many standard URI query params (e.g. sslmode),
+  but NOT Prisma's `?schema=public` parameter.
+
+  Railway / Prisma / Vercel often provide DATABASE_URL like:
+    postgresql://.../railway?schema=public
+  Strip only the unsupported `schema` param and keep everything else.
+  """
+  raw = (database_url or "").strip()
+  if not raw:
+    return raw
+  if "?" not in raw:
+    return raw
+
+  parts = urlsplit(raw)
+  query = parse_qsl(parts.query, keep_blank_values=True)
+  filtered = [(k, v) for (k, v) in query if k.lower() != "schema"]
+  if filtered == query:
+    return raw
+
+  rebuilt = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(filtered), parts.fragment))
+  return rebuilt
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
@@ -467,20 +500,24 @@ def get_vectors_from_llm(client: GeminiClient, *, model: str, brand: str, name: 
     return n
 
   cleaned_risk_flags = [str(x).strip() for x in risk_flags if str(x).strip()]
+  final_risk_flags = postprocess_risk_flags(llm_flags=cleaned_risk_flags, product_name=name, ingredients_text=ingredients)
 
   def _default_burn_rate(flags: List[str]) -> float:
     lower = [f.lower() for f in flags]
-    if any("high_irritation" in f or "irritation" in f for f in lower):
+    if any(f in lower for f in ("high_irritation", "strong_acid", "retinol_high", "benzoyl_peroxide")):
       return 0.15
-    if any("alcohol" in f for f in lower) or any("acid" in f for f in lower):
+    if any(f in lower for f in ("alcohol_high", "fragrance", "mint", "mild_acid")):
       return 0.08
     return 0.03
 
   # Social stats are often not available from ingredients alone; we accept LLM-provided estimates
   # but also provide safe defaults so the pipeline is usable out-of-the-box.
-  red_score = _clamp_int_0_100(social.get("red_score", 60) if isinstance(social, dict) else 60)
-  reddit_score = _clamp_int_0_100(social.get("reddit_score", 60) if isinstance(social, dict) else 60)
-  burn_rate = _clamp_float_0_1(social.get("burn_rate", _default_burn_rate(cleaned_risk_flags)) if isinstance(social, dict) else _default_burn_rate(cleaned_risk_flags))
+  red_score = _clamp_int_0_100((social.get("red_score") or social.get("redScore") or 60) if isinstance(social, dict) else 60)
+  reddit_score = _clamp_int_0_100((social.get("reddit_score") or social.get("redditScore") or 60) if isinstance(social, dict) else 60)
+  burn_rate_raw = (
+    (social.get("burn_rate") or social.get("burnRate") or _default_burn_rate(final_risk_flags)) if isinstance(social, dict) else _default_burn_rate(final_risk_flags)
+  )
+  burn_rate = calibrate_burn_rate(burn_rate=_clamp_float_0_1(burn_rate_raw), risk_flags=final_risk_flags, product_name=name)
 
   top_keywords_raw = social.get("top_keywords", []) if isinstance(social, dict) else []
   if isinstance(top_keywords_raw, str):
@@ -497,7 +534,7 @@ def get_vectors_from_llm(client: GeminiClient, *, model: str, brand: str, name: 
       "soothing": _clamp_int_0_100(mechanism.get("soothing", 0)),
       "barrier_repair": _clamp_int_0_100(mechanism.get("barrier_repair", 0)),
     },
-    "risk_flags": cleaned_risk_flags,
+    "risk_flags": final_risk_flags,
     "experience_prediction": {
       "texture": str(experience.get("texture", "")).strip() or "unknown",
       "finish": str(experience.get("finish", "")).strip() or "natural",
@@ -527,6 +564,226 @@ def parse_ingredients_list(text: str) -> List[str]:
   # Keep it simple: split by comma; Excel sheets commonly store INCI as comma-separated.
   items = [t.strip() for t in text.split(",")]
   return [t for t in items if t]
+
+
+def _looks_like_wash_off_product(name: str) -> bool:
+  n = (name or "").lower()
+  return any(
+    k in n
+    for k in (
+      "cleanser",
+      "cleansing",
+      "face wash",
+      "facial wash",
+      "wash",
+      "soap",
+      "foaming",
+      "foam",
+      "gel cleanser",
+      "body wash",
+    )
+  )
+
+
+def infer_risk_flags_from_ingredients(*, product_name: str, ingredients_text: str) -> List[str]:
+  """
+  Deterministic, conservative risk flag extraction.
+
+  Goal:
+  - Avoid LLM hallucination/over-flagging (e.g., mild cleansers marked as high_irritation).
+  - Emit a controlled vocabulary used by downstream VETO logic.
+  """
+  text = unicodedata.normalize("NFKC", str(ingredients_text or "")).lower()
+  items = [unicodedata.normalize("NFKC", t).lower() for t in parse_ingredients_list(text)]
+  top5 = items[:5]
+  top10 = items[:10]
+
+  def _has_any(haystack: List[str], needles: List[str]) -> bool:
+    return any(any(n in token for n in needles) for token in haystack)
+
+  # Alcohol (denat) in top ingredients is a strong irritation signal for impaired barriers.
+  alcohol_terms = ["alcohol denat", "alcohol denat.", "denatured alcohol", "sd alcohol", "ethyl alcohol"]
+  has_alcohol_high = _has_any(top5, alcohol_terms)
+
+  # Retinoids (leave-on "actives" category).
+  retinoid_terms = [
+    "retinol",
+    "retinal",
+    "retinaldehyde",
+    "tretinoin",
+    "adapalene",
+    "tazarotene",
+    "retinoate",
+    "hydroxypinacolone retinoate",
+  ]
+  has_retinoid = _has_any(items, retinoid_terms)
+
+  # Strong acids: treat BHA and strong AHA as "strong_acid". Exclude common pH adjusters like citric acid.
+  strong_acid_terms = [
+    "salicylic acid",
+    "capryloyl salicylic acid",
+    "betaine salicylate",
+    "glycolic acid",
+    "lactic acid",
+  ]
+  has_strong_acid = _has_any(top10, strong_acid_terms)
+
+  # Mild acids: useful for comedones even in sensitive users; should NOT trigger "strong acid" veto.
+  mild_acid_terms = ["azelaic acid", "mandelic acid", "gluconolactone", "lactobionic acid", "pha"]
+  has_mild_acid = _has_any(items, mild_acid_terms)
+
+  # Benzoyl peroxide is a high-irritation treatment class.
+  has_benzoyl_peroxide = _has_any(items, ["benzoyl peroxide"])
+
+  # Fungal acne heuristics (simple MVP): polysorbates.
+  has_polysorbate = _has_any(items, ["polysorbate"])
+
+  # Fragrance & common EU allergen markers (often indicate fragrance load).
+  fragrance_markers = ["fragrance", "parfum", "perfume"]
+  fragrance_allergens = [
+    "limonene",
+    "linalool",
+    "citral",
+    "geraniol",
+    "eugenol",
+    "coumarin",
+    "farnesol",
+    "benzyl benzoate",
+    "benzyl salicylate",
+  ]
+  has_fragrance = _has_any(items, fragrance_markers) or _has_any(items, fragrance_allergens)
+
+  # Mint/cooling agents (often sting on impaired barriers).
+  has_mint = _has_any(items, ["menthol", "peppermint", "mentha", "camphor", "eucalyptus"])
+
+  flags: List[str] = []
+  if has_alcohol_high:
+    flags.append("alcohol_high")
+  if has_polysorbate:
+    flags.append("fungal_acne")
+  if has_fragrance:
+    flags.append("fragrance")
+  if has_mint:
+    flags.append("mint")
+  if has_retinoid:
+    flags.append("retinol_high")
+  if has_benzoyl_peroxide:
+    flags.append("benzoyl_peroxide")
+  if has_strong_acid:
+    flags.append("strong_acid")
+  if has_mild_acid and not has_strong_acid:
+    # Keep distinct from strong acids so VETO can be nuanced.
+    flags.append("mild_acid")
+
+  # High-level "this can sting" summary flag. Only set when we have strong actives.
+  if has_retinoid or has_strong_acid or has_benzoyl_peroxide:
+    flags.append("high_irritation")
+
+  # Avoid duplications while keeping a stable order for diffs/debugging.
+  order = [
+    "alcohol_high",
+    "strong_acid",
+    "mild_acid",
+    "retinol_high",
+    "benzoyl_peroxide",
+    "high_irritation",
+    "fragrance",
+    "mint",
+    "fungal_acne",
+  ]
+  stable = [f for f in order if f in set(flags)]
+  for f in flags:
+    if f not in stable:
+      stable.append(f)
+  return stable
+
+
+def postprocess_risk_flags(
+  *, llm_flags: List[str], product_name: str, ingredients_text: str
+) -> List[str]:
+  """
+  Use LLM risk flags as hints, but enforce deterministic evidence + controlled vocabulary.
+
+  This prevents false positives that cascade into safety VETO (e.g., "high_irritation" on a basic cleanser).
+  """
+  deterministic = infer_risk_flags_from_ingredients(product_name=product_name, ingredients_text=ingredients_text)
+  det_set = set(deterministic)
+
+  def _norm_flag(flag: str) -> str:
+    s = unicodedata.normalize("NFKC", str(flag or "")).strip().lower()
+    s = re.sub(r"[\s\-]+", "_", s)
+    s = re.sub(r"[^a-z0-9_]+", "", s)
+    return s
+
+  # Only keep LLM flags that are (a) in our allowlist and (b) supported by deterministic signals.
+  allowlist = {
+    "alcohol_high",
+    "strong_acid",
+    "mild_acid",
+    "retinol_high",
+    "benzoyl_peroxide",
+    "high_irritation",
+    "fungal_acne",
+    "fragrance",
+    "mint",
+  }
+
+  # Many models output generic flags like "alcohol"/"acid"/"retinol" which are too broad.
+  # Map them to our stricter tokens only if deterministic evidence exists; otherwise drop.
+  synonym_map = {
+    "alcohol": "alcohol_high",
+    "high_alcohol": "alcohol_high",
+    "acid": "strong_acid",
+    "aha": "strong_acid",
+    "bha": "strong_acid",
+    "retinol": "retinol_high",
+    "retinoid": "retinol_high",
+  }
+
+  cleaned: List[str] = []
+  for raw in llm_flags:
+    f = _norm_flag(raw)
+    if not f:
+      continue
+    f = synonym_map.get(f, f)
+    if f not in allowlist:
+      continue
+    # High-risk flags must be backed by deterministic evidence.
+    if f in ("high_irritation", "strong_acid", "mild_acid", "retinol_high", "benzoyl_peroxide", "alcohol_high", "fungal_acne", "fragrance", "mint"):
+      if f not in det_set:
+        continue
+    cleaned.append(f)
+
+  merged = list(dict.fromkeys(deterministic + cleaned))
+  return merged
+
+
+def calibrate_burn_rate(*, burn_rate: float, risk_flags: List[str], product_name: str) -> float:
+  """
+  Calibrate burn_rate so it is consistent with deterministic risk flags.
+
+  Why: burn_rate > 0.10 triggers strong VETO in chat prompts/engines. For wash-off cleansers without strong actives,
+  cap burn_rate to avoid over-vetoing the entire catalog.
+  """
+  br = _clamp_float(burn_rate, min_value=0.0, max_value=1.0)
+  wash_off = _looks_like_wash_off_product(product_name)
+
+  has_strong = any(f in risk_flags for f in ("strong_acid", "retinol_high", "benzoyl_peroxide", "high_irritation"))
+  has_medium = any(f in risk_flags for f in ("alcohol_high", "fragrance", "mint"))
+
+  if wash_off and not has_strong:
+    # Keep cleansers usable for sensitive users unless we have clear strong-actives evidence.
+    cap = 0.10 if has_medium else 0.08
+    return min(br, cap)
+
+  if has_strong:
+    # Allow higher irritation reports for strong leave-on actives.
+    return max(br, 0.12)
+
+  if has_medium:
+    return min(br, 0.25)
+
+  return min(br, 0.15)
 
 
 def split_brand_and_name(product_full_name: str) -> Tuple[str, str]:
@@ -575,6 +832,16 @@ def split_brand_and_name(product_full_name: str) -> Tuple[str, str]:
   rest = full[len(first) :].strip()
   rest = rest.lstrip("-–—:").strip()
   return (first, rest or full)
+
+
+def safe_split_brand_and_name(product_full_name: str) -> Tuple[str, str]:
+  """
+  Split brand/name, but fall back to the full string as name if split fails.
+  """
+  b, n = split_brand_and_name(product_full_name)
+  b = (b or "").strip() or "Unknown"
+  n = (n or "").strip() or (product_full_name or "").strip()
+  return b, n
 
 
 def canonicalize_kb_field(label: str) -> str:
@@ -789,6 +1056,7 @@ class AuroraDb:
     self._has_region_availability = False
     self._has_kb_snippets_table = False
     self._has_product_aliases_table = False
+    self._product_ids_norm_cache: Optional[Dict[Tuple[str, str], str]] = None
 
   def __enter__(self):
     self.conn = psycopg2.connect(self._database_url)
@@ -796,6 +1064,7 @@ class AuroraDb:
     self._has_region_availability = self._ensure_region_availability_column()
     self._has_kb_snippets_table = self._ensure_kb_snippets_table()
     self._has_product_aliases_table = self._ensure_product_aliases_table()
+    self._product_ids_norm_cache = None
     return self
 
   def __exit__(self, exc_type, exc, tb):
@@ -918,6 +1187,48 @@ class AuroraDb:
       cur.execute('SELECT id FROM "products" WHERE brand = %s AND name = %s LIMIT 1;', (brand, name))
       row = cur.fetchone()
       return row[0] if row else None
+
+  def find_product_id_loose(self, *, brand: str, name: str) -> Optional[str]:
+    """
+    Match an existing product id using exact brand/name first, then a normalized fallback.
+
+    This helps avoid duplicates when sources vary in punctuation/diacritics
+    (e.g., "Lancôme" vs "Lancome") while remaining relatively strict.
+    """
+    pid = self.find_product_id(brand=brand, name=name)
+    if pid:
+      return pid
+
+    if self._product_ids_norm_cache is None:
+      self._product_ids_norm_cache = self.load_all_product_ids_normalized()
+    key = (normalize_match_key(brand), normalize_match_key(name))
+    return self._product_ids_norm_cache.get(key)
+
+  def ensure_product_stub(self, *, brand: str, name: str, availability: Optional[List[str]] = None) -> str:
+    """
+    Ensure a Product row exists for (brand,name) even if vectors/ingredients are missing.
+
+    This is used to attach KB snippets for products where INCI is not provided yet.
+    """
+    existing = self.find_product_id_loose(brand=brand, name=name)
+    if existing:
+      return str(existing)
+
+    product_id = str(uuid.uuid4())
+    sku = InputSku(
+      brand=str(brand).strip() or "Unknown",
+      name=str(name).strip(),
+      ingredients_text="",
+      price_usd=0.0,
+      price_cny=0.0,
+      availability=availability or ["Global"],
+    )
+    self.insert_product(sku, product_id=product_id)
+    # Keep alias table warm for better anchor resolution in chat (best-effort).
+    self.upsert_default_aliases_for_product(product_id=product_id, brand=sku.brand, name=sku.name)
+    # Refresh cache so subsequent lookups find it.
+    self._product_ids_norm_cache = None
+    return product_id
 
   def load_all_product_ids(self) -> Dict[Tuple[str, str], str]:
     with self.conn.cursor() as cur:
@@ -1305,6 +1616,108 @@ def load_input_skus_from_excel(
   return skus
 
 
+def load_input_skus_from_workbook_all_sheets(
+  *,
+  path: str,
+  col_brand: str,
+  col_name: str,
+  col_ingredients: str,
+  col_price_usd: Optional[str],
+  col_price: Optional[str],
+  price_cny_rate: float,
+  col_product_url: Optional[str],
+  col_image_url: Optional[str],
+  limit: Optional[int],
+) -> List[InputSku]:
+  wb = load_workbook(path, read_only=True, data_only=True)
+
+  out: List[InputSku] = []
+  seen: set[Tuple[str, str]] = set()
+
+  for sheet_name in wb.sheetnames:
+    ws = wb[sheet_name]
+    rows = ws.iter_rows(values_only=True)
+    header = next(rows, None)
+    if not header:
+      continue
+    headers = [str(h).strip() if h is not None else "" for h in header]
+
+    try:
+      idx_brand = _pick_column(headers, col_brand)
+      idx_name = _pick_column(headers, col_name)
+      idx_ing = _pick_column(headers, col_ingredients)
+      idx_price_usd = _pick_column(headers, col_price_usd, required=False)
+      idx_price = _pick_column(headers, col_price, required=False)
+      idx_product_url = _pick_column(headers, col_product_url, required=False)
+      idx_image_url = _pick_column(headers, col_image_url, required=False)
+    except BaseException as e:  # noqa: BLE001
+      print(f"   ⚠️ Skipping sheet '{sheet_name}': {e}")
+      continue
+
+    for r in rows:
+      if r is None:
+        continue
+      brand = (r[idx_brand] if idx_brand < len(r) else "") or ""
+      name = (r[idx_name] if idx_name < len(r) else "") or ""
+      ingredients = (r[idx_ing] if idx_ing < len(r) else "") or ""
+      if not str(brand).strip() or not str(name).strip() or not str(ingredients).strip():
+        continue
+
+      if idx_brand == idx_name:
+        inferred_brand, inferred_name = split_brand_and_name(str(brand).strip())
+        brand = inferred_brand
+        name = inferred_name
+
+      brand_s = str(brand).strip()
+      name_s = str(name).strip()
+      key = (normalize_match_key(brand_s), normalize_match_key(name_s))
+      if key in seen:
+        continue
+      seen.add(key)
+
+      price_usd: Optional[float] = None
+      if idx_price_usd is not None:
+        raw = r[idx_price_usd] if idx_price_usd < len(r) else None
+        if raw is not None and str(raw).strip():
+          price_usd = float(raw)
+      if price_usd is None and idx_price is not None:
+        raw = r[idx_price] if idx_price < len(r) else None
+        if raw is not None and str(raw).strip():
+          price_usd = float(raw)
+      if price_usd is None:
+        price_usd = 0.0
+
+      product_url = None
+      if idx_product_url is not None:
+        raw = r[idx_product_url] if idx_product_url < len(r) else None
+        if raw is not None and str(raw).strip():
+          product_url = str(raw).strip()
+
+      image_url = None
+      if idx_image_url is not None:
+        raw = r[idx_image_url] if idx_image_url < len(r) else None
+        if raw is not None and str(raw).strip():
+          image_url = str(raw).strip()
+
+      out.append(
+        InputSku(
+          brand=brand_s,
+          name=name_s,
+          ingredients_text=str(ingredients).strip(),
+          price_usd=float(price_usd),
+          price_cny=float(price_usd) * price_cny_rate,
+          availability=["Global"],
+          product_url=product_url,
+          image_url=image_url,
+        )
+      )
+
+      if limit is not None and len(out) >= limit:
+        return out
+
+  return out
+
+
 def load_input_skus_from_json(*, path: str, price_cny_rate: float, limit: Optional[int]) -> List[InputSku]:
   with open(path, "r", encoding="utf-8") as f:
     payload = json.load(f)
@@ -1492,7 +1905,7 @@ def ingest_one(
       upserted += 1
     return upserted
 
-  existing_id = db.find_product_id(brand=sku.brand, name=sku.name)
+  existing_id = db.find_product_id_loose(brand=sku.brand, name=sku.name)
   if existing_id and not overwrite:
     upserted = _upsert_expert_knowledge(product_id=str(existing_id))
     if upserted:
@@ -1581,10 +1994,17 @@ def main() -> None:
   parser.add_argument("--input", type=str, help="Path to Excel (.xlsx) file.")
   parser.add_argument("--input-json", type=str, help="Path to JSON file (list of SKUs) to ingest.")
   parser.add_argument("--sheet", type=str, default=None, help="Excel sheet name (default: active sheet).")
+  parser.add_argument("--all-sheets", action="store_true", help="Ingest from all sheets in the workbook (deduped).")
+  parser.add_argument("--list-sheets", action="store_true", help="List workbook sheet names and headers (requires --input).")
   parser.add_argument("--limit", type=int, default=None, help="Max rows to ingest (for testing).")
   parser.add_argument("--list-models", action="store_true", help="List available Gemini models and exit.")
   parser.add_argument("--ingest-kb", action="store_true", help="Also ingest non-ingredient notes into product_kb_snippets.")
   parser.add_argument("--kb-only", action="store_true", help="Only upsert KB snippets from the workbook (no LLM calls). Requires --input.")
+  parser.add_argument(
+    "--kb-bootstrap-products",
+    action="store_true",
+    help="In --kb-only mode: create missing Product rows (no vectors/ingredients) so KB snippets can attach even when INCI is missing.",
+  )
   parser.add_argument("--aliases-only", action="store_true", help="Only upsert default Product Aliases from existing products (no LLM calls).")
 
   parser.add_argument("--col-brand", type=str, default="brand")
@@ -1613,8 +2033,24 @@ def main() -> None:
 
   load_dotenv()
 
+  if args.list_sheets:
+    if not args.input:
+      raise SystemExit("--list-sheets requires --input /path/to.xlsx")
+    wb = load_workbook(args.input, read_only=True, data_only=True)
+    print("📄 Workbook sheets:")
+    for sheet_name in wb.sheetnames:
+      ws = wb[sheet_name]
+      rows = ws.iter_rows(values_only=True)
+      header = next(rows, None)
+      headers = [str(h).strip() if h is not None else "" for h in (header or [])]
+      print(f"- {sheet_name}: {headers}")
+    return
+
+  ran_special_mode = False
+
   if args.aliases_only:
-    database_url = resolve_env_templates(_require_env("DATABASE_URL"))
+    ran_special_mode = True
+    database_url = sanitize_database_url_for_psycopg2(resolve_env_templates(_require_env("DATABASE_URL")))
     with AuroraDb(database_url) as db:
       rows = db.load_all_products_basic()
       upserted = 0
@@ -1623,13 +2059,13 @@ def main() -> None:
         upserted += 1
       db.conn.commit()
       print(f"🔤 Product aliases upserted for {upserted} products.")
-    return
 
   if args.kb_only:
+    ran_special_mode = True
     if not args.input:
       raise SystemExit("--kb-only requires --input /path/to.xlsx")
 
-    database_url = resolve_env_templates(_require_env("DATABASE_URL"))
+    database_url = sanitize_database_url_for_psycopg2(resolve_env_templates(_require_env("DATABASE_URL")))
     with AuroraDb(database_url) as db:
       snippets = extract_kb_snippets_from_workbook(path=args.input)
       if snippets:
@@ -1640,6 +2076,34 @@ def main() -> None:
           full_key = normalize_match_key(f"{b} {n}")
           if full_key:
             product_ids_full_norm.setdefault(full_key, pid)
+
+        # Optional: bootstrap missing products so KB snippets can attach even when ingredient lists are absent.
+        if args.kb_bootstrap_products:
+          missing_products: Dict[str, int] = {}
+          for snip in snippets:
+            pid = product_ids.get((snip.brand, snip.name))
+            if not pid:
+              pid = product_ids_norm.get((normalize_match_key(snip.brand), normalize_match_key(snip.name)))
+            if not pid:
+              full_name = str(snip.metadata.get("product_full_name") or f"{snip.brand} {snip.name}").strip()
+              pid = product_ids_full_norm.get(normalize_match_key(full_name))
+            if not pid:
+              full_name = str(snip.metadata.get("product_full_name") or f"{snip.brand} {snip.name}").strip()
+              missing_products[full_name] = missing_products.get(full_name, 0) + 1
+
+          if missing_products:
+            created = 0
+            for full_name, _count in sorted(missing_products.items(), key=lambda x: x[1], reverse=True):
+              brand, name = safe_split_brand_and_name(full_name)
+              pid = db.ensure_product_stub(brand=brand, name=name, availability=["Global"])
+              # Update local maps so the upcoming upsert pass can attach immediately.
+              product_ids[(brand, name)] = pid
+              product_ids_norm[(normalize_match_key(brand), normalize_match_key(name))] = pid
+              product_ids_full_norm[normalize_match_key(full_name)] = pid
+              created += 1
+            db.conn.commit()
+            print(f"🧱 Bootstrapped missing products: {created}")
+
         upserted = 0
         skipped = 0
         missing_counts: Dict[str, int] = {}
@@ -1671,6 +2135,9 @@ def main() -> None:
             print(f"  - {name}  missing_snippets={count}")
       else:
         print("📚 No KB snippets found in workbook.")
+
+  # If the user requested one of the "special modes", do not proceed to normal ingestion.
+  if ran_special_mode:
     return
 
   api_key = _require_any_env(["GEMINI_API_KEY", "GOOGLE_API_KEY"])
@@ -1704,19 +2171,35 @@ def main() -> None:
   elif args.input_json:
     skus = load_input_skus_from_json(path=args.input_json, price_cny_rate=float(args.price_cny_rate), limit=args.limit)
   else:
-    skus = load_input_skus_from_excel(
-      path=args.input,
-      sheet=args.sheet,
-      col_brand=args.col_brand,
-      col_name=args.col_name,
-      col_ingredients=args.col_ingredients,
-      col_price_usd=args.col_price_usd,
-      col_price=args.col_price,
-      price_cny_rate=float(args.price_cny_rate),
-      col_product_url=args.col_product_url,
-      col_image_url=args.col_image_url,
-      limit=args.limit,
-    )
+    if args.all_sheets:
+      if args.sheet:
+        print("ℹ️  --all-sheets is set; ignoring --sheet.")
+      skus = load_input_skus_from_workbook_all_sheets(
+        path=args.input,
+        col_brand=args.col_brand,
+        col_name=args.col_name,
+        col_ingredients=args.col_ingredients,
+        col_price_usd=args.col_price_usd,
+        col_price=args.col_price,
+        price_cny_rate=float(args.price_cny_rate),
+        col_product_url=args.col_product_url,
+        col_image_url=args.col_image_url,
+        limit=args.limit,
+      )
+    else:
+      skus = load_input_skus_from_excel(
+        path=args.input,
+        sheet=args.sheet,
+        col_brand=args.col_brand,
+        col_name=args.col_name,
+        col_ingredients=args.col_ingredients,
+        col_price_usd=args.col_price_usd,
+        col_price=args.col_price,
+        price_cny_rate=float(args.price_cny_rate),
+        col_product_url=args.col_product_url,
+        col_image_url=args.col_image_url,
+        limit=args.limit,
+      )
 
   if not skus:
     print("No rows found to ingest.")
@@ -1740,7 +2223,7 @@ def main() -> None:
       )
     return
 
-  database_url = resolve_env_templates(_require_env("DATABASE_URL"))
+  database_url = sanitize_database_url_for_psycopg2(resolve_env_templates(_require_env("DATABASE_URL")))
   with AuroraDb(database_url) as db:
     for sku in skus:
       ingest_one(

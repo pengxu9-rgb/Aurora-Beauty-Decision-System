@@ -83,7 +83,7 @@ IF User Barrier == "Impaired" (Redness/Stinging):
 
 VETO any product with risk_flags containing ANY of:
 - raw flags: ['alcohol_high', 'strong_acid', 'retinol_high']
-- canonical flags: ['alcohol', 'acid', 'high_irritation', 'retinol']
+- canonical flags: ['alcohol', 'acid', 'high_irritation']
 OR if burn_rate > 0.10.
 
 ACTION: Explicitly warn the user: "🚫 Based on your current sensitivity, [Product Name] is too risky."
@@ -420,8 +420,11 @@ function mapRiskFlags(rawFlags: unknown): RiskFlag[] {
   const out = new Set<RiskFlag>();
 
   for (const f of flags) {
-    if (f.includes("alcohol")) out.add("alcohol");
-    if (f.includes("acid")) out.add("acid");
+    // Be conservative, but avoid overly broad substring matches (e.g., "mild_acid" should NOT trigger strong-acid veto).
+    if (f === "alcohol" || f.includes("alcohol_high") || f.includes("alcoholdenat") || f.includes("denatured_alcohol")) out.add("alcohol");
+    if ((f === "acid" || f.includes("strong_acid") || f.includes("acid_medium") || f.includes("acid_high") || f.includes("acid_strong")) && !f.includes("mild_acid")) {
+      out.add("acid");
+    }
     if (f.includes("high_irritation") || f.includes("irritation") || f.includes("burn") || f.includes("sting")) {
       out.add("high_irritation");
     }
