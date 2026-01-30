@@ -1104,6 +1104,25 @@ function buildExpertKnowledgeFromKb(
   };
 }
 
+function shrinkKbProfileForLlm(profile: KbProfile | null) {
+  if (!profile) return null;
+  return {
+    product_id: profile.product_id,
+    display_name: profile.display_name,
+    region: profile.region,
+    availability: profile.availability,
+
+    keyActives: profile.keyActives?.slice(0, 6),
+    textureFinish: profile.textureFinish?.slice(0, 6),
+    sensitivityFlags: profile.sensitivityFlags?.slice(0, 10),
+    pairingRules: profile.pairingRules?.slice(0, 6),
+    comparisonNotes: profile.comparisonNotes?.slice(0, 4),
+
+    // Keep citations short: enough for grounding, not enough to blow the context window.
+    citations: profile.citations.slice(0, 8),
+  };
+}
+
 function normalizeIngredientList(fullList: unknown): string[] {
   if (!fullList) return [];
   if (Array.isArray(fullList)) return fullList.map((i) => String(i)).filter(Boolean);
@@ -1970,8 +1989,20 @@ export async function POST(req: Request) {
     const sanitizeRoutineForLlm = (r: RoutineRecWithEvidence | null) => {
       if (!r) return null;
       return {
-        am: r.am.map((s) => ({ ...s, sku: sanitizeSkuForLlm(s.sku) })),
-        pm: r.pm.map((s) => ({ ...s, sku: sanitizeSkuForLlm(s.sku) })),
+        am: r.am.map((s) => ({
+          step: s.step,
+          notes: s.notes,
+          product_id: s.product_id,
+          sku: sanitizeSkuForLlm(s.sku),
+          evidence_pack: shrinkKbProfileForLlm(s.evidence_pack),
+        })),
+        pm: r.pm.map((s) => ({
+          step: s.step,
+          notes: s.notes,
+          product_id: s.product_id,
+          sku: sanitizeSkuForLlm(s.sku),
+          evidence_pack: shrinkKbProfileForLlm(s.evidence_pack),
+        })),
       };
     };
 
@@ -2129,7 +2160,7 @@ export async function POST(req: Request) {
         name: anchor.name,
         price_usd: normalizeUsdPrice(anchor.priceUsd),
         availability,
-        kb_profile,
+        kb_profile: shrinkKbProfileForLlm(kb_profile),
         expert_knowledge,
       },
       candidates: [],
@@ -2324,7 +2355,7 @@ export async function POST(req: Request) {
       social_stats: anchorSkuForLlm.social_stats,
       ingredients: anchorIngredientCtx,
       expert_knowledge: anchorExpertKnowledge,
-      kb_profile: anchorKbProfile,
+      kb_profile: shrinkKbProfileForLlm(anchorKbProfile),
     },
     candidates: candidates.slice(0, 5).map((c) => {
       const ing = ingredientByProductId.get(c.product_id);
@@ -2355,15 +2386,17 @@ export async function POST(req: Request) {
         social_stats: skuLlm.social_stats,
         ingredients: ingCtx,
         expert_knowledge: buildExpertKnowledgeFromKb(kbByProductId.get(c.product_id) ?? []),
-        kb_profile: buildKbProfile({
-          product_id: c.product_id,
-          display_name: `${c.sku.brand} ${c.sku.name}`.trim(),
-          region: detectedRegion,
-          availability: c.availability,
-          sku_risk_flags: c.sku.risk_flags,
-          sku_experience: c.sku.experience as any,
-          snippets: kbByProductId.get(c.product_id) ?? [],
-        }),
+        kb_profile: shrinkKbProfileForLlm(
+          buildKbProfile({
+            product_id: c.product_id,
+            display_name: `${c.sku.brand} ${c.sku.name}`.trim(),
+            region: detectedRegion,
+            availability: c.availability,
+            sku_risk_flags: c.sku.risk_flags,
+            sku_experience: c.sku.experience as any,
+            snippets: kbByProductId.get(c.product_id) ?? [],
+          }),
+        ),
       };
     }),
   };
