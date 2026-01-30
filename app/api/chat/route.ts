@@ -5,6 +5,7 @@ import { Prisma } from "@prisma/client";
 
 import { getSkuById, getSkuDatabase, resolveProductIdForSkuId } from "@/app/v1/decision/_lib";
 import { calculateScore } from "@/lib/engine";
+import { buildKbProfile, type KbProfile, type KbSnippet, inferKbCanonicalKey } from "@/lib/kb-profile";
 import { prisma } from "@/lib/server/prisma";
 import { findSimilarSkusByAnchorProductId, type RegionPreference } from "@/lib/vector-service";
 import type { Budget, MechanismKey, RiskFlag, SkinType, SkuScoreBreakdown, SkuVector, UserGoal, UserVector } from "@/types";
@@ -723,6 +724,27 @@ function coerceNumber(value: unknown) {
   return Number(value);
 }
 
+function normalizeUsdPrice(value: unknown): number | null {
+  const n = coerceNumber(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n * 100) / 100;
+}
+
+function sanitizeSkuForLlm(sku: SkuVector) {
+  return {
+    sku_id: sku.sku_id,
+    brand: sku.brand,
+    name: sku.name,
+    category: sku.category,
+    price_usd: normalizeUsdPrice(sku.price),
+    currency: sku.currency,
+    mechanism: sku.mechanism,
+    experience: sku.experience,
+    risk_flags: sku.risk_flags,
+    social_stats: sku.social_stats,
+  };
+}
+
 function formatUsd(amount: number) {
   const v = Math.round(amount * 100) / 100;
   return `$${v}`;
@@ -891,101 +913,7 @@ type ExpertKnowledge = {
   sources?: Array<{ source_sheet: string; field: string; kb_id?: string }>;
 };
 
-type KbSnippetForEvidence = {
-  id?: string;
-  source_sheet: string;
-  field: string;
-  content: string;
-  metadata?: unknown;
-};
-
-type KbCanonicalKey = "sensitivity" | "key_actives" | "comparison" | "usage" | "texture" | "notes" | "unknown";
-
-function inferKbCanonicalKey(snippet: KbSnippetForEvidence): KbCanonicalKey {
-  const meta = snippet.metadata as any;
-  const metaKey =
-    typeof meta?.canonical_key === "string"
-      ? meta.canonical_key
-      : typeof meta?.canonicalKey === "string"
-        ? meta.canonicalKey
-        : typeof meta?.canonical_field === "string"
-          ? meta.canonical_field
-          : null;
-
-  const label = [metaKey, meta?.field_label, snippet.field].filter((v) => typeof v === "string" && v.trim()).join(" ").toLowerCase();
-
-  // Sensitivity / irritation
-  if (
-    label.includes("sensitivity") ||
-    label.includes("irrit") ||
-    label.includes("risk") ||
-    label.includes("敏感") ||
-    label.includes("刺激") ||
-    label.includes("刺痛") ||
-    label.includes("过敏")
-  ) {
-    return "sensitivity";
-  }
-
-  // Key actives
-  if (
-    label.includes("key_actives") ||
-    (label.includes("key") && (label.includes("active") || label.includes("actives"))) ||
-    label.includes("主要成分") ||
-    label.includes("核心成分") ||
-    label.includes("关键活性") ||
-    label.includes("功效成分")
-  ) {
-    return "key_actives";
-  }
-
-  // Comparison / dupes
-  if (
-    label.includes("comparison") ||
-    label.includes("compare") ||
-    label.includes("dupe") ||
-    label.includes("替代") ||
-    label.includes("平替") ||
-    label.includes("对比") ||
-    label.includes("竞品")
-  ) {
-    return "comparison";
-  }
-
-  // Usage / pairing
-  if (
-    label.includes("usage") ||
-    label.includes("routine") ||
-    label.includes("layer") ||
-    label.includes("frequency") ||
-    label.includes("用法") ||
-    label.includes("搭配") ||
-    label.includes("叠加") ||
-    label.includes("频率") ||
-    label.includes("注意事项")
-  ) {
-    return "usage";
-  }
-
-  // Texture / finish
-  if (
-    label.includes("texture") ||
-    label.includes("finish") ||
-    label.includes("pilling") ||
-    label.includes("质地") ||
-    label.includes("清爽") ||
-    label.includes("厚重") ||
-    label.includes("搓泥") ||
-    label.includes("成膜") ||
-    label.includes("油腻")
-  ) {
-    return "texture";
-  }
-
-  if (label.includes("notes") || label.includes("note") || label.includes("备注") || label.includes("评价")) return "notes";
-  if (!label.trim()) return "unknown";
-  return "notes";
-}
+type KbSnippetForEvidence = KbSnippet;
 
 function buildExpertKnowledgeFromKb(
   snippets: Array<KbSnippetForEvidence>,
@@ -1083,20 +1011,7 @@ type RoutineRec = {
   total_cny: number;
 };
 
-type RoutineEvidencePack = {
-  product_id: string;
-  display_name: string;
-  region: RegionPreference | "Global";
-  availability: string[];
-
-  keyActives?: string[];
-  textureFinish?: string[];
-  sensitivityFlags?: string[];
-  pairingRules?: string[];
-  comparisonNotes?: string[];
-
-  citations: string[];
-};
+type RoutineEvidencePack = KbProfile;
 
 type RoutineStepWithEvidence = {
   step: string;
@@ -1113,13 +1028,6 @@ type RoutineRecWithEvidence = {
   total_cny: number;
 };
 
-function truncateText(value: string, maxChars: number) {
-  const s = String(value ?? "").trim();
-  if (!s) return "";
-  if (s.length <= maxChars) return s;
-  return s.slice(0, Math.max(0, maxChars - 1)).trimEnd() + "…";
-}
-
 function uniqueStrings(items: string[]) {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -1134,43 +1042,6 @@ function uniqueStrings(items: string[]) {
   return out;
 }
 
-function extractSensitivityFlagsFromText(text: string): string[] {
-  const t = String(text ?? "").toLowerCase();
-  const flags = new Set<string>();
-
-  const hasAny = (needles: string[]) => needles.some((n) => t.includes(n));
-
-  if (hasAny(["alcohol denat", "alcohol", "ethanol", "酒精"])) flags.add("alcohol");
-  if (hasAny(["fragrance", "parfum", "perfume", "香精", "香料"])) flags.add("fragrance");
-  if (hasAny(["essential oil", "精油"])) flags.add("essential_oil");
-  if (hasAny(["mint", "peppermint", "薄荷"])) flags.add("mint");
-  if (hasAny(["retinol", "retinoid", "tretinoin", "adapalene", "维a", "视黄醇", "阿达帕林"])) flags.add("retinol");
-  if (hasAny(["aha", "bha", "pha", "glycolic", "lactic", "mandelic", "salicylic", "azelaic", "acid", "果酸", "水杨酸", "杏仁酸", "壬二酸", "酸"])) {
-    flags.add("acid");
-  }
-  if (hasAny(["sting", "burn", "irritat", "刺痛", "灼热", "刺激"])) flags.add("high_irritation");
-
-  return Array.from(flags);
-}
-
-function extractKeyActivesFromText(text: string): string[] {
-  const raw = String(text ?? "").trim();
-  if (!raw) return [];
-
-  const parts = raw
-    .replace(/[()（）]/g, " ")
-    .split(/[;,，、|/]+/g)
-    .map((p) => p.trim())
-    .filter(Boolean);
-
-  const cleaned = parts
-    .map((p) => p.replace(/\s+/g, " ").trim())
-    .filter((p) => p.length >= 2 && p.length <= 40)
-    .filter((p) => !/^good|great|nice|ok|none$/i.test(p));
-
-  return uniqueStrings(cleaned).slice(0, 10);
-}
-
 function buildRoutineEvidencePack(input: {
   sku: SkuVector;
   product_id: string;
@@ -1178,93 +1049,15 @@ function buildRoutineEvidencePack(input: {
   availability: string[];
   snippets: KbSnippetForEvidence[];
 }): RoutineEvidencePack {
-  const MAX_PER_BUCKET = {
-    sensitivity: 3,
-    key_actives: 3,
-    texture: 2,
-    usage: 2,
-    comparison: 2,
-    notes: 2,
-  } as const;
-
-  const buckets: Record<KbCanonicalKey, KbSnippetForEvidence[]> = {
-    sensitivity: [],
-    key_actives: [],
-    texture: [],
-    usage: [],
-    comparison: [],
-    notes: [],
-    unknown: [],
-  };
-
-  for (const snip of input.snippets) {
-    const key = inferKbCanonicalKey(snip);
-    buckets[key].push(snip);
-  }
-
-  const takeBucketText = (key: keyof typeof MAX_PER_BUCKET) =>
-    buckets[key]
-      .slice(0, MAX_PER_BUCKET[key])
-      .map((s) => truncateText(String(s.content ?? ""), 140))
-      .filter(Boolean);
-
-  const sensitivityNotes = takeBucketText("sensitivity");
-  const textureNotes = takeBucketText("texture");
-  const usageNotes = takeBucketText("usage");
-  const comparisonNotes = takeBucketText("comparison");
-
-  const keyActivesFromKb = uniqueStrings(
-    buckets.key_actives
-      .slice(0, MAX_PER_BUCKET.key_actives)
-      .flatMap((s) => extractKeyActivesFromText(String(s.content ?? ""))),
-  );
-
-  const sensitivityFlags = uniqueStrings([
-    ...input.sku.risk_flags,
-    ...extractSensitivityFlagsFromText(sensitivityNotes.join(" ")),
-    ...extractSensitivityFlagsFromText(usageNotes.join(" ")),
-  ]);
-
-  const textureFinish = uniqueStrings([
-    input.sku.experience?.texture ? `Texture: ${input.sku.experience.texture}` : "",
-    input.sku.experience?.finish ? `Finish: ${input.sku.experience.finish}` : "",
-    (input.sku.experience?.pilling_risk ?? 0) > 0.6 ? "Higher pilling risk" : "",
-    ...textureNotes,
-  ]).filter(Boolean);
-
-  const pairingRules = uniqueStrings([
-    ...usageNotes,
-    sensitivityFlags.includes("retinol") ? "If using retinoids, avoid stacking with strong acids on the same night." : "",
-    sensitivityFlags.includes("acid") ? "Do not stack multiple strong acids in the same routine." : "",
-  ]).filter(Boolean);
-
-  const selectedSnippets = [
-    ...buckets.sensitivity.slice(0, MAX_PER_BUCKET.sensitivity),
-    ...buckets.key_actives.slice(0, MAX_PER_BUCKET.key_actives),
-    ...buckets.texture.slice(0, MAX_PER_BUCKET.texture),
-    ...buckets.usage.slice(0, MAX_PER_BUCKET.usage),
-    ...buckets.comparison.slice(0, MAX_PER_BUCKET.comparison),
-    ...buckets.notes.slice(0, MAX_PER_BUCKET.notes),
-  ];
-
-  const citations = uniqueStrings(
-    selectedSnippets
-      .map((s) => (s.id ? `kb:${s.id}` : null))
-      .filter((v): v is string => Boolean(v)),
-  );
-
-  return {
+  return buildKbProfile({
     product_id: input.product_id,
     display_name: `${input.sku.brand} ${input.sku.name}`.trim(),
-    region: input.region ?? "Global",
-    availability: Array.isArray(input.availability) ? input.availability : [],
-    keyActives: keyActivesFromKb.length ? keyActivesFromKb : input.sku.actives,
-    textureFinish: textureFinish.length ? textureFinish : undefined,
-    sensitivityFlags: sensitivityFlags.length ? sensitivityFlags : undefined,
-    pairingRules: pairingRules.length ? pairingRules : undefined,
-    comparisonNotes: comparisonNotes.length ? comparisonNotes : undefined,
-    citations,
-  };
+    region: input.region,
+    availability: input.availability,
+    sku_risk_flags: input.sku.risk_flags,
+    sku_experience: input.sku.experience as any,
+    snippets: input.snippets,
+  });
 }
 
 async function buildRoutineEvidenceIndex(input: {
@@ -1616,10 +1409,18 @@ function isTooShort(answer: string) {
 function buildFallbackProductAnswer(input: {
   query: string;
   detected: { sensitive_skin: boolean; barrier_impaired: boolean };
-  anchor: { brand: string; name: string; price_usd: number; score?: SkuScoreBreakdown; ingredients?: IngredientContext; vetoed: boolean };
-  candidates: Array<{ brand: string; name: string; price_usd: number; similarity: number; tradeoff: string; ingredients?: IngredientContext }>;
+  anchor: { brand: string; name: string; price_usd: number | null; score?: SkuScoreBreakdown; ingredients?: IngredientContext; vetoed: boolean };
+  candidates: Array<{
+    brand: string;
+    name: string;
+    price_usd: number | null;
+    similarity: number;
+    tradeoff: string;
+    ingredients?: IngredientContext;
+  }>;
 }) {
   const { anchor, candidates, detected } = input;
+  const priceLabel = (usd: number | null) => (usd != null && Number.isFinite(usd) && usd > 0 ? formatUsd(usd) : "价格未知");
 
   const header =
     detected.barrier_impaired && anchor.vetoed
@@ -1633,13 +1434,16 @@ function buildFallbackProductAnswer(input: {
     : null;
 
   const top = candidates.slice(0, 3);
-  const priceGap = top[0]
-    ? `价格对比：${anchor.brand} ${formatUsd(anchor.price_usd)} vs ${top[0].brand} ${formatUsd(top[0].price_usd)}（约 ${Math.round(anchor.price_usd / Math.max(1, top[0].price_usd))}x 差异）。`
-    : null;
+  const anchorPrice = anchor.price_usd;
+  const topPrice = top[0]?.price_usd ?? null;
+  const priceGap =
+    top[0] && anchorPrice != null && anchorPrice > 0 && topPrice != null && topPrice > 0
+      ? `价格对比：${anchor.brand} ${formatUsd(anchorPrice)} vs ${top[0].brand} ${formatUsd(topPrice)}（约 ${Math.round(anchorPrice / Math.max(1, topPrice))}x 差异）。`
+      : null;
 
   const lines: string[] = [];
   lines.push(header);
-  lines.push(`- Anchor：${anchor.brand} ${anchor.name}（${formatUsd(anchor.price_usd)}）`);
+  lines.push(`- Anchor：${anchor.brand} ${anchor.name}（${priceLabel(anchor.price_usd)}）`);
   if (scoreLine) lines.push(`- ${scoreLine}`);
   if (anchor.ingredients?.highlights?.length) lines.push(`- 关键成分/结构：${anchor.ingredients.highlights.join("；")}`);
   if (priceGap) lines.push(`- ${priceGap}`);
@@ -1649,7 +1453,7 @@ function buildFallbackProductAnswer(input: {
     lines.push("推荐平替（按相似度/性价比）：");
     for (const [idx, c] of top.entries()) {
       const cLines: string[] = [];
-      cLines.push(`${idx + 1}) ${c.brand} ${c.name}（${formatUsd(c.price_usd)}，相似度≈${c.similarity.toFixed(2)}）`);
+      cLines.push(`${idx + 1}) ${c.brand} ${c.name}（${priceLabel(c.price_usd)}，相似度≈${c.similarity.toFixed(2)}）`);
       cLines.push(`   - Trade-off：${c.tradeoff}`);
       if (c.ingredients?.highlights?.length) cLines.push(`   - 成分/结构要点：${c.ingredients.highlights.join("；")}`);
 
@@ -1919,6 +1723,34 @@ export async function POST(req: Request) {
       products_with_kb: evidencePacks.filter((p) => (p.citations?.length ?? 0) > 0).length,
     };
 
+    const summarizeRoutinePrices = (r: RoutineRec) => {
+      const seen = new Set<string>();
+      let knownUsd = 0;
+      let unknownCount = 0;
+      for (const step of [...r.am, ...r.pm]) {
+        const skuId = step.sku.sku_id;
+        if (seen.has(skuId)) continue;
+        seen.add(skuId);
+        const usd = normalizeUsdPrice(step.sku.price);
+        if (usd == null) {
+          unknownCount += 1;
+        } else {
+          knownUsd += usd;
+        }
+      }
+      const knownUsdRounded = Math.round(knownUsd * 100) / 100;
+      const knownCnyRounded = Math.round(computeUsdToCny(knownUsdRounded) * 100) / 100;
+      return { known_usd: knownUsdRounded, known_cny_est: knownCnyRounded, unknown_count: unknownCount, total_unique: seen.size };
+    };
+
+    const sanitizeRoutineForLlm = (r: RoutineRecWithEvidence | null) => {
+      if (!r) return null;
+      return {
+        am: r.am.map((s) => ({ ...s, sku: sanitizeSkuForLlm(s.sku) })),
+        pm: r.pm.map((s) => ({ ...s, sku: sanitizeSkuForLlm(s.sku) })),
+      };
+    };
+
     const routineContextData = {
       user_query: query,
       region_preference: detectedRegion,
@@ -1931,9 +1763,13 @@ export async function POST(req: Request) {
       },
       user_profile_inferred: user,
       routine_evidence_summary: evidenceSummary,
+      price_summary: {
+        primary: summarizeRoutinePrices(routine_primary),
+        strict_budget: over_budget ? summarizeRoutinePrices(routine_budget) : null,
+      },
       routine: {
-        primary: routine_primary_with_evidence,
-        strict_budget: over_budget ? routine_budget_with_evidence : null,
+        primary: sanitizeRoutineForLlm(routine_primary_with_evidence),
+        strict_budget: sanitizeRoutineForLlm(over_budget ? routine_budget_with_evidence : null),
         over_budget,
       },
     };
@@ -2020,16 +1856,116 @@ export async function POST(req: Request) {
     include: { vectors: true, socialStats: true, ingredients: true },
   });
 
-  if (!anchor?.vectors) {
-    return NextResponse.json(
-      { error: "Anchor product not found or missing vectors", anchor_product_id: anchorProductId },
-      { status: 404 },
-    );
-  }
-
   const sensitive = detectSensitiveSkin(query);
   const barrierImpaired = detectBarrierImpaired(query);
   const user = buildUserVectorFromQuery(query);
+
+  if (!anchor) {
+    return NextResponse.json({ error: "Anchor product not found", anchor_product_id: anchorProductId }, { status: 404 });
+  }
+
+  // KB-only anchor support: allow the user to ask about products that exist in KB but haven't been vectorized yet.
+  if (!anchor.vectors) {
+    const availability = Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [];
+    const kbRows = await prisma.productKbSnippet.findMany({
+      where: { productId: anchor.id },
+      orderBy: [{ sourceSheet: "asc" }, { field: "asc" }, { updatedAt: "desc" }],
+      select: { id: true, sourceSheet: true, field: true, content: true, metadata: true },
+    });
+    const snippets: KbSnippetForEvidence[] = kbRows.map((r) => ({
+      id: r.id,
+      source_sheet: r.sourceSheet,
+      field: r.field,
+      content: r.content,
+      metadata: r.metadata,
+    }));
+
+    const kb_profile = buildKbProfile({
+      product_id: anchor.id,
+      display_name: `${anchor.brand} ${anchor.name}`.trim(),
+      region: detectedRegion,
+      availability,
+      sku_risk_flags: [],
+      sku_experience: null,
+      snippets,
+    });
+    const expert_knowledge = buildExpertKnowledgeFromKb(snippets);
+
+    const kbOnlyContext = {
+      user_query: query,
+      region_preference: detectedRegion,
+      detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
+      user_profile_inferred: user,
+      limitations: ["Anchor product is present in KB, but vectors/embedding are missing.", "Similarity search and scoring are unavailable for this product."],
+      anchor: {
+        id: anchor.id,
+        brand: anchor.brand,
+        name: anchor.name,
+        price_usd: normalizeUsdPrice(anchor.priceUsd),
+        availability,
+        kb_profile,
+        expert_knowledge,
+      },
+      candidates: [],
+    };
+
+    const systemPrompt = buildAuroraStructuredSystemPrompt({
+      regionLabel,
+      contextDataJson: JSON.stringify(kbOnlyContext, null, 2),
+      mode: "product",
+    });
+
+    const fallbackAnswerParts: string[] = [];
+    fallbackAnswerParts.push(
+      `我找到了「${anchor.brand} ${anchor.name}」的专家知识库笔记，但这款目前还没有向量（vectors/embedding），所以无法给出精确 Aurora 分数或做余弦相似度“平替检索”。`,
+    );
+    if (expert_knowledge?.key_actives_summary) fallbackAnswerParts.push(`- 关键活性/要点：${expert_knowledge.key_actives_summary}`);
+    if (expert_knowledge?.sensitivity_notes) fallbackAnswerParts.push(`- 敏感/刺激提示：${expert_knowledge.sensitivity_notes}`);
+    if (expert_knowledge?.comparison_notes) fallbackAnswerParts.push(`- 对比/替代参考：${expert_knowledge.comparison_notes}`);
+    fallbackAnswerParts.push(
+      "如果你希望开启这款的“相似平替/打分”，需要补全成分表并重新运行向量化入库（让 sku_vectors.embedding 有值）。",
+    );
+    const fallbackAnswer = fallbackAnswerParts.join("\n");
+
+    let answer = "";
+    let llm_error: string | null = null;
+    try {
+      answer =
+        provider === "gemini"
+          ? await geminiGenerateContent({ system_prompt: systemPrompt, user_prompt: `User request: ${query}`, model: requestedModel })
+          : await openaiChatCompletion({
+              model: requestedModel,
+              messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: `User request: ${query}` },
+              ],
+            });
+      if (isTooShort(answer)) {
+        llm_error = "LLM answer too short; used fallback.";
+        answer = fallbackAnswer;
+      }
+    } catch (e) {
+      llm_error = e instanceof Error ? e.message : "Unknown error";
+      answer = fallbackAnswer;
+    }
+
+    if (wantsStream) return streamTextResponse(answer);
+
+    return NextResponse.json({
+      query,
+      anchor_product_id: anchorProductId,
+      llm_provider: provider,
+      llm_model:
+        requestedModel ??
+        (provider === "gemini"
+          ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
+          : process.env.OPENAI_MODEL ?? "gpt-4o"),
+      answer,
+      llm_error,
+      intent: "product",
+      context: kbOnlyContext,
+    });
+  }
 
   // Use the shared DB->SkuVector normalization so scoring behaves like /v1/decision/analyze.
   const normalizedAnchorSku = await getSkuById(anchorProductId);
@@ -2097,6 +2033,15 @@ export async function POST(req: Request) {
   const anchorIngredients = ingredientByProductId.get(anchor.id);
   const anchorIngredientCtx = summarizeIngredients(anchorIngredients?.fullList, anchorIngredients?.heroActives);
   const anchorExpertKnowledge = buildExpertKnowledgeFromKb(kbByProductId.get(anchor.id) ?? []);
+  const anchorKbProfile = buildKbProfile({
+    product_id: anchor.id,
+    display_name: `${anchor.brand} ${anchor.name}`.trim(),
+    region: detectedRegion,
+    availability: Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [],
+    sku_risk_flags: anchorSku.risk_flags,
+    sku_experience: anchorSku.experience as any,
+    snippets: kbByProductId.get(anchor.id) ?? [],
+  });
 
   const mappedCandidates = candidates.map((c) => {
     const ing = ingredientByProductId.get(c.product_id);
@@ -2105,7 +2050,7 @@ export async function POST(req: Request) {
       product_id: c.product_id,
       brand: c.sku.brand,
       name: c.sku.name,
-      price_usd: c.sku.price,
+      price_usd: normalizeUsdPrice(c.sku.price),
       availability: c.availability,
       similarity: c.similarity,
       tradeoff: (() => {
@@ -2117,6 +2062,15 @@ export async function POST(req: Request) {
       })(),
       ingredients: ingCtx,
       expert_knowledge: buildExpertKnowledgeFromKb(kbByProductId.get(c.product_id) ?? []),
+      kb_profile: buildKbProfile({
+        product_id: c.product_id,
+        display_name: `${c.sku.brand} ${c.sku.name}`.trim(),
+        region: detectedRegion,
+        availability: c.availability,
+        sku_risk_flags: c.sku.risk_flags,
+        sku_experience: c.sku.experience as any,
+        snippets: kbByProductId.get(c.product_id) ?? [],
+      }),
     };
   });
 
@@ -2131,7 +2085,7 @@ export async function POST(req: Request) {
       id: anchor.id,
       brand: anchor.brand,
       name: anchor.name,
-      price_usd: anchorSku.price,
+      price_usd: normalizeUsdPrice(anchorSku.price),
       availability: Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [],
       score: anchorScore,
       vetoed: anchorVetoed || anchorScore.vetoed,
@@ -2146,6 +2100,7 @@ export async function POST(req: Request) {
       social_stats: anchorSku.social_stats,
       ingredients: anchorIngredientCtx,
       expert_knowledge: anchorExpertKnowledge,
+      kb_profile: anchorKbProfile,
     },
     candidates: candidates.slice(0, 5).map((c) => {
       const ing = ingredientByProductId.get(c.product_id);
@@ -2164,7 +2119,7 @@ export async function POST(req: Request) {
         id: c.product_id,
         brand: c.sku.brand,
         name: c.sku.name,
-        price_usd: c.sku.price,
+        price_usd: normalizeUsdPrice(c.sku.price),
         availability: c.availability,
         similarity: c.similarity,
         tradeoff,
@@ -2176,6 +2131,15 @@ export async function POST(req: Request) {
         social_stats: c.sku.social_stats,
         ingredients: ingCtx,
         expert_knowledge: buildExpertKnowledgeFromKb(kbByProductId.get(c.product_id) ?? []),
+        kb_profile: buildKbProfile({
+          product_id: c.product_id,
+          display_name: `${c.sku.brand} ${c.sku.name}`.trim(),
+          region: detectedRegion,
+          availability: c.availability,
+          sku_risk_flags: c.sku.risk_flags,
+          sku_experience: c.sku.experience as any,
+          snippets: kbByProductId.get(c.product_id) ?? [],
+        }),
       };
     }),
   };
@@ -2192,7 +2156,7 @@ export async function POST(req: Request) {
     anchor: {
       brand: anchor.brand,
       name: anchor.name,
-      price_usd: coerceNumber(anchor.priceUsd),
+      price_usd: normalizeUsdPrice(anchor.priceUsd),
       score: anchorScore,
       ingredients: anchorIngredientCtx,
       vetoed: anchorVetoed || anchorScore.vetoed,
