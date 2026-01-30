@@ -1975,7 +1975,8 @@ export async function POST(req: Request) {
 
     const systemPrompt = buildAuroraStructuredSystemPrompt({
       regionLabel,
-      contextDataJson: JSON.stringify(routineContextData, null, 2),
+      // Keep the JSON compact to preserve model output budget (Gemini has a total context window).
+      contextDataJson: JSON.stringify(routineContextData),
       mode: "routine",
     });
 
@@ -2110,7 +2111,7 @@ export async function POST(req: Request) {
 
     const systemPrompt = buildAuroraStructuredSystemPrompt({
       regionLabel,
-      contextDataJson: JSON.stringify(kbOnlyContext, null, 2),
+      contextDataJson: JSON.stringify(kbOnlyContext),
       mode: "product",
     });
 
@@ -2345,7 +2346,7 @@ export async function POST(req: Request) {
 
   const systemPrompt = buildAuroraStructuredSystemPrompt({
     regionLabel,
-    contextDataJson: JSON.stringify(productContextData, null, 2),
+    contextDataJson: JSON.stringify(productContextData),
     mode: "product",
   });
 
