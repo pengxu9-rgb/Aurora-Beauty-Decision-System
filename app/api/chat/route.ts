@@ -700,8 +700,10 @@ function isLowBudgetCny(budgetCny: number | null) {
 }
 
 function pickCheapest(db: SkuVector[], category: SkuVector["category"]): SkuVector | null {
-  const candidates = db.filter((s) => s.category === category).sort((a, b) => a.price - b.price);
-  return candidates[0] ?? null;
+  const candidates = db.filter((s) => s.category === category);
+  const priced = candidates.filter((s) => Number.isFinite(s.price) && s.price > 0);
+  const pool = priced.length ? priced : candidates;
+  return [...pool].sort((a, b) => a.price - b.price)[0] ?? null;
 }
 
 function pickBestByScore(db: SkuVector[], category: SkuVector["category"], user: UserVector): SkuVector | null {
@@ -996,26 +998,104 @@ function buildFallbackRoutineAnswer(input: {
   routine_budget?: RoutineRec;
 }) {
   const { budget_cny, routine_primary, routine_budget } = input;
-  const withinBudget = budget_cny != null ? routine_primary.total_cny <= budget_cny : null;
-  const budgetLine =
-    budget_cny != null
-      ? `预算：${formatCny(budget_cny)}（≈${formatUsd(budget_cny / USD_TO_CNY)}）。主方案合计≈${formatCny(routine_primary.total_cny)}（${formatUsd(routine_primary.total_usd)}），${withinBudget ? "在预算内" : "可能略超预算"}。`
-      : `主方案合计≈${formatUsd(routine_primary.total_usd)}（≈${formatCny(routine_primary.total_cny)}）。`;
+  const detectedRegion = detectRegionPreference(input.query);
+
+  const wantsBrightening =
+    input.query.toLowerCase().includes("brighten") ||
+    input.query.toLowerCase().includes("whitening") ||
+    input.query.toLowerCase().includes("dark spot") ||
+    input.query.toLowerCase().includes("hyperpig") ||
+    input.query.includes("美白") ||
+    input.query.includes("提亮") ||
+    input.query.includes("淡斑") ||
+    input.query.includes("祛斑") ||
+    input.query.includes("暗沉") ||
+    input.query.includes("痘印");
+  const comedones = detectClosedComedonesOrRoughTexture(input.query);
+  const oilyAcne = detectOilyAcne(input.query);
+  const sensitive = detectSensitiveSkin(input.query);
+  const barrierImpaired = detectBarrierImpaired(input.query);
+
+  const diagnosisTags: string[] = [];
+  if (wantsBrightening) diagnosisTags.push("提亮/淡斑");
+  if (barrierImpaired) diagnosisTags.push("屏障受损/刺痛");
+  else if (sensitive) diagnosisTags.push("敏感/泛红");
+  if (comedones) diagnosisTags.push("闭口/粗糙");
+  if (!comedones && oilyAcne) diagnosisTags.push("油痘倾向");
+
+  const uniqueSkus = () => {
+    const seen = new Set<string>();
+    const out: SkuVector[] = [];
+    for (const step of [...routine_primary.am, ...routine_primary.pm]) {
+      if (seen.has(step.sku.sku_id)) continue;
+      seen.add(step.sku.sku_id);
+      out.push(step.sku);
+    }
+    return out;
+  };
+
+  const costSummary = (() => {
+    const skus = uniqueSkus();
+    let knownUsd = 0;
+    let unknown = 0;
+    for (const sku of skus) {
+      if (!Number.isFinite(sku.price) || sku.price <= 0) {
+        unknown += 1;
+        continue;
+      }
+      knownUsd += sku.price;
+    }
+    return { knownUsd, knownCny: computeUsdToCny(knownUsd), unknownCount: unknown, totalUnique: skus.length };
+  })();
+
+  const withinBudget =
+    budget_cny != null && costSummary.unknownCount === 0 ? costSummary.knownCny <= budget_cny : null;
+
+  const priceLabel = (usd: number) => (!Number.isFinite(usd) || usd <= 0 ? "价格未知" : formatUsd(usd));
 
   const lines: string[] = [];
-  lines.push("为你按「油痘肌 / 去闭口」做了一套早晚分开的入门流程（尽量省钱但有效）：");
-  lines.push(`- ${budgetLine}`);
-
-  lines.push("");
-  lines.push("AM（主方案）：");
-  for (const step of routine_primary.am) {
-    lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${formatUsd(step.sku.price)}）`);
+  lines.push("Part 1: Diagnosis 🩺");
+  lines.push(
+    `- 目标：${diagnosisTags.length ? diagnosisTags.join(" / ") : "根据你的描述给出温和入门流程"}${
+      detectedRegion ? `；坐标：${detectedRegion}` : ""
+    }。`,
+  );
+  if (barrierImpaired || sensitive) {
+    lines.push("- 重点：你提到「刺痛/敏感」，优先走温和、低刺激路线，先稳住屏障再加大活性。");
   }
 
   lines.push("");
-  lines.push("PM（主方案）：");
+  lines.push("Part 2: The Routine 📅");
+
+  lines.push("");
+  lines.push("🌞 AM (Protection):");
+  for (const step of routine_primary.am) {
+    lines.push(`- ${step.step} - ${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）`);
+  }
+
+  lines.push("");
+  lines.push("🌙 PM (Treatment):");
   for (const step of routine_primary.pm) {
-    lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${formatUsd(step.sku.price)}）`);
+    lines.push(`- ${step.step} - ${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）`);
+  }
+
+  lines.push("");
+  lines.push("Part 3: Budget Analysis 💰");
+  if (budget_cny != null) {
+    lines.push(`- 预算：${formatCny(budget_cny)}（≈${formatUsd(budget_cny / USD_TO_CNY)}）`);
+  }
+  if (costSummary.unknownCount > 0) {
+    lines.push(
+      `- 价格数据不完整：${costSummary.unknownCount}/${costSummary.totalUnique} 个商品缺少价格；已知价格合计≈${formatUsd(
+        costSummary.knownUsd,
+      )}（≈${formatCny(costSummary.knownCny)}）`,
+    );
+  } else {
+    lines.push(
+      `- 主方案合计≈${formatUsd(costSummary.knownUsd)}（≈${formatCny(costSummary.knownCny)}）${
+        withinBudget == null ? "" : withinBudget ? "，在预算内" : "，可能超预算"
+      }。`,
+    );
   }
 
   if (budget_cny != null && !withinBudget && routine_budget) {
@@ -1026,17 +1106,18 @@ function buildFallbackRoutineAnswer(input: {
     lines.push("");
     lines.push("AM（备选）：");
     for (const step of routine_budget.am) {
-      lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${formatUsd(step.sku.price)}）`);
+      lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）`);
     }
 
     lines.push("");
     lines.push("PM（备选）：");
     for (const step of routine_budget.pm) {
-      lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${formatUsd(step.sku.price)}）`);
+      lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）`);
     }
   }
 
   lines.push("");
+  lines.push("Part 4: Safety Warning ⚠️");
   lines.push("注意：活性类（酸/维A类）先从每周 2-3 次开始，出现刺痛爆皮就先停，用修护类把屏障养好。");
   return lines.join("\n").trim();
 }
@@ -1142,7 +1223,7 @@ export async function POST(req: Request) {
     try {
       answer =
         provider === "gemini"
-          ? await geminiGenerateContent({ system_prompt: systemPrompt, user_prompt: "", model: requestedModel })
+          ? await geminiGenerateContent({ system_prompt: systemPrompt, user_prompt: `User request: ${query}`, model: requestedModel })
           : await openaiChatCompletion({
               model: requestedModel,
               messages: [
