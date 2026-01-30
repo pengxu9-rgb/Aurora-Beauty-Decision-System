@@ -119,6 +119,11 @@ Serum/Ampoule: Recommend higher budget. "Deep penetration requires better delive
 - YOU MUST quote or paraphrase these notes when they exist (treat them as "footnotes" / evidence).
 - If 'expert_knowledge.sensitivity_notes' flags a risk (e.g., fragrance/alcohol/strong acids) AND the user is sensitive or barrier is impaired, you MUST VETO and start with a clear warning.
 
+8. Price Handling (Avoid Fake Prices)
+
+- If a product price is missing, 0, or not provided in Context Data, treat it as unknown.
+- DO NOT output "$0". Use "价格未知" / "price unknown" instead and avoid exact totals.
+
 ${modeAddendum}
 
 Response Format (Markdown)
