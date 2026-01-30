@@ -1554,13 +1554,25 @@ function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string
   return { am, pm, total_usd: finalUsd, total_cny: computeUsdToCny(finalUsd) };
 }
 
-function isTooShort(answer: string) {
+function isBadAnswer(answer: string, mode: "routine" | "product") {
   const trimmed = answer.trim();
-  // Gemini sometimes returns concise but valid answers; keep this check lightweight to avoid discarding good outputs.
   if (trimmed.length < 80) return true;
 
   // Reject obvious "unfinished bullet" stubs that commonly happen with streaming truncation.
   if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
+
+  if (mode === "routine") {
+    const hasAm = trimmed.includes("🌞") || /\bAM\b/i.test(trimmed);
+    const hasPm = trimmed.includes("🌙") || /\bPM\b/i.test(trimmed);
+    if (!hasAm || !hasPm) return true;
+  }
+
+  if (mode === "product") {
+    // Require at least one "actionable" section marker (dupes / alternatives / recommendation).
+    // This avoids returning partial diagnosis-only answers when the model runs out of output budget.
+    const hasActionable = /推荐|平替|Trade-off|相似度|Dupe|Alternatives?|1\)|1\./i.test(trimmed);
+    if (!hasActionable) return true;
+  }
 
   return false;
 }
@@ -1568,7 +1580,15 @@ function isTooShort(answer: string) {
 function buildFallbackProductAnswer(input: {
   query: string;
   detected: { sensitive_skin: boolean; barrier_impaired: boolean };
-  anchor: { brand: string; name: string; price_usd: number | null; score?: SkuScoreBreakdown; ingredients?: IngredientContext; vetoed: boolean };
+  anchor: {
+    brand: string;
+    name: string;
+    price_usd: number | null;
+    score?: SkuScoreBreakdown;
+    ingredients?: IngredientContext;
+    vetoed: boolean;
+    citations?: string[];
+  };
   candidates: Array<{
     brand: string;
     name: string;
@@ -1576,6 +1596,7 @@ function buildFallbackProductAnswer(input: {
     similarity: number;
     tradeoff: string;
     ingredients?: IngredientContext;
+    citations?: string[];
   }>;
 }) {
   const { anchor, candidates, detected } = input;
@@ -1602,7 +1623,8 @@ function buildFallbackProductAnswer(input: {
 
   const lines: string[] = [];
   lines.push(header);
-  lines.push(`- Anchor：${anchor.brand} ${anchor.name}（${priceLabel(anchor.price_usd)}）`);
+  const anchorCite = anchor.citations?.[0] ? ` ${anchor.citations[0]}` : "";
+  lines.push(`- Anchor：${anchor.brand} ${anchor.name}（${priceLabel(anchor.price_usd)}）${anchorCite}`);
   if (scoreLine) lines.push(`- ${scoreLine}`);
   if (anchor.ingredients?.highlights?.length) lines.push(`- 关键成分/结构：${anchor.ingredients.highlights.join("；")}`);
   if (priceGap) lines.push(`- ${priceGap}`);
@@ -1612,9 +1634,11 @@ function buildFallbackProductAnswer(input: {
     lines.push("推荐平替（按相似度/性价比）：");
     for (const [idx, c] of top.entries()) {
       const cLines: string[] = [];
+      const cite = c.citations?.[0] ? ` ${c.citations[0]}` : "";
       cLines.push(`${idx + 1}) ${c.brand} ${c.name}（${priceLabel(c.price_usd)}，相似度≈${c.similarity.toFixed(2)}）`);
       cLines.push(`   - Trade-off：${c.tradeoff}`);
       if (c.ingredients?.highlights?.length) cLines.push(`   - 成分/结构要点：${c.ingredients.highlights.join("；")}`);
+      if (cite) cLines.push(`   - Evidence: ${cite}`);
 
       // Honesty: if anchor has algae and candidate doesn't, call out.
       const anchorHasAlgae = anchor.ingredients?.highlights?.some((h) => h.toLowerCase().includes("algae")) ?? false;
@@ -1636,8 +1660,8 @@ function buildFallbackProductAnswer(input: {
 function buildFallbackRoutineAnswer(input: {
   query: string;
   budget_cny: number | null;
-  routine_primary: RoutineRec;
-  routine_budget?: RoutineRec;
+  routine_primary: RoutineRecWithEvidence;
+  routine_budget?: RoutineRecWithEvidence;
 }) {
   const { budget_cny, routine_primary, routine_budget } = input;
   const detectedRegion = detectRegionPreference(input.query);
@@ -1712,13 +1736,15 @@ function buildFallbackRoutineAnswer(input: {
   lines.push("");
   lines.push("🌞 AM (Protection):");
   for (const step of routine_primary.am) {
-    lines.push(`- ${step.step} - ${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）`);
+    const cite = step.evidence_pack?.citations?.[0] ? ` ${step.evidence_pack.citations[0]}` : "";
+    lines.push(`- ${step.step} - ${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）${cite}`);
   }
 
   lines.push("");
   lines.push("🌙 PM (Treatment):");
   for (const step of routine_primary.pm) {
-    lines.push(`- ${step.step} - ${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）`);
+    const cite = step.evidence_pack?.citations?.[0] ? ` ${step.evidence_pack.citations[0]}` : "";
+    lines.push(`- ${step.step} - ${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）${cite}`);
   }
 
   lines.push("");
@@ -2040,8 +2066,8 @@ export async function POST(req: Request) {
     const fallbackAnswer = buildFallbackRoutineAnswer({
       query,
       budget_cny: budgetCny,
-      routine_primary,
-      routine_budget: over_budget ? routine_budget : undefined,
+      routine_primary: routine_primary_with_evidence,
+      routine_budget: over_budget ? routine_budget_with_evidence ?? undefined : undefined,
     });
 
     let answer = "";
@@ -2058,7 +2084,7 @@ export async function POST(req: Request) {
               ],
             });
 
-      if (isTooShort(answer)) {
+      if (isBadAnswer(answer, "routine")) {
         llm_error = "LLM answer too short; used fallback.";
         answer = fallbackAnswer;
       }
@@ -2197,7 +2223,7 @@ export async function POST(req: Request) {
                 { role: "user", content: `User request: ${query}` },
               ],
             });
-      if (isTooShort(answer)) {
+      if (isBadAnswer(answer, "product")) {
         llm_error = "LLM answer too short; used fallback.";
         answer = fallbackAnswer;
       }
@@ -2407,19 +2433,28 @@ export async function POST(req: Request) {
     mode: "product",
   });
 
-  const fallbackAnswer = buildFallbackProductAnswer({
-    query,
-    detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
-    anchor: {
-      brand: anchor.brand,
-      name: anchor.name,
-      price_usd: normalizeUsdPrice(anchor.priceUsd),
-      score: anchorScore,
-      ingredients: anchorIngredientCtx,
-      vetoed: anchorVetoed || anchorScore.vetoed,
-    },
-    candidates: mappedCandidates,
-  });
+	  const fallbackAnswer = buildFallbackProductAnswer({
+	    query,
+	    detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
+	    anchor: {
+	      brand: anchor.brand,
+	      name: anchor.name,
+	      price_usd: normalizeUsdPrice(anchor.priceUsd),
+	      score: anchorScore,
+	      ingredients: anchorIngredientCtx,
+	      vetoed: anchorVetoed || anchorScore.vetoed,
+	      citations: anchorKbProfile.citations.slice(0, 1),
+	    },
+	    candidates: mappedCandidates.map((c) => ({
+	      brand: c.brand,
+	      name: c.name,
+	      price_usd: c.price_usd,
+	      similarity: c.similarity,
+	      tradeoff: c.tradeoff,
+	      ingredients: c.ingredients,
+	      citations: c.kb_profile.citations.slice(0, 1),
+	    })),
+	  });
 
   let answer = "";
   let llm_error: string | null = null;
@@ -2435,7 +2470,7 @@ export async function POST(req: Request) {
             ],
           });
 
-    if (isTooShort(answer)) {
+    if (isBadAnswer(answer, "product")) {
       llm_error = "LLM answer too short; used fallback.";
       answer = fallbackAnswer;
     }
