@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "prisma generate && next build",
     "lint": "next lint",
     "test": "node --test --experimental-strip-types",
     "db:seed": "node --experimental-strip-types prisma/seed.ts",
