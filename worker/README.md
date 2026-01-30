@@ -112,6 +112,27 @@ python3 worker/ingest.py --input-json worker/datasets/top10.json --overwrite
 
 你也可以把自己准备的 JSON 列表保存成文件后用 `--input-json` 导入（支持格式：`[{...}, ...]` 或 `{ "items": [...] }`）。
 
+## 4.2) 导入 KB Snippets（专家注脚/对比/敏感提示）
+
+如果你的 Excel 里除了成分列，还包含 “Comparison notes / Sensitivity flags / Key actives / 用法/搭配/质地”等列，
+可以把这些非结构化字段作为 **KB snippets** 写入 `product_kb_snippets`，供线上 Chat/Routine 做证据引用（RAG footnotes）。
+
+两种方式：
+
+1) **随产品一起导入**（会跑 LLM 向量化）：
+
+```bash
+cd client
+python3 worker/ingest.py --input /path/to/skus.xlsx --sheet Sheet1 --ingest-kb --overwrite
+```
+
+2) **只导入 KB（不跑 LLM）**（推荐用于“修列名/修规则后重新 upsert KB”）：
+
+```bash
+cd client
+python3 worker/ingest.py --kb-only --input /path/to/skus.xlsx
+```
+
 ## 5) 注意
 
 - LLM 输出的功效分数是 **0-100**，目前 Aurora 前端引擎使用的是 **0-1**；后续做 DB→API 映射时会做归一化。

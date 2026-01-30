@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 
 import { createTextStreamResponse } from "ai";
 
-import { getSkuById, getSkuDatabase } from "@/app/v1/decision/_lib";
+import { getSkuById, getSkuDatabase, resolveProductIdForSkuId } from "@/app/v1/decision/_lib";
 import { calculateScore } from "@/lib/engine";
 import { prisma } from "@/lib/server/prisma";
 import { findSimilarSkusByAnchorProductId, type RegionPreference } from "@/lib/vector-service";
@@ -61,6 +61,12 @@ Input Data Structure
 User Profile: Skin Type, Concerns, Barrier Status, Budget, Region Preference.
 
 Context Data: A list of products with mechanism_scores (Science), social_stats (Social), risk_flags, and (if present) availability regions.
+
+Routine Evidence Packs (when present)
+
+- In Routine mode, each routine step may include an \`evidence_pack\` (key actives / texture & finish / sensitivity flags / pairing rules / dupes) plus \`citations\`.
+- You MUST ground step-level claims ("why this product", "how to use", "what not to mix") in the step's \`evidence_pack\` (and its \`citations\`).
+- If an evidence pack is missing, clearly say "KB not found for this product" and avoid asserting product-specific facts.
 
 Reasoning Policy (Chain of Thought)
 
@@ -606,17 +612,117 @@ type ExpertKnowledge = {
   sensitivity_notes?: string;
   comparison_notes?: string;
   key_actives_summary?: string;
-  sources?: Array<{ source_sheet: string; field: string }>;
+  usage_notes?: string;
+  texture_notes?: string;
+  sources?: Array<{ source_sheet: string; field: string; kb_id?: string }>;
 };
 
+type KbSnippetForEvidence = {
+  id?: string;
+  source_sheet: string;
+  field: string;
+  content: string;
+  metadata?: unknown;
+};
+
+type KbCanonicalKey = "sensitivity" | "key_actives" | "comparison" | "usage" | "texture" | "notes" | "unknown";
+
+function inferKbCanonicalKey(snippet: KbSnippetForEvidence): KbCanonicalKey {
+  const meta = snippet.metadata as any;
+  const metaKey =
+    typeof meta?.canonical_key === "string"
+      ? meta.canonical_key
+      : typeof meta?.canonicalKey === "string"
+        ? meta.canonicalKey
+        : typeof meta?.canonical_field === "string"
+          ? meta.canonical_field
+          : null;
+
+  const label = [metaKey, meta?.field_label, snippet.field].filter((v) => typeof v === "string" && v.trim()).join(" ").toLowerCase();
+
+  // Sensitivity / irritation
+  if (
+    label.includes("sensitivity") ||
+    label.includes("irrit") ||
+    label.includes("risk") ||
+    label.includes("敏感") ||
+    label.includes("刺激") ||
+    label.includes("刺痛") ||
+    label.includes("过敏")
+  ) {
+    return "sensitivity";
+  }
+
+  // Key actives
+  if (
+    label.includes("key_actives") ||
+    (label.includes("key") && (label.includes("active") || label.includes("actives"))) ||
+    label.includes("主要成分") ||
+    label.includes("核心成分") ||
+    label.includes("关键活性") ||
+    label.includes("功效成分")
+  ) {
+    return "key_actives";
+  }
+
+  // Comparison / dupes
+  if (
+    label.includes("comparison") ||
+    label.includes("compare") ||
+    label.includes("dupe") ||
+    label.includes("替代") ||
+    label.includes("平替") ||
+    label.includes("对比") ||
+    label.includes("竞品")
+  ) {
+    return "comparison";
+  }
+
+  // Usage / pairing
+  if (
+    label.includes("usage") ||
+    label.includes("routine") ||
+    label.includes("layer") ||
+    label.includes("frequency") ||
+    label.includes("用法") ||
+    label.includes("搭配") ||
+    label.includes("叠加") ||
+    label.includes("频率") ||
+    label.includes("注意事项")
+  ) {
+    return "usage";
+  }
+
+  // Texture / finish
+  if (
+    label.includes("texture") ||
+    label.includes("finish") ||
+    label.includes("pilling") ||
+    label.includes("质地") ||
+    label.includes("清爽") ||
+    label.includes("厚重") ||
+    label.includes("搓泥") ||
+    label.includes("成膜") ||
+    label.includes("油腻")
+  ) {
+    return "texture";
+  }
+
+  if (label.includes("notes") || label.includes("note") || label.includes("备注") || label.includes("评价")) return "notes";
+  if (!label.trim()) return "unknown";
+  return "notes";
+}
+
 function buildExpertKnowledgeFromKb(
-  snippets: Array<{ source_sheet: string; field: string; content: string }>,
+  snippets: Array<KbSnippetForEvidence>,
 ): ExpertKnowledge | null {
   if (!snippets.length) return null;
 
   const sensitivity: string[] = [];
   const comparison: string[] = [];
   const keyActives: string[] = [];
+  const usage: string[] = [];
+  const texture: string[] = [];
   const sources: ExpertKnowledge["sources"] = [];
 
   const pushUnique = (list: string[], value: string) => {
@@ -627,32 +733,42 @@ function buildExpertKnowledgeFromKb(
   };
 
   for (const s of snippets) {
-    const field = String(s.field ?? "").toLowerCase();
+    const key = inferKbCanonicalKey(s);
     const content = String(s.content ?? "").trim();
     if (!content) continue;
 
-    sources.push({ source_sheet: String(s.source_sheet ?? ""), field: String(s.field ?? "") });
+    sources.push({ source_sheet: String(s.source_sheet ?? ""), field: String(s.field ?? ""), kb_id: s.id });
 
-    if (field.includes("sensitivity")) {
+    if (key === "sensitivity") {
       pushUnique(sensitivity, content);
       continue;
     }
-    if (field.includes("comparison") || field.endsWith("_notes") || field === "notes") {
+    if (key === "comparison") {
       pushUnique(comparison, content);
       continue;
     }
-    if (field.includes("key") && (field.includes("active") || field.includes("actives"))) {
+    if (key === "key_actives") {
       pushUnique(keyActives, content);
+      continue;
+    }
+    if (key === "usage") {
+      pushUnique(usage, content);
+      continue;
+    }
+    if (key === "texture") {
+      pushUnique(texture, content);
       continue;
     }
   }
 
-  if (!sensitivity.length && !comparison.length && !keyActives.length) return null;
+  if (!sensitivity.length && !comparison.length && !keyActives.length && !usage.length && !texture.length) return null;
 
   return {
     sensitivity_notes: sensitivity.length ? sensitivity.join(" | ") : undefined,
     comparison_notes: comparison.length ? comparison.join(" | ") : undefined,
     key_actives_summary: keyActives.length ? keyActives.join(" | ") : undefined,
+    usage_notes: usage.length ? usage.join(" | ") : undefined,
+    texture_notes: texture.length ? texture.join(" | ") : undefined,
     sources: sources.length ? sources : undefined,
   };
 }
@@ -692,6 +808,288 @@ type RoutineRec = {
   total_usd: number;
   total_cny: number;
 };
+
+type RoutineEvidencePack = {
+  product_id: string;
+  display_name: string;
+  region: RegionPreference | "Global";
+  availability: string[];
+
+  keyActives?: string[];
+  textureFinish?: string[];
+  sensitivityFlags?: string[];
+  pairingRules?: string[];
+  comparisonNotes?: string[];
+
+  citations: string[];
+};
+
+type RoutineStepWithEvidence = {
+  step: string;
+  sku: SkuVector;
+  notes: string[];
+  product_id: string | null;
+  evidence_pack: RoutineEvidencePack | null;
+};
+
+type RoutineRecWithEvidence = {
+  am: RoutineStepWithEvidence[];
+  pm: RoutineStepWithEvidence[];
+  total_usd: number;
+  total_cny: number;
+};
+
+function truncateText(value: string, maxChars: number) {
+  const s = String(value ?? "").trim();
+  if (!s) return "";
+  if (s.length <= maxChars) return s;
+  return s.slice(0, Math.max(0, maxChars - 1)).trimEnd() + "…";
+}
+
+function uniqueStrings(items: string[]) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of items) {
+    const v = String(raw ?? "").trim();
+    if (!v) continue;
+    const key = v.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(v);
+  }
+  return out;
+}
+
+function extractSensitivityFlagsFromText(text: string): string[] {
+  const t = String(text ?? "").toLowerCase();
+  const flags = new Set<string>();
+
+  const hasAny = (needles: string[]) => needles.some((n) => t.includes(n));
+
+  if (hasAny(["alcohol denat", "alcohol", "ethanol", "酒精"])) flags.add("alcohol");
+  if (hasAny(["fragrance", "parfum", "perfume", "香精", "香料"])) flags.add("fragrance");
+  if (hasAny(["essential oil", "精油"])) flags.add("essential_oil");
+  if (hasAny(["mint", "peppermint", "薄荷"])) flags.add("mint");
+  if (hasAny(["retinol", "retinoid", "tretinoin", "adapalene", "维a", "视黄醇", "阿达帕林"])) flags.add("retinol");
+  if (hasAny(["aha", "bha", "pha", "glycolic", "lactic", "mandelic", "salicylic", "azelaic", "acid", "果酸", "水杨酸", "杏仁酸", "壬二酸", "酸"])) {
+    flags.add("acid");
+  }
+  if (hasAny(["sting", "burn", "irritat", "刺痛", "灼热", "刺激"])) flags.add("high_irritation");
+
+  return Array.from(flags);
+}
+
+function extractKeyActivesFromText(text: string): string[] {
+  const raw = String(text ?? "").trim();
+  if (!raw) return [];
+
+  const parts = raw
+    .replace(/[()（）]/g, " ")
+    .split(/[;,，、|/]+/g)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const cleaned = parts
+    .map((p) => p.replace(/\s+/g, " ").trim())
+    .filter((p) => p.length >= 2 && p.length <= 40)
+    .filter((p) => !/^good|great|nice|ok|none$/i.test(p));
+
+  return uniqueStrings(cleaned).slice(0, 10);
+}
+
+function buildRoutineEvidencePack(input: {
+  sku: SkuVector;
+  product_id: string;
+  region: RegionPreference;
+  availability: string[];
+  snippets: KbSnippetForEvidence[];
+}): RoutineEvidencePack {
+  const MAX_PER_BUCKET = {
+    sensitivity: 3,
+    key_actives: 3,
+    texture: 2,
+    usage: 2,
+    comparison: 2,
+    notes: 2,
+  } as const;
+
+  const buckets: Record<KbCanonicalKey, KbSnippetForEvidence[]> = {
+    sensitivity: [],
+    key_actives: [],
+    texture: [],
+    usage: [],
+    comparison: [],
+    notes: [],
+    unknown: [],
+  };
+
+  for (const snip of input.snippets) {
+    const key = inferKbCanonicalKey(snip);
+    buckets[key].push(snip);
+  }
+
+  const takeBucketText = (key: keyof typeof MAX_PER_BUCKET) =>
+    buckets[key]
+      .slice(0, MAX_PER_BUCKET[key])
+      .map((s) => truncateText(String(s.content ?? ""), 140))
+      .filter(Boolean);
+
+  const sensitivityNotes = takeBucketText("sensitivity");
+  const textureNotes = takeBucketText("texture");
+  const usageNotes = takeBucketText("usage");
+  const comparisonNotes = takeBucketText("comparison");
+
+  const keyActivesFromKb = uniqueStrings(
+    buckets.key_actives
+      .slice(0, MAX_PER_BUCKET.key_actives)
+      .flatMap((s) => extractKeyActivesFromText(String(s.content ?? ""))),
+  );
+
+  const sensitivityFlags = uniqueStrings([
+    ...input.sku.risk_flags,
+    ...extractSensitivityFlagsFromText(sensitivityNotes.join(" ")),
+    ...extractSensitivityFlagsFromText(usageNotes.join(" ")),
+  ]);
+
+  const textureFinish = uniqueStrings([
+    input.sku.experience?.texture ? `Texture: ${input.sku.experience.texture}` : "",
+    input.sku.experience?.finish ? `Finish: ${input.sku.experience.finish}` : "",
+    (input.sku.experience?.pilling_risk ?? 0) > 0.6 ? "Higher pilling risk" : "",
+    ...textureNotes,
+  ]).filter(Boolean);
+
+  const pairingRules = uniqueStrings([
+    ...usageNotes,
+    sensitivityFlags.includes("retinol") ? "If using retinoids, avoid stacking with strong acids on the same night." : "",
+    sensitivityFlags.includes("acid") ? "Do not stack multiple strong acids in the same routine." : "",
+  ]).filter(Boolean);
+
+  const selectedSnippets = [
+    ...buckets.sensitivity.slice(0, MAX_PER_BUCKET.sensitivity),
+    ...buckets.key_actives.slice(0, MAX_PER_BUCKET.key_actives),
+    ...buckets.texture.slice(0, MAX_PER_BUCKET.texture),
+    ...buckets.usage.slice(0, MAX_PER_BUCKET.usage),
+    ...buckets.comparison.slice(0, MAX_PER_BUCKET.comparison),
+    ...buckets.notes.slice(0, MAX_PER_BUCKET.notes),
+  ];
+
+  const citations = uniqueStrings(
+    selectedSnippets
+      .map((s) => (s.id ? `kb:${s.id}` : null))
+      .filter((v): v is string => Boolean(v)),
+  );
+
+  return {
+    product_id: input.product_id,
+    display_name: `${input.sku.brand} ${input.sku.name}`.trim(),
+    region: input.region ?? "Global",
+    availability: Array.isArray(input.availability) ? input.availability : [],
+    keyActives: keyActivesFromKb.length ? keyActivesFromKb : input.sku.actives,
+    textureFinish: textureFinish.length ? textureFinish : undefined,
+    sensitivityFlags: sensitivityFlags.length ? sensitivityFlags : undefined,
+    pairingRules: pairingRules.length ? pairingRules : undefined,
+    comparisonNotes: comparisonNotes.length ? comparisonNotes : undefined,
+    citations,
+  };
+}
+
+async function buildRoutineEvidenceIndex(input: {
+  routines: RoutineRec[];
+  region: RegionPreference;
+}): Promise<{
+  productIdBySkuId: Map<string, string>;
+  availabilityByProductId: Map<string, string[]>;
+  evidenceByProductId: Map<string, RoutineEvidencePack>;
+}> {
+  const productIdBySkuId = new Map<string, string>();
+  const availabilityByProductId = new Map<string, string[]>();
+  const evidenceByProductId = new Map<string, RoutineEvidencePack>();
+
+  // Best-effort: if DB is not configured, skip KB enrichment.
+  const dbUrl = process.env.DATABASE_URL;
+  if (!dbUrl || dbUrl.includes("${{")) return { productIdBySkuId, availabilityByProductId, evidenceByProductId };
+
+  const skuById = new Map<string, SkuVector>();
+  for (const r of input.routines) {
+    for (const s of [...r.am, ...r.pm]) skuById.set(s.sku.sku_id, s.sku);
+  }
+
+  // Resolve product_ids for any non-UUID sku_id values (aliases).
+  for (const sku of skuById.values()) {
+    const skuId = sku.sku_id;
+    if (looksLikeUuid(skuId)) {
+      productIdBySkuId.set(skuId, skuId);
+      continue;
+    }
+
+    // Try known alias resolution first.
+    const resolved = await resolveProductIdForSkuId(skuId);
+    if (resolved) {
+      productIdBySkuId.set(skuId, resolved);
+      continue;
+    }
+
+    // Fallback: try brand+name identity.
+    const row = await prisma.product.findFirst({ where: { brand: sku.brand, name: sku.name }, select: { id: true } });
+    if (row?.id) productIdBySkuId.set(skuId, row.id);
+  }
+
+  const productIds = uniqueStrings(Array.from(productIdBySkuId.values()));
+  if (!productIds.length) return { productIdBySkuId, availabilityByProductId, evidenceByProductId };
+
+  const products = await prisma.product.findMany({
+    where: { id: { in: productIds } },
+    select: { id: true, regionAvailability: true },
+  });
+  for (const p of products) availabilityByProductId.set(p.id, Array.isArray(p.regionAvailability) ? p.regionAvailability : []);
+
+  const kbRows = await prisma.productKbSnippet.findMany({
+    where: { productId: { in: productIds } },
+    orderBy: [{ sourceSheet: "asc" }, { field: "asc" }, { updatedAt: "desc" }],
+    select: { id: true, productId: true, sourceSheet: true, field: true, content: true, metadata: true },
+  });
+  const kbByProductId = new Map<string, KbSnippetForEvidence[]>();
+  for (const row of kbRows) {
+    const list = kbByProductId.get(row.productId) ?? [];
+    list.push({ id: row.id, source_sheet: row.sourceSheet, field: row.field, content: row.content, metadata: row.metadata });
+    kbByProductId.set(row.productId, list);
+  }
+
+  for (const sku of skuById.values()) {
+    const productId = productIdBySkuId.get(sku.sku_id) ?? (looksLikeUuid(sku.sku_id) ? sku.sku_id : null);
+    if (!productId) continue;
+    if (evidenceByProductId.has(productId)) continue;
+
+    const pack = buildRoutineEvidencePack({
+      sku,
+      product_id: productId,
+      region: input.region,
+      availability: availabilityByProductId.get(productId) ?? [],
+      snippets: kbByProductId.get(productId) ?? [],
+    });
+    evidenceByProductId.set(productId, pack);
+  }
+
+  return { productIdBySkuId, availabilityByProductId, evidenceByProductId };
+}
+
+function attachEvidenceToRoutine(
+  routine: RoutineRec,
+  index: { productIdBySkuId: Map<string, string>; evidenceByProductId: Map<string, RoutineEvidencePack> },
+): RoutineRecWithEvidence {
+  const enrichStep = (s: { step: string; sku: SkuVector; notes: string[] }): RoutineStepWithEvidence => {
+    const productId = index.productIdBySkuId.get(s.sku.sku_id) ?? (looksLikeUuid(s.sku.sku_id) ? s.sku.sku_id : null);
+    const evidence = productId ? index.evidenceByProductId.get(productId) ?? null : null;
+    return { ...s, product_id: productId, evidence_pack: evidence };
+  };
+
+  return {
+    am: routine.am.map(enrichStep),
+    pm: routine.pm.map(enrichStep),
+    total_usd: routine.total_usd,
+    total_cny: routine.total_cny,
+  };
+}
 
 function hasDrySkin(user: UserVector) {
   const skin = user.skin_type;
@@ -1194,6 +1592,18 @@ export async function POST(req: Request) {
     const over_budget = budgetCny != null && Number.isFinite(budgetCny) ? routine_primary.total_cny > budgetCny : false;
     const routine = routine_primary;
 
+    const evidenceIndex = await buildRoutineEvidenceIndex({
+      routines: [routine_primary, ...(over_budget ? [routine_budget] : [])],
+      region: detectedRegion,
+    });
+    const routine_primary_with_evidence = attachEvidenceToRoutine(routine_primary, evidenceIndex);
+    const routine_budget_with_evidence = over_budget ? attachEvidenceToRoutine(routine_budget, evidenceIndex) : null;
+    const evidencePacks = Array.from(evidenceIndex.evidenceByProductId.values());
+    const evidenceSummary = {
+      products_in_routine: evidencePacks.length,
+      products_with_kb: evidencePacks.filter((p) => (p.citations?.length ?? 0) > 0).length,
+    };
+
     const routineContextData = {
       user_query: query,
       region_preference: detectedRegion,
@@ -1205,9 +1615,10 @@ export async function POST(req: Request) {
         barrier_impaired: detectBarrierImpaired(query),
       },
       user_profile_inferred: user,
+      routine_evidence_summary: evidenceSummary,
       routine: {
-        primary: routine_primary,
-        strict_budget: over_budget ? routine_budget : null,
+        primary: routine_primary_with_evidence,
+        strict_budget: over_budget ? routine_budget_with_evidence : null,
         over_budget,
       },
     };
@@ -1358,12 +1769,13 @@ export async function POST(req: Request) {
 
   const kbRows = await prisma.productKbSnippet.findMany({
     where: { productId: { in: [anchor.id, ...candidateIds] } },
-    select: { productId: true, sourceSheet: true, field: true, content: true },
+    orderBy: [{ sourceSheet: "asc" }, { field: "asc" }, { updatedAt: "desc" }],
+    select: { id: true, productId: true, sourceSheet: true, field: true, content: true, metadata: true },
   });
-  const kbByProductId = new Map<string, Array<{ source_sheet: string; field: string; content: string }>>();
+  const kbByProductId = new Map<string, KbSnippetForEvidence[]>();
   for (const row of kbRows) {
     const list = kbByProductId.get(row.productId) ?? [];
-    list.push({ source_sheet: row.sourceSheet, field: row.field, content: row.content });
+    list.push({ id: row.id, source_sheet: row.sourceSheet, field: row.field, content: row.content, metadata: row.metadata });
     kbByProductId.set(row.productId, list);
   }
 

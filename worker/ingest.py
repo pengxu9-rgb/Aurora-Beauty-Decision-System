@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -527,10 +528,110 @@ def split_brand_and_name(product_full_name: str) -> Tuple[str, str]:
 
 
 def canonicalize_kb_field(label: str) -> str:
-  value = (label or "").strip().lower()
+  """
+  Produce a stable, unique-ish column key for KB snippets.
+
+  Notes:
+  - We keep this key per sheet/column (used in UNIQUE constraint), so it MUST
+    stay stable across runs.
+  - Some sheets contain Chinese-only column names; the previous ASCII-only
+    normalization collapsed these into "unknown" and caused collisions.
+  """
+  raw = (label or "").strip()
+  if not raw:
+    return "unknown"
+
+  value = raw.lower()
   value = re.sub(r"[^a-z0-9]+", "_", value)
   value = value.strip("_")
-  return value[:64] or "unknown"
+  if value:
+    return value[:64]
+
+  # Fallback for non-ASCII labels: use a short stable hash.
+  digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+  return f"col_{digest}"
+
+
+def infer_kb_canonical_key(label: str) -> Optional[str]:
+  """
+  Map heterogeneous spreadsheet column labels to a small, stable ontology.
+
+  Stored in KB snippet `metadata.canonical_key` (no DB schema change required).
+  """
+  raw = (label or "").strip()
+  if not raw:
+    return None
+
+  lower = raw.lower()
+
+  # Sensitivity / irritation
+  if (
+    "sensitivity" in lower
+    or "irrit" in lower
+    or "risk" in lower
+    or "敏感" in raw
+    or "刺激" in raw
+    or "刺痛" in raw
+    or "过敏" in raw
+  ):
+    return "sensitivity"
+
+  # Key actives
+  if (
+    "key_actives" in lower
+    or ("key" in lower and ("active" in lower or "actives" in lower))
+    or "核心成分" in raw
+    or "主要成分" in raw
+    or "关键活性" in raw
+    or "功效成分" in raw
+    or "活性" in raw
+  ):
+    return "key_actives"
+
+  # Comparison / dupes
+  if (
+    "comparison" in lower
+    or "compare" in lower
+    or "dupe" in lower
+    or "替代" in raw
+    or "平替" in raw
+    or "对比" in raw
+    or "竞品" in raw
+  ):
+    return "comparison"
+
+  # Usage / pairing
+  if (
+    "usage" in lower
+    or "routine" in lower
+    or "layer" in lower
+    or "frequency" in lower
+    or "用法" in raw
+    or "搭配" in raw
+    or "叠加" in raw
+    or "频率" in raw
+    or "注意事项" in raw
+  ):
+    return "usage"
+
+  # Texture / finish
+  if (
+    "texture" in lower
+    or "finish" in lower
+    or "pilling" in lower
+    or "质地" in raw
+    or "清爽" in raw
+    or "厚重" in raw
+    or "搓泥" in raw
+    or "成膜" in raw
+    or "油腻" in raw
+  ):
+    return "texture"
+
+  if "notes" in lower or "note" in lower or "备注" in raw or "评价" in raw:
+    return "notes"
+
+  return None
 
 
 def normalize_match_key(text: str) -> str:
@@ -604,6 +705,7 @@ def extract_kb_snippets_from_workbook(*, path: str) -> List[KbSnippet]:
         content = _cell_text(r[j])
         if len(content) < 2:
           continue
+        canonical_key = infer_kb_canonical_key(label)
         meta: Dict[str, Any] = {
           "source_file": os.path.basename(path),
           "source_sheet": sheet_name,
@@ -611,6 +713,9 @@ def extract_kb_snippets_from_workbook(*, path: str) -> List[KbSnippet]:
           "row_number": row_number,
           "product_full_name": product_full,
         }
+        if canonical_key:
+          meta["canonical_key"] = canonical_key
+          meta["canonical_key_source"] = "label_rules_v1"
         if source_url:
           meta["source"] = source_url
 
@@ -1316,6 +1421,7 @@ def main() -> None:
   parser.add_argument("--limit", type=int, default=None, help="Max rows to ingest (for testing).")
   parser.add_argument("--list-models", action="store_true", help="List available Gemini models and exit.")
   parser.add_argument("--ingest-kb", action="store_true", help="Also ingest non-ingredient notes into product_kb_snippets.")
+  parser.add_argument("--kb-only", action="store_true", help="Only upsert KB snippets from the workbook (no LLM calls). Requires --input.")
 
   parser.add_argument("--col-brand", type=str, default="brand")
   parser.add_argument("--col-name", type=str, default="name")
@@ -1342,6 +1448,40 @@ def main() -> None:
   args = parser.parse_args()
 
   load_dotenv()
+
+  if args.kb_only:
+    if not args.input:
+      raise SystemExit("--kb-only requires --input /path/to.xlsx")
+
+    database_url = resolve_env_templates(_require_env("DATABASE_URL"))
+    with AuroraDb(database_url) as db:
+      snippets = extract_kb_snippets_from_workbook(path=args.input)
+      if snippets:
+        product_ids = db.load_all_product_ids()
+        product_ids_norm = db.load_all_product_ids_normalized()
+        upserted = 0
+        skipped = 0
+        for snip in snippets:
+          pid = product_ids.get((snip.brand, snip.name))
+          if not pid:
+            pid = product_ids_norm.get((normalize_match_key(snip.brand), normalize_match_key(snip.name)))
+          if not pid:
+            skipped += 1
+            continue
+          db.upsert_kb_snippet(
+            product_id=pid,
+            source_sheet=snip.source_sheet,
+            field=snip.field,
+            content=snip.content,
+            metadata=snip.metadata,
+          )
+          upserted += 1
+        db.conn.commit()
+        print(f"📚 KB snippets upserted: {upserted} (skipped missing products: {skipped})")
+      else:
+        print("📚 No KB snippets found in workbook.")
+    return
+
   api_key = _require_any_env(["GEMINI_API_KEY", "GOOGLE_API_KEY"])
   api_base_url = (os.getenv("GEMINI_API_BASE_URL") or DEFAULT_GEMINI_API_BASE_URL).strip()
   openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
