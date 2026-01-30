@@ -5,7 +5,7 @@ import { createTextStreamResponse } from "ai";
 import { getSkuById, getSkuDatabase } from "@/app/v1/decision/_lib";
 import { calculateScore } from "@/lib/engine";
 import { prisma } from "@/lib/server/prisma";
-import { findSimilarProductsByAnchorProductId } from "@/lib/search";
+import { findSimilarSkusByAnchorProductId, type RegionPreference } from "@/lib/vector-service";
 import type { Budget, MechanismKey, RiskFlag, SkinType, SkuScoreBreakdown, SkuVector, UserGoal, UserVector } from "@/types";
 
 export const runtime = "nodejs";
@@ -28,6 +28,146 @@ const USD_TO_CNY = 7.2;
 
 function looksLikeUuid(value: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function buildAuroraStructuredSystemPrompt(input: {
+  regionLabel: string;
+  contextDataJson: string;
+  mode: "routine" | "product";
+}) {
+  const modeAddendum =
+    input.mode === "product"
+      ? `
+Dupe / Alternatives Mode (If applicable)
+- If the user asks for a dupe OR Context Data includes candidate alternatives:
+  - Recommend 2-3 dupes from Context Data.
+  - For each dupe: include price, (if provided) similarity, and an honest "trade-off" based on experience (texture/finish/pilling).
+  - Prefer products available in the user's region when availability is provided.
+  - Then propose how to use the best dupe inside a simple AM/PM routine (if the user wants a routine).
+`.trim()
+      : "";
+
+  return `
+Role
+
+You are Aurora, an elite Dermatological AI Consultant. You combine the scientific rigor of a cosmetic chemist with the empathy of a supportive aesthetician.
+
+Core Objective
+
+Analyze the user's skin profile and the provided Context Data (retrieved SKUs) to generate a personalized, safe, and effective skincare routine.
+
+Input Data Structure
+
+User Profile: Skin Type, Concerns, Barrier Status, Budget, Region Preference.
+
+Context Data: A list of products with mechanism_scores (Science), social_stats (Social), risk_flags, and (if present) availability regions.
+
+Reasoning Policy (Chain of Thought)
+
+- Think step-by-step privately to apply the Aurora Algorithm.
+- Do NOT reveal chain-of-thought. Output only the final answer with brief, grounded reasons.
+- Never invent products or facts. If Context Data is missing, say "not found in database" and give generic ingredient-level advice.
+
+Decision Logic (The "Aurora Algorithm")
+
+1. Safety Filter (Priority Zero)
+
+IF User Barrier == "Impaired" (Redness/Stinging):
+
+VETO any product with risk_flags containing ANY of:
+- raw flags: ['alcohol_high', 'strong_acid', 'retinol_high']
+- canonical flags: ['alcohol', 'acid', 'high_irritation', 'retinol']
+OR if burn_rate > 0.10.
+
+ACTION: Explicitly warn the user: "🚫 Based on your current sensitivity, [Product Name] is too risky."
+
+2. Targeted Treatment Rule (The "Comedone" Logic)
+
+IF user mentions "closed comedones" (闭口) or "rough texture" (粗糙):
+- PRIORITIZE Acids (BHA/AHA/Azelaic/Mandelic) over Niacinamide/Retinol in the PM routine.
+- REASON: "Acid exfoliation is the most direct cure for unclogging pores."
+- EXCEPTION: If skin is "sensitive", stick to Azelaic Acid or Mandelic Acid only.
+
+3. Budget Compression Rule (The "Skip Moisturizer" Logic)
+
+IF user budget is "Low" AND skin type is NOT "Dry":
+- MERGE AM steps: Skip separate AM Moisturizer. Recommend a "Moisturizing Sunscreen" directly after Cleansing.
+- EXPLAIN: "For oily/combo skin, a good sunscreen provides enough hydration. Save the moisturizer budget for a better serum."
+- ACTION: Re-allocate the saved budget to upgrade the PM Active (Serum).
+
+4. The "Sandwich" Strategy (Retinol/Acid)
+
+If recommending Retinol or Strong Acids to a beginner:
+- INSTRUCT: Use the "Sandwich Method" (Moisturizer -> Active -> Moisturizer).
+- FREQUENCY: Start 1-2 times/week.
+
+5. Budget Allocation (High-Low)
+
+Cleanser/Mist: Recommend affordables (CeraVe, etc.). "Stay time is short, save money here."
+
+Serum/Ampoule: Recommend higher budget. "Deep penetration requires better delivery tech."
+
+6. Region & Availability
+
+- You are recommending products available in ${input.regionLabel} (or Global).
+- If a product availability includes "Global", explicitly mention it is widely available.
+- If no products match the user's region, say so and provide Global options.
+
+${modeAddendum}
+
+Response Format (Markdown)
+
+Part 1: Diagnosis 🩺
+
+Briefly summarize their skin state and primary focus (e.g., "Repair First, Brighten Later").
+
+Part 2: The Routine 📅
+
+Present a vertical timeline for AM and PM.
+Format:
+
+🌞 AM (Protection):
+
+[Step Name] - [Product Name] (Why: ...)
+
+...
+
+🌙 PM (Treatment):
+
+[Step Name] - [Product Name] (Why: ...)
+
+Part 3: Budget Analysis 💰
+
+"Total Estimated Cost: $X. By using [Budget Product] for cleansing, we saved budget for [Hero Product]."
+
+Part 4: Safety Warning ⚠️
+
+Specific instructions on what NOT to mix (e.g., "Do not use [Product A] with [Product B]").
+
+Tone & Style
+
+Professional yet Accessible: Use clear terms. Explain "why" briefly.
+
+Honest: If the retrieved products don't match the user (e.g., no safe options found), admit it and suggest generic ingredients (e.g., "Look for a plain 5% Panthenol cream").
+
+No Fluff: Go straight to the solution.
+
+Few-Shot Examples (format reference only; do not copy products unless present in Context Data)
+
+Example A (Sensitive + VETO):
+- User: "I have sensitive skin with stinging redness. Can I use a strong retinol?"
+- Output: Start with 🚫 warning, veto retinol, suggest barrier repair routine first, and only mild actives later.
+
+Example B (Closed comedones + Tight budget):
+- User: "Oily acne skin, closed comedones, budget ¥500, AM/PM routine."
+- Output: AM: Cleanser -> Moisturizing Sunscreen (skip AM moisturizer). PM: Cleanser -> Azelaic/BHA -> Moisturizer. Include total cost and budget logic.
+
+Context Data
+
+\`\`\`json
+${input.contextDataJson}
+\`\`\`
+`.trim();
 }
 
 function extractTextFromUnknownMessage(message: unknown): string {
@@ -98,6 +238,20 @@ function detectBarrierImpaired(query: string) {
     query.includes("刺痛") ||
     query.includes("火辣")
   );
+}
+
+function detectRegionPreference(query: string): RegionPreference {
+  const q = query.toLowerCase();
+
+  if (q.includes("china") || query.includes("国内") || query.includes("淘宝") || query.includes("中国")) return "CN";
+
+  const mentionsUs = /\b(us|usa)\b/i.test(query) || q.includes("sephora") || q.includes("amazon") || query.includes("美国");
+  if (mentionsUs) return "US";
+
+  const mentionsEu = /\b(eu)\b/i.test(query) || q.includes("europe") || query.includes("欧洲");
+  if (mentionsEu) return "EU";
+
+  return null;
 }
 
 function mapRiskFlags(rawFlags: unknown): RiskFlag[] {
@@ -370,7 +524,9 @@ async function geminiGenerateContent(input: {
   // NOTE:
   // Some Gemini REST variants reject `systemInstruction` (400: Unknown name "systemInstruction").
   // To maximize compatibility, we inline the system prompt into the user prompt.
-  const combinedPrompt = `${input.system_prompt}\n\nContext:\n${input.user_prompt}`;
+  const combinedPrompt = input.user_prompt.trim()
+    ? `${input.system_prompt}\n\nContext:\n${input.user_prompt}`
+    : input.system_prompt;
 
   const body = {
     contents: [{ role: "user", parts: [{ text: combinedPrompt }] }],
@@ -832,6 +988,8 @@ export async function POST(req: Request) {
   const limit = typeof body.limit === "number" && body.limit > 0 ? Math.min(20, body.limit) : 6;
 
   const budgetCny = parseBudgetCny(query);
+  const detectedRegion = detectRegionPreference(query);
+  const regionLabel = detectedRegion ?? "Global";
 
   const explicitAnchorId =
     typeof body.anchor_product_id === "string" && body.anchor_product_id.trim() ? body.anchor_product_id.trim() : null;
@@ -866,50 +1024,29 @@ export async function POST(req: Request) {
     const over_budget = budgetCny != null && Number.isFinite(budgetCny) ? routine_primary.total_cny > budgetCny : false;
     const routine = routine_primary;
 
-    const contextText = [
-      `User Query: ${query}`,
-      `Detected: oily/acne=${detectOilyAcne(query)}; sensitive=${detectSensitiveSkin(query)}; barrier_impaired=${detectBarrierImpaired(query)}`,
-      budgetCny != null ? `Budget: ${formatCny(budgetCny)} (≈${formatUsd(budgetCny / USD_TO_CNY)})` : "Budget: (not provided)",
-      "",
-      "Recommended Routine (primary, pre-selected):",
-      `AM: ${routine.am.map((s) => `${s.step}=${s.sku.brand} ${s.sku.name} (${formatUsd(s.sku.price)})`).join(" | ")}`,
-      `PM: ${routine.pm.map((s) => `${s.step}=${s.sku.brand} ${s.sku.name} (${formatUsd(s.sku.price)})`).join(" | ")}`,
-      `Total: ${formatUsd(routine.total_usd)} (≈${formatCny(routine.total_cny)})`,
-      over_budget
-        ? [
-            "",
-            "Budget-safe Alternative (if you must stay within budget):",
-            `AM: ${routine_budget.am.map((s) => `${s.step}=${s.sku.brand} ${s.sku.name} (${formatUsd(s.sku.price)})`).join(" | ")}`,
-            `PM: ${routine_budget.pm.map((s) => `${s.step}=${s.sku.brand} ${s.sku.name} (${formatUsd(s.sku.price)})`).join(" | ")}`,
-            `Total: ${formatUsd(routine_budget.total_usd)} (≈${formatCny(routine_budget.total_cny)})`,
-          ].join("\n")
-        : null,
-    ].join("\n");
+    const routineContextData = {
+      user_query: query,
+      region_preference: detectedRegion,
+      budget_cny: budgetCny,
+      budget_usd_est: budgetCny != null ? budgetCny / USD_TO_CNY : null,
+      detected: {
+        oily_acne: detectOilyAcne(query),
+        sensitive_skin: detectSensitiveSkin(query),
+        barrier_impaired: detectBarrierImpaired(query),
+      },
+      user_profile_inferred: user,
+      routine: {
+        primary: routine_primary,
+        strict_budget: over_budget ? routine_budget : null,
+        over_budget,
+      },
+    };
 
-    const systemPrompt = `
-You are the Aurora Beauty Consultant.
-You MUST base your answer strictly on the provided context (do not hallucinate products).
-
-Expert heuristics to follow (STRICT):
-
-1) Targeted Treatment Rule (The "Comedone" Logic)
-IF the user mentions "closed comedones" (闭口) or "rough texture" (粗糙):
-- PRIORITIZE Acids (BHA/AHA/Azelaic) over Niacinamide/Retinol in the PM Routine.
-- REASON: "Acid exfoliation is the most direct cure for unclogging pores."
-- EXCEPTION: If skin is "sensitive", stick to Azelaic Acid or Mandelic Acid.
-
-2) Budget Compression Rule (The "Skip Moisturizer" Logic)
-IF the user budget is "Low" AND skin type is NOT "Dry":
-- MERGE AM steps: Skip separate AM Moisturizer. Recommend a "Moisturizing Sunscreen" directly after Cleansing.
-- EXPLAIN: "For oily/combo skin, a good sunscreen provides enough hydration. Save the moisturizer budget for a better serum."
-- ACTION: Re-allocate the saved budget to upgrade the PM Active (Serum).
-
-Output requirements:
-- Provide AM and PM routines (bullets).
-- Explain why each product fits oily/acne + closed comedones.
-- Include total price and confirm whether it stays within budget. If the primary plan is over budget, still show it first (as the “optimal” plan), then output a budget-safe alternative (as the “strict budget” plan).
-- Be direct and practical.
-`.trim();
+    const systemPrompt = buildAuroraStructuredSystemPrompt({
+      regionLabel,
+      contextDataJson: JSON.stringify(routineContextData, null, 2),
+      mode: "routine",
+    });
 
     const fallbackAnswer = buildFallbackRoutineAnswer({
       query,
@@ -923,12 +1060,12 @@ Output requirements:
     try {
       answer =
         provider === "gemini"
-          ? await geminiGenerateContent({ system_prompt: systemPrompt, user_prompt: contextText, model: requestedModel })
+          ? await geminiGenerateContent({ system_prompt: systemPrompt, user_prompt: "", model: requestedModel })
           : await openaiChatCompletion({
               model: requestedModel,
               messages: [
                 { role: "system", content: systemPrompt },
-                { role: "user", content: contextText },
+                { role: "user", content: `User request: ${query}` },
               ],
             });
 
@@ -955,7 +1092,12 @@ Output requirements:
       llm_error,
       intent: "routine",
       context: {
-        detected: { oily_acne: detectOilyAcne(query), sensitive_skin: detectSensitiveSkin(query), barrier_impaired: detectBarrierImpaired(query) },
+        detected: {
+          oily_acne: detectOilyAcne(query),
+          sensitive_skin: detectSensitiveSkin(query),
+          barrier_impaired: detectBarrierImpaired(query),
+          region_preference: detectedRegion,
+        },
         budget_cny: budgetCny,
         routine,
         routine_primary,
@@ -1022,7 +1164,11 @@ Output requirements:
   const anchorBurnRate = Math.max(0, Math.min(1, anchorSku.social_stats.burn_rate ?? 0));
   const anchorVetoed = anchorScore.vetoed || (barrierImpaired && (anchorRisk.includes("high_irritation") || anchorBurnRate > 0.1));
 
-  const similar = await findSimilarProductsByAnchorProductId(anchorProductId, { limit: Math.min(10, limit), cheaper_than_anchor: true });
+  const similar = await findSimilarSkusByAnchorProductId(anchorProductId, {
+    limit: Math.min(10, limit),
+    cheaper_than_anchor: true,
+    region: detectedRegion,
+  });
   let candidates = similar;
   if (sensitive) candidates = candidates.filter((c) => !c.sku.risk_flags.includes("alcohol"));
   if (barrierImpaired) {
@@ -1051,6 +1197,7 @@ Output requirements:
       brand: c.sku.brand,
       name: c.sku.name,
       price_usd: c.sku.price,
+      availability: c.availability,
       similarity: c.similarity,
       tradeoff: (() => {
         const ex = c.sku.experience;
@@ -1063,48 +1210,69 @@ Output requirements:
     };
   });
 
-  const contextText = [
-    `User Query: ${query}`,
-    `Detected: sensitive_skin=${sensitive}; barrier_impaired=${barrierImpaired}`,
-    "",
-    "ANCHOR:",
-    `- ${anchor.brand} ${anchor.name} | price=${formatUsd(coerceNumber(anchor.priceUsd))}`,
-    `- score_total=${Math.round(anchorScore.total)}/100 | vetoed=${anchorScore.vetoed} | reason=${anchorScore.veto_reason ?? "n/a"}`,
-    `- risk_flags=${anchorRisk.join(",") || "(none)"} | burn_rate=${anchorBurnRate}`,
-    anchorIngredientCtx.head.length ? `- ingredients_head=${anchorIngredientCtx.head.join(", ")}` : "- ingredients_head=(missing)",
-    anchorIngredientCtx.highlights.length ? `- ingredients_highlights=${anchorIngredientCtx.highlights.join(" | ")}` : "",
-    "",
-    "CANDIDATES (cheaper, sorted by similarity):",
-    ...mappedCandidates.slice(0, 5).map((c, idx) => {
-      const parts = [
-        `${idx + 1}. ${c.brand} ${c.name} | price=${formatUsd(c.price_usd)} | similarity=${c.similarity.toFixed(2)}`,
-        `   tradeoff=${c.tradeoff}`,
-      ];
-      if (c.ingredients.head.length) parts.push(`   ingredients_head=${c.ingredients.head.join(", ")}`);
-      if (c.ingredients.highlights.length) parts.push(`   ingredients_highlights=${c.ingredients.highlights.join(" | ")}`);
-      return parts.join("\n");
+  const contextText = `User request: ${query}`;
+
+  const productContextData = {
+    user_query: query,
+    region_preference: detectedRegion,
+    detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
+    user_profile_inferred: user,
+    anchor: {
+      id: anchor.id,
+      brand: anchor.brand,
+      name: anchor.name,
+      price_usd: coerceNumber(anchor.priceUsd),
+      availability: Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [],
+      score: anchorScore,
+      vetoed: anchorVetoed || anchorScore.vetoed,
+      risk_flags: anchor.vectors.riskFlags ?? [],
+      risk_flags_canonical: anchorRisk,
+      burn_rate: anchorBurnRate,
+      vectors: {
+        mechanism: anchorSku.mechanism,
+        experience: anchorSku.experience,
+        risk_flags: anchorSku.risk_flags,
+      },
+      social_stats: anchorSku.social_stats,
+      ingredients: anchorIngredientCtx,
+    },
+    candidates: candidates.slice(0, 5).map((c) => {
+      const ing = ingredientByProductId.get(c.product_id);
+      const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives);
+      const ex = c.sku.experience;
+      const tradeoff =
+        ex.texture === "sticky" || (ex.stickiness ?? 0) > 0.6
+          ? "Texture is stickier."
+          : ex.texture === "thick"
+            ? "Texture is thicker/richer."
+            : (ex.pilling_risk ?? 0) > 0.6
+              ? "Higher pilling risk under layering."
+              : "Lower-cost alternative.";
+
+      return {
+        id: c.product_id,
+        brand: c.sku.brand,
+        name: c.sku.name,
+        price_usd: c.sku.price,
+        availability: c.availability,
+        similarity: c.similarity,
+        tradeoff,
+        vectors: {
+          mechanism: c.sku.mechanism,
+          experience: c.sku.experience,
+          risk_flags: c.sku.risk_flags,
+        },
+        social_stats: c.sku.social_stats,
+        ingredients: ingCtx,
+      };
     }),
-  ]
-    .filter(Boolean)
-    .join("\n");
+  };
 
-  const systemPrompt = `
-You are the Aurora Beauty Consultant.
-You MUST base your answer strictly on the provided context (do not hallucinate).
-
-Critical safety rules:
-- If barrier_impaired=true AND (risk_flags contains alcohol/acid/high_irritation OR burn_rate > 0.10), you MUST start with "🚫 严重警告 (WARNING)" and clearly say "不推荐", and treat the recommendation score as 0.
-
-For dupe requests:
-- Provide at least 2 dupe options from CANDIDATES.
-- For each dupe: show price, similarity, and an honest trade-off (texture/finish/pilling).
-- If the ingredient highlights show both have petrolatum/mineral oil type occlusives, explicitly state the “occlusive base” similarity.
-- If the anchor has algae/seaweed highlights but the dupe doesn't, explicitly state it as a limitation (basic occlusion vs premium actives).
-- Include a clear price comparison (anchor vs best dupe).
-
-For suitability questions:
-- If the anchor is vetoed or score_total < 60, be firm: "不推荐/慎用", explain why, and suggest safer alternatives from CANDIDATES.
-`.trim();
+  const systemPrompt = buildAuroraStructuredSystemPrompt({
+    regionLabel,
+    contextDataJson: JSON.stringify(productContextData, null, 2),
+    mode: "product",
+  });
 
   const fallbackAnswer = buildFallbackProductAnswer({
     query,
@@ -1158,12 +1326,13 @@ For suitability questions:
     llm_error,
     intent: "product",
     context: {
-      detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
+      detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired, region_preference: detectedRegion },
       anchor: {
         id: anchor.id,
         brand: anchor.brand,
         name: anchor.name,
         price_usd: coerceNumber(anchor.priceUsd),
+        availability: Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [],
         vetoed: anchorVetoed || anchorScore.vetoed,
         score: anchorScore,
         risk_flags: anchor.vectors.riskFlags ?? [],

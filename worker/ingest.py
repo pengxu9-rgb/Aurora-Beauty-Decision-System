@@ -4,6 +4,7 @@ import os
 import re
 import time
 import uuid
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -83,8 +84,19 @@ class InputSku:
   ingredients_text: str
   price_usd: float
   price_cny: float
+  availability: Optional[List[str]] = None
   product_url: Optional[str] = None
   image_url: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class KbSnippet:
+  brand: str
+  name: str
+  source_sheet: str
+  field: str
+  content: str
+  metadata: Dict[str, Any]
 
 
 def _require_env(name: str) -> str:
@@ -465,13 +477,167 @@ def parse_ingredients_list(text: str) -> List[str]:
   return [t for t in items if t]
 
 
+def split_brand_and_name(product_full_name: str) -> Tuple[str, str]:
+  """
+  Best-effort brand/name split for sheets that only have a single "Product" column.
+
+  Strategy:
+  - Prefer matching known multi-word brands (longest-first).
+  - Fallback to first token as brand.
+  - Keep name as the remainder (or full string if unknown).
+  """
+  full = (product_full_name or "").strip()
+  if not full:
+    return ("Unknown", "")
+
+  known_multi = sorted(
+    [
+      "La Roche-Posay",
+      "Paula's Choice",
+      "The Ordinary",
+      "Estée Lauder",
+      "Estee Lauder",
+      "First Aid Beauty",
+      "Beauty of Joseon",
+      "Helena Rubinstein",
+      "SkinCeuticals",
+      "La Mer",
+      "Tom Ford",
+      "Hada Labo",
+    ],
+    key=len,
+    reverse=True,
+  )
+
+  lower = full.lower()
+  for b in known_multi:
+    if lower.startswith(b.lower()):
+      rest = full[len(b) :].strip()
+      rest = rest.lstrip("-–—:").strip()
+      return (b, rest or full)
+
+  # Fallback: first token as brand.
+  first = full.split(" ")[0].strip()
+  if not first:
+    return ("Unknown", full)
+  rest = full[len(first) :].strip()
+  rest = rest.lstrip("-–—:").strip()
+  return (first, rest or full)
+
+
+def canonicalize_kb_field(label: str) -> str:
+  value = (label or "").strip().lower()
+  value = re.sub(r"[^a-z0-9]+", "_", value)
+  value = value.strip("_")
+  return value[:64] or "unknown"
+
+
+def normalize_match_key(text: str) -> str:
+  value = unicodedata.normalize("NFKD", str(text or ""))
+  value = "".join(ch for ch in value if not unicodedata.combining(ch))
+  value = value.lower()
+  value = re.sub(r"[^a-z0-9]+", "", value)
+  return value
+
+
+def _cell_text(value: Any) -> str:
+  if value is None:
+    return ""
+  s = str(value).strip()
+  if not s or s.lower() == "nan":
+    return ""
+  return s
+
+
+def extract_kb_snippets_from_workbook(*, path: str) -> List[KbSnippet]:
+  """
+  Extract non-ingredient notes from all sheets in the workbook.
+
+  We intentionally skip Ingredients/Source columns (already stored elsewhere).
+  """
+  wb = load_workbook(path, read_only=True, data_only=True)
+  out: List[KbSnippet] = []
+
+  for sheet_name in wb.sheetnames:
+    ws = wb[sheet_name]
+    rows = ws.iter_rows(values_only=True)
+    header = next(rows, None)
+    if not header:
+      continue
+
+    headers = [str(h).strip() if h is not None else "" for h in header]
+    headers_lc = [h.strip().lower() for h in headers]
+
+    if "product" not in headers_lc:
+      continue
+    idx_product = headers_lc.index("product")
+    idx_source = headers_lc.index("source") if "source" in headers_lc else None
+
+    skip = {"product", "ingredients (as listed)", "ingredients", "source"}
+    note_cols: List[Tuple[int, str]] = []
+    for j, label in enumerate(headers):
+      if not label.strip():
+        continue
+      if label.strip().lower() in skip:
+        continue
+      note_cols.append((j, label))
+
+    if not note_cols:
+      continue
+
+    for row_number, r in enumerate(rows, start=2):
+      if not r or idx_product >= len(r):
+        continue
+      product_full = _cell_text(r[idx_product])
+      if not product_full:
+        continue
+      brand, name = split_brand_and_name(product_full)
+
+      source_url = ""
+      if idx_source is not None and idx_source < len(r):
+        source_url = _cell_text(r[idx_source])
+
+      for j, label in note_cols:
+        if j >= len(r):
+          continue
+        content = _cell_text(r[j])
+        if len(content) < 2:
+          continue
+        meta: Dict[str, Any] = {
+          "source_file": os.path.basename(path),
+          "source_sheet": sheet_name,
+          "field_label": label,
+          "row_number": row_number,
+          "product_full_name": product_full,
+        }
+        if source_url:
+          meta["source"] = source_url
+
+        out.append(
+          KbSnippet(
+            brand=brand,
+            name=name,
+            source_sheet=sheet_name,
+            field=canonicalize_kb_field(label),
+            content=content,
+            metadata=meta,
+          )
+        )
+
+  return out
+
+
 class AuroraDb:
   def __init__(self, database_url: str):
     self._database_url = database_url
+    self._has_region_availability = False
+    self._has_kb_snippets_table = False
 
   def __enter__(self):
     self.conn = psycopg2.connect(self._database_url)
     self.conn.autocommit = False
+    self._has_region_availability = self._ensure_region_availability_column()
+    self._has_kb_snippets_table = self._ensure_kb_snippets_table()
     return self
 
   def __exit__(self, exc_type, exc, tb):
@@ -481,11 +647,101 @@ class AuroraDb:
     finally:
       self.conn.close()
 
+  def _ensure_region_availability_column(self) -> bool:
+    """
+    Best-effort schema guard.
+
+    The ingestion JSON may include `availability: ["CN","US"]`. We store it in
+    products.region_availability (TEXT[]). If the column does not exist yet,
+    attempt to add it. If we cannot, we degrade gracefully and skip writing it.
+    """
+    try:
+      with self.conn.cursor() as cur:
+        cur.execute(
+          """
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'products'
+            AND column_name = 'region_availability'
+          LIMIT 1;
+          """
+        )
+        if cur.fetchone():
+          return True
+
+        cur.execute(
+          'ALTER TABLE "products" ADD COLUMN IF NOT EXISTS region_availability TEXT[] NOT NULL DEFAULT \'{}\'::text[];'
+        )
+        self.conn.commit()
+        return True
+    except BaseException:  # noqa: BLE001
+      try:
+        self.conn.rollback()
+      except BaseException:  # noqa: BLE001
+        pass
+      print("⚠️  Could not ensure products.region_availability column; continuing without it.")
+      return False
+
+  def _ensure_kb_snippets_table(self) -> bool:
+    try:
+      with self.conn.cursor() as cur:
+        cur.execute(
+          """
+          CREATE TABLE IF NOT EXISTS "product_kb_snippets" (
+            id UUID PRIMARY KEY,
+            product_id UUID NOT NULL REFERENCES "products"(id) ON DELETE CASCADE,
+            source_sheet TEXT NOT NULL,
+            field TEXT NOT NULL,
+            content TEXT NOT NULL,
+            metadata JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT product_kb_snippets_product_sheet_field_uidx UNIQUE (product_id, source_sheet, field)
+          );
+          """
+        )
+        # If the table existed without the unique constraint, ensure a unique index exists so
+        # our ON CONFLICT (product_id, source_sheet, field) upsert works.
+        cur.execute(
+          'CREATE UNIQUE INDEX IF NOT EXISTS product_kb_snippets_product_sheet_field_uidx ON "product_kb_snippets"(product_id, source_sheet, field);'
+        )
+        cur.execute('CREATE INDEX IF NOT EXISTS product_kb_snippets_product_id_idx ON "product_kb_snippets"(product_id);')
+      self.conn.commit()
+      return True
+    except BaseException:  # noqa: BLE001
+      try:
+        self.conn.rollback()
+      except BaseException:  # noqa: BLE001
+        pass
+      print("⚠️  Could not ensure product_kb_snippets table; continuing without KB ingestion.")
+      return False
+
   def find_product_id(self, *, brand: str, name: str) -> Optional[str]:
     with self.conn.cursor() as cur:
       cur.execute('SELECT id FROM "products" WHERE brand = %s AND name = %s LIMIT 1;', (brand, name))
       row = cur.fetchone()
       return row[0] if row else None
+
+  def load_all_product_ids(self) -> Dict[Tuple[str, str], str]:
+    with self.conn.cursor() as cur:
+      cur.execute('SELECT brand, name, id FROM "products";')
+      rows = cur.fetchall()
+      out: Dict[Tuple[str, str], str] = {}
+      for brand, name, pid in rows:
+        out[(str(brand), str(name))] = str(pid)
+      return out
+
+  def load_all_product_ids_normalized(self) -> Dict[Tuple[str, str], str]:
+    with self.conn.cursor() as cur:
+      cur.execute('SELECT brand, name, id FROM "products";')
+      rows = cur.fetchall()
+      out: Dict[Tuple[str, str], str] = {}
+      for brand, name, pid in rows:
+        key = (normalize_match_key(str(brand)), normalize_match_key(str(name)))
+        # If collisions occur, keep the first seen to avoid flapping.
+        out.setdefault(key, str(pid))
+      return out
 
   def delete_product(self, product_id: str) -> None:
     with self.conn.cursor() as cur:
@@ -493,6 +749,38 @@ class AuroraDb:
 
   def upsert_product(self, sku: InputSku, *, product_id: str) -> None:
     with self.conn.cursor() as cur:
+      if self._has_region_availability:
+        availability = list(sku.availability or [])
+        cur.execute(
+          """
+          INSERT INTO "products" (
+            id,
+            brand,
+            name,
+            price_usd,
+            price_cny,
+            product_url,
+            image_url,
+            region_availability,
+            created_at,
+            updated_at
+          )
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE SET
+            brand = EXCLUDED.brand,
+            name = EXCLUDED.name,
+            price_usd = EXCLUDED.price_usd,
+            price_cny = EXCLUDED.price_cny,
+            product_url = EXCLUDED.product_url,
+            image_url = EXCLUDED.image_url,
+            region_availability = EXCLUDED.region_availability,
+            updated_at = NOW();
+          """,
+          (product_id, sku.brand, sku.name, sku.price_usd, sku.price_cny, sku.product_url, sku.image_url, availability),
+        )
+        return
+
+      # Backward-compatible path if the DB column is missing.
       cur.execute(
         """
         INSERT INTO "products" (id, brand, name, price_usd, price_cny, product_url, image_url, created_at, updated_at)
@@ -506,15 +794,7 @@ class AuroraDb:
           image_url = EXCLUDED.image_url,
           updated_at = NOW();
         """,
-        (
-          product_id,
-          sku.brand,
-          sku.name,
-          sku.price_usd,
-          sku.price_cny,
-          sku.product_url,
-          sku.image_url,
-        ),
+        (product_id, sku.brand, sku.name, sku.price_usd, sku.price_cny, sku.product_url, sku.image_url),
       )
 
   def delete_vectors_for_product(self, product_id: str) -> None:
@@ -531,20 +811,35 @@ class AuroraDb:
 
   def insert_product(self, sku: InputSku, *, product_id: str) -> None:
     with self.conn.cursor() as cur:
+      if self._has_region_availability:
+        availability = list(sku.availability or [])
+        cur.execute(
+          """
+          INSERT INTO "products" (
+            id,
+            brand,
+            name,
+            price_usd,
+            price_cny,
+            product_url,
+            image_url,
+            region_availability,
+            created_at,
+            updated_at
+          )
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
+          """,
+          (product_id, sku.brand, sku.name, sku.price_usd, sku.price_cny, sku.product_url, sku.image_url, availability),
+        )
+        return
+
+      # Backward-compatible path if the DB column is missing.
       cur.execute(
         """
         INSERT INTO "products" (id, brand, name, price_usd, price_cny, product_url, image_url, created_at, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
         """,
-        (
-          product_id,
-          sku.brand,
-          sku.name,
-          sku.price_usd,
-          sku.price_cny,
-          sku.product_url,
-          sku.image_url,
-        ),
+        (product_id, sku.brand, sku.name, sku.price_usd, sku.price_cny, sku.product_url, sku.image_url),
       )
 
   def insert_vectors(
@@ -603,6 +898,30 @@ class AuroraDb:
         VALUES (%s, %s, %s, %s, %s, %s, NOW());
         """,
         (social_id, product_id, red_score, reddit_score, burn_rate, top_keywords),
+      )
+
+  def upsert_kb_snippet(
+    self,
+    *,
+    product_id: str,
+    source_sheet: str,
+    field: str,
+    content: str,
+    metadata: Dict[str, Any],
+  ) -> None:
+    if not self._has_kb_snippets_table:
+      return
+    with self.conn.cursor() as cur:
+      cur.execute(
+        """
+        INSERT INTO "product_kb_snippets" (id, product_id, source_sheet, field, content, metadata, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ON CONFLICT (product_id, source_sheet, field) DO UPDATE SET
+          content = EXCLUDED.content,
+          metadata = EXCLUDED.metadata,
+          updated_at = NOW();
+        """,
+        (str(uuid.uuid4()), product_id, source_sheet, field, content, Json(metadata)),
       )
 
 
@@ -667,6 +986,13 @@ def load_input_skus_from_excel(
     if not str(brand).strip() or not str(name).strip() or not str(ingredients).strip():
       continue
 
+    # Some source sheets only have a single "Product" column. If the user maps
+    # both --col-brand and --col-name to that column, split brand/name here.
+    if idx_brand == idx_name:
+      inferred_brand, inferred_name = split_brand_and_name(str(brand).strip())
+      brand = inferred_brand
+      name = inferred_name
+
     price_usd: Optional[float] = None
     if idx_price_usd is not None:
       raw = r[idx_price_usd] if idx_price_usd < len(r) else None
@@ -700,6 +1026,7 @@ def load_input_skus_from_excel(
         ingredients_text=str(ingredients).strip(),
         price_usd=float(price_usd),
         price_cny=float(price_usd) * price_cny_rate,
+        availability=["Global"],
         product_url=product_url,
         image_url=image_url,
       )
@@ -743,6 +1070,14 @@ def load_input_skus_from_json(*, path: str, price_cny_rate: float, limit: Option
 
     product_url = raw.get("product_url")
     image_url = raw.get("image_url")
+    availability_raw = raw.get("availability")
+    availability: List[str] = []
+    if isinstance(availability_raw, list):
+      availability = [str(x).strip() for x in availability_raw if str(x).strip()]
+    elif isinstance(availability_raw, str) and availability_raw.strip():
+      availability = [s.strip() for s in availability_raw.split(",") if s.strip()]
+    if not availability:
+      availability = ["Global"]
 
     if not brand or not name or not ingredients:
       print(f"Skipping JSON row {i}: missing brand/name/ingredients_text")
@@ -755,6 +1090,7 @@ def load_input_skus_from_json(*, path: str, price_cny_rate: float, limit: Option
         ingredients_text=ingredients,
         price_usd=price_usd,
         price_cny=price_cny,
+        availability=availability,
         product_url=str(product_url).strip() if product_url else None,
         image_url=str(image_url).strip() if image_url else None,
       )
@@ -775,6 +1111,7 @@ def demo_skus() -> List[InputSku]:
       price_cny=2800.0,
       product_url="https://www.tomfordbeauty.com/...",
       ingredients_text="Water, Caffeine, Theobroma Cacao, Glycolic Acid, Alcohol Denat",
+      availability=["Global"],
     ),
     InputSku(
       brand="The Ordinary",
@@ -782,6 +1119,7 @@ def demo_skus() -> List[InputSku]:
       price_usd=30.0,
       price_cny=240.0,
       ingredients_text="Water, Glycerin, Copper Tripeptide-1, Lactococcus Ferment",
+      availability=["Global"],
     ),
     InputSku(
       brand="Helena Rubinstein",
@@ -790,13 +1128,14 @@ def demo_skus() -> List[InputSku]:
       price_cny=3900.0,
       ingredients_text="Water, Glycerin, Shea Butter, Dimethicone, Madecassoside, Fragrance",
       product_url="https://www.helenarubinstein.com/...",
+      availability=["Global"],
     ),
   ]
 
 
 def ingest_one(
   *,
-  db: AuroraDb,
+  db: Optional[AuroraDb],
   client: GeminiClient,
   llm_model: str,
   embedding_model: str,
@@ -851,6 +1190,9 @@ def ingest_one(
     )
     return
 
+  if db is None:
+    raise RuntimeError("Internal error: db is required unless --dry-run is set.")
+
   existing_id = db.find_product_id(brand=sku.brand, name=sku.name)
   if existing_id and not overwrite:
     print(f"↩️  Skipped (exists): {sku.brand} - {sku.name}")
@@ -904,6 +1246,7 @@ def main() -> None:
   parser.add_argument("--sheet", type=str, default=None, help="Excel sheet name (default: active sheet).")
   parser.add_argument("--limit", type=int, default=None, help="Max rows to ingest (for testing).")
   parser.add_argument("--list-models", action="store_true", help="List available Gemini models and exit.")
+  parser.add_argument("--ingest-kb", action="store_true", help="Also ingest non-ingredient notes into product_kb_snippets.")
 
   parser.add_argument("--col-brand", type=str, default="brand")
   parser.add_argument("--col-name", type=str, default="name")
@@ -930,7 +1273,6 @@ def main() -> None:
   args = parser.parse_args()
 
   load_dotenv()
-  database_url = resolve_env_templates(_require_env("DATABASE_URL"))
   api_key = _require_any_env(["GEMINI_API_KEY", "GOOGLE_API_KEY"])
   api_base_url = (os.getenv("GEMINI_API_BASE_URL") or DEFAULT_GEMINI_API_BASE_URL).strip()
   openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
@@ -980,6 +1322,25 @@ def main() -> None:
     print("No rows found to ingest.")
     return
 
+  if args.dry_run:
+    for sku in skus:
+      ingest_one(
+        db=None,
+        client=gemini_client,
+        llm_model=args.llm_model,
+        embedding_model=args.embedding_model,
+        social_provider=social_provider,
+        social_model=args.social_model,
+        openai_api_key=openai_api_key if social_provider == "openai" else None,
+        openai_api_base_url=openai_api_base_url,
+        sku=sku,
+        overwrite=bool(args.overwrite),
+        enable_embedding=not bool(args.no_embedding),
+        dry_run=True,
+      )
+    return
+
+  database_url = resolve_env_templates(_require_env("DATABASE_URL"))
   with AuroraDb(database_url) as db:
     for sku in skus:
       ingest_one(
@@ -996,6 +1357,33 @@ def main() -> None:
         enable_embedding=not bool(args.no_embedding),
         dry_run=bool(args.dry_run),
       )
+
+    if args.ingest_kb and args.input:
+      snippets = extract_kb_snippets_from_workbook(path=args.input)
+      if snippets:
+        product_ids = db.load_all_product_ids()
+        product_ids_norm = db.load_all_product_ids_normalized()
+        upserted = 0
+        skipped = 0
+        for snip in snippets:
+          pid = product_ids.get((snip.brand, snip.name))
+          if not pid:
+            pid = product_ids_norm.get((normalize_match_key(snip.brand), normalize_match_key(snip.name)))
+          if not pid:
+            skipped += 1
+            continue
+          db.upsert_kb_snippet(
+            product_id=pid,
+            source_sheet=snip.source_sheet,
+            field=snip.field,
+            content=snip.content,
+            metadata=snip.metadata,
+          )
+          upserted += 1
+        db.conn.commit()
+        print(f"📚 KB snippets upserted: {upserted} (skipped missing products: {skipped})")
+      else:
+        print("📚 No KB snippets found in workbook.")
 
 
 if __name__ == "__main__":

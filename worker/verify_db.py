@@ -76,10 +76,17 @@ def main() -> None:
       ingredients = cur.fetchone()[0]
       cur.execute('select count(*) from "social_stats";')
       social_stats = cur.fetchone()[0]
+      try:
+        cur.execute('select count(*) from "product_kb_snippets";')
+        kb_snippets = cur.fetchone()[0]
+      except Exception:  # noqa: BLE001
+        kb_snippets = 0
 
       print("db_ok: true")
       print(f"pgvector_installed: {has_vector}")
-      print(f"counts: products={products} sku_vectors={sku_vectors} ingredients={ingredients} social_stats={social_stats}")
+      print(
+        f"counts: products={products} sku_vectors={sku_vectors} ingredients={ingredients} social_stats={social_stats} kb_snippets={kb_snippets}"
+      )
 
       cur.execute(
         """

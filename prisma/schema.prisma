@@ -19,11 +19,13 @@ model Product {
   priceCny   Decimal @map("price_cny") @db.Decimal(10, 2)
   productUrl String? @map("product_url")
   imageUrl   String? @map("image_url")
+  regionAvailability String[] @default([]) @map("region_availability")
 
   // Relations
   vectors     SkuVector?
   ingredients IngredientData?
   socialStats SocialStats?
+  kbSnippets  ProductKbSnippet[]
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -89,4 +91,22 @@ model SocialStats {
   lastUpdated DateTime @default(now()) @map("last_updated")
 
   @@map("social_stats")
+}
+
+model ProductKbSnippet {
+  id        String  @id @default(uuid())
+  productId String  @map("product_id")
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  sourceSheet String @map("source_sheet")
+  field       String
+  content     String
+  metadata    Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([productId, sourceSheet, field], map: "product_kb_snippets_product_sheet_field_uidx")
+  @@index([productId])
+  @@map("product_kb_snippets")
 }
