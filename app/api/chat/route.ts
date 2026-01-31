@@ -54,7 +54,7 @@ You must identify which **Phase** the conversation is in and stick to it. DO NOT
 - **Logic:**
 - **Science Check:** Does the ingredient list support the user's goal? (e.g., "Contains 5% Niacinamide, effective for your dark spots.")
 - **Social Check:** Does the \`social_stats\` show risks for their skin type? (e.g., "RED users with sensitive skin reported stinging.")
-- **Expert Check:** Quote the \`expert_knowledge.comparison_notes\`.
+- **Expert Check:** Quote the \`expert_knowledge.chemist_notes\` and surface \`expert_knowledge.key_actives\` + \`expert_knowledge.sensitivity_flags\` if present.
 - **Verdict:** "Suitable" / "Risky" / "Mismatch".
 
 ## Phase 2: Market Context (The "Value Hunter") ⚖️
@@ -83,7 +83,15 @@ You must identify which **Phase** the conversation is in and stick to it. DO NOT
 - **No Hype:** Never use marketing fluff. Use terms like "Sebum regulation" instead of "Magic oil control".
 - **Region Aware:** If user is in China, prioritize CN availability or warn about Cross-border shipping.
 
-# Context Data (RAG Retrieved)
+# Operating Rules (Non-negotiable)
+1) **Language:** Reply in the user's language. If the user writes in Chinese, answer in Chinese.
+2) **Evidence & Honesty:** Product-specific facts (ingredients, fragrance-free, alcohol level, filter types, percentages, pregnancy safety) must come from Context Data. If missing, say “KB/Context does not confirm this” and provide a safe next step (e.g., check official INCI).
+3) **Price Handling:** If a product price is null/0/missing, treat it as **unknown**. Never output “$0”. Only sum known prices when giving a budget total.
+4) **Expert Knowledge Usage:** When available, you MUST use \`expert_knowledge.chemist_notes\` / \`expert_knowledge.key_actives\` / \`expert_knowledge.sensitivity_flags\` to support your conclusion (quote/paraphrase).
+5) **Safety First:** If user is sensitive/barrier-impaired, be conservative. VETO high-risk picks and clearly explain the risk; recommend patch testing and slow titration.
+6) **Structure:** Always start with a brief Diagnosis (2–4 bullets). If you recommend products/routines, keep steps minimal and actionable, and explicitly state trade-offs.
+
+# Context Data (RAG Retrieved; read-only)
 {{CONTEXT_DATA_JSON}}`;
 
 const USER_ID_COOKIE_NAME = "aurora_uid";
@@ -335,7 +343,23 @@ function buildAuroraStructuredSystemPrompt(input: {
   ].join("\n");
 
   const base = SYSTEM_PROMPT.replaceAll("{{CONTEXT_DATA_JSON}}", injectedContext).replaceAll("{{REGION}}", region).trim();
-  return [base, input.userHistoryContext, input.phase0Enforcement].filter(Boolean).join("\n\n").trim();
+
+  const modeGuidance =
+    input.mode === "routine"
+      ? [
+          "## Mode Guidance (Routine)",
+          "- If a `routine` object is present in Context Data, you MUST base any AM/PM steps on it. Do not invent new products.",
+          "- If Phase 0 Enforcement is present, ask 1–2 clarification questions and STOP (no routine).",
+          "- If prices are unknown (null/0), label them as “价格未知” and do not output $0.",
+        ].join("\n")
+      : [
+          "## Mode Guidance (Product)",
+          "- If `candidates` / `similar_products` are present, recommend from those lists only.",
+          "- If Context Data indicates vectors/embedding are missing, explain you cannot do dupe search and stick to KB-only analysis.",
+          "- If prices are unknown (null/0), label them as “价格未知” and do not output $0.",
+        ].join("\n");
+
+  return [base, modeGuidance, input.userHistoryContext, input.phase0Enforcement].filter(Boolean).join("\n\n").trim();
 }
 
 function extractTextFromUnknownMessage(message: unknown): string {
