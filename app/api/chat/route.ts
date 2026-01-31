@@ -2469,8 +2469,8 @@ export async function POST(req: Request) {
               ],
             });
 
-      if (isBadShortlistAnswer(answer)) {
-        llm_error = "LLM answer unsuitable for shortlist; used fallback.";
+      if (!answer.trim() || answer.trim().length < 20) {
+        llm_error = "LLM answer empty/too short for shortlist; used fallback.";
         answer = fallbackAnswer;
       }
     } catch (e) {
