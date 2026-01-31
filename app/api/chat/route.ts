@@ -1929,16 +1929,19 @@ export async function POST(req: Request) {
 
   // ROUTINE PATH
   if (shouldPlanRoutine) {
-    const clarify = buildRoutineClarification(query, budgetCny);
-    if (clarify.questions.length) {
-      const answer = formatClarificationAnswer(clarify.questions);
-      if (wantsStream) return streamTextResponse(answer);
-      return NextResponse.json({
-        query,
-        intent: "clarify",
-        answer,
-        clarification: { questions: clarify.questions, missing_fields: clarify.missing, region_preference: detectedRegion },
-      });
+    const skipClarify = detectDeepScienceQuestion(query) && !routineIntent;
+    if (!skipClarify) {
+      const clarify = buildRoutineClarification(query, budgetCny);
+      if (clarify.questions.length) {
+        const answer = formatClarificationAnswer(clarify.questions);
+        if (wantsStream) return streamTextResponse(answer);
+        return NextResponse.json({
+          query,
+          intent: "clarify",
+          answer,
+          clarification: { questions: clarify.questions, missing_fields: clarify.missing, region_preference: detectedRegion },
+        });
+      }
     }
 
     // Build a lightweight user vector from query text.
