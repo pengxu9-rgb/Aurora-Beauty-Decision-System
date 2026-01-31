@@ -422,6 +422,121 @@ function detectClosedComedonesOrRoughTexture(query: string) {
   );
 }
 
+function detectSimilarEfficacyIntent(query: string) {
+  const q = query.toLowerCase();
+  return (
+    q.includes("similar efficacy") ||
+    q.includes("same efficacy") ||
+    query.includes("类似功效") ||
+    query.includes("同功效") ||
+    query.includes("同类功效") ||
+    query.includes("同效果")
+  );
+}
+
+function detectProductShortlistIntent(query: string) {
+  const q = query.toLowerCase();
+  const mentionsProductType =
+    q.includes("serum") ||
+    q.includes("treatment") ||
+    q.includes("cleanser") ||
+    q.includes("toner") ||
+    q.includes("sunscreen") ||
+    q.includes("spf") ||
+    q.includes("cream") ||
+    query.includes("精华") ||
+    query.includes("面霜") ||
+    query.includes("防晒") ||
+    query.includes("洁面") ||
+    query.includes("洗面奶") ||
+    query.includes("爽肤水") ||
+    query.includes("化妆水") ||
+    query.includes("水乳");
+
+  const wantsList =
+    q.includes("recommend") ||
+    q.includes("suggest") ||
+    q.includes("what should i buy") ||
+    q.includes("which one") ||
+    query.includes("推荐") ||
+    query.includes("求推荐") ||
+    query.includes("有什么推荐") ||
+    query.includes("买什么") ||
+    query.includes("哪款") ||
+    query.includes("哪一个") ||
+    query.includes("给我选") ||
+    (query.includes("有哪些") && mentionsProductType) ||
+    (query.includes("有什么") && mentionsProductType) ||
+    (query.includes("有没有") && mentionsProductType) ||
+    query.includes("想买") ||
+    query.includes("想找") ||
+    query.includes("想入") ||
+    query.includes("想购");
+
+  // `mentionsProductType` helps route "I want a brightening serum" requests into the shortlist path by default.
+  // We avoid treating generic “有没有证据” as a shortlist unless a product type is mentioned.
+  return wantsList || mentionsProductType;
+}
+
+function extractActiveMentions(query: string): string[] {
+  const q = query.toLowerCase();
+  const out = new Set<string>();
+
+  const has = (needle: string) => q.includes(needle);
+  const hasCn = (needle: string) => query.includes(needle);
+
+  if (has("peptide") || hasCn("多肽") || hasCn("肽") || hasCn("蓝铜")) out.add("Peptides");
+  if (has("niacinamide") || hasCn("烟酰胺")) out.add("Niacinamide");
+  if (has("tranexamic") || hasCn("传明酸")) out.add("Tranexamic Acid");
+  if (has("arbutin") || hasCn("熊果苷")) out.add("Arbutin");
+  if (has("kojic") || hasCn("曲酸")) out.add("Kojic Acid");
+  if (has("azelaic") || hasCn("壬二酸")) out.add("Azelaic Acid");
+  if (has("vitamin c") || has("ascorbic") || has("ascorbyl") || hasCn("维c") || hasCn("维生素c")) out.add("Vitamin C");
+  if (has("retinol") || has("retinal") || has("adapalene") || hasCn("a醇") || hasCn("维a") || hasCn("视黄")) out.add("Retinoid");
+  if (has("salicylic") || has("bha") || hasCn("水杨酸")) out.add("BHA (Salicylic Acid)");
+  if (has("glycolic") || has("lactic") || has("aha") || hasCn("果酸") || hasCn("乙醇酸") || hasCn("乳酸")) out.add("AHA");
+  if (has("mandelic") || hasCn("杏仁酸")) out.add("Mandelic Acid");
+  if (has("gluconolactone") || has("pha") || hasCn("pha") || hasCn("葡糖酸内酯")) out.add("PHA");
+
+  return Array.from(out);
+}
+
+function inferDesiredCategories(query: string): Array<SkuVector["category"]> {
+  const q = query.toLowerCase();
+  if (q.includes("cleanser") || query.includes("洁面") || query.includes("洗面奶")) return ["cleanser"];
+  if (q.includes("toner") || query.includes("爽肤水") || query.includes("化妆水") || query.includes("水") || query.includes("酸")) return ["toner", "treatment"];
+  if (q.includes("sunscreen") || q.includes("spf") || query.includes("防晒")) return ["sunscreen"];
+  if (q.includes("cream") || q.includes("moistur") || query.includes("面霜") || query.includes("修护霜") || query.includes("乳液")) return ["moisturizer"];
+  if (q.includes("serum") || query.includes("精华") || query.includes("安瓶")) return ["serum", "treatment"];
+  // Default: treatments/serums are the most common "single-product" request.
+  return ["serum", "treatment"];
+}
+
+function extractRecentUserContextText(messages: unknown[], maxMessages = 4, maxChars = 800): string {
+  const userTexts: string[] = [];
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    if ((m as any).role !== "user") continue;
+    const t = extractTextFromUnknownMessage(m);
+    if (t.trim()) userTexts.push(t.trim());
+  }
+  const recent = userTexts.slice(-maxMessages).join("\n");
+  if (recent.length <= maxChars) return recent;
+  return recent.slice(-maxChars);
+}
+
+function isShortFollowUpQuery(query: string) {
+  const t = String(query ?? "").trim();
+  if (!t) return false;
+  if (t.length <= 14) return true;
+
+  // Common "follow-up" forms that rely on prior context.
+  if (/^(适合(我|敏感肌|油皮|干皮|混合皮)?(吗|不)?|能用吗|可以用吗|怎么样|还行吗|会刺痛吗|会过敏吗)[？?]?$/.test(t)) return true;
+  if (/^(is it (ok|good|safe)|does it work)[?]$/i.test(t)) return true;
+
+  return false;
+}
+
 function detectDeepScienceQuestion(query: string): boolean {
   const q = query.toLowerCase();
 
@@ -1667,6 +1782,58 @@ function buildFallbackScienceAnswer(input: { query: string; regionLabel: string;
   return lines.join("\n");
 }
 
+function buildFallbackShortlistAnswer(input: {
+  query: string;
+  regionLabel: string;
+  desiredCategories: Array<SkuVector["category"]>;
+  activeMentions: string[];
+  detected: { sensitive_skin: boolean; barrier_impaired: boolean };
+  candidates: Array<{
+    brand: string;
+    name: string;
+    category: string;
+    price_usd: number | null;
+    availability: string[];
+    score: SkuScoreBreakdown;
+    citations: string[];
+    key_actives?: string;
+    sensitivity_flags?: string;
+  }>;
+}) {
+  const priceLabel = (usd: number | null) => (usd != null && Number.isFinite(usd) && usd > 0 ? formatUsd(usd) : "价格未知");
+  const region = input.regionLabel?.trim() ? input.regionLabel.trim() : "Global";
+
+  const lines: string[] = [];
+  lines.push(`我理解你的需求：${input.query.trim()}`);
+  lines.push(`- 推荐范围：优先 ${region} 可买（或 Global 通用）的产品。`);
+  if (input.activeMentions.length) lines.push(`- 关注活性/方向：${input.activeMentions.join(" / ")}。`);
+  if (input.desiredCategories.length) lines.push(`- 品类：${input.desiredCategories.join(" / ")}。`);
+  if (input.detected.barrier_impaired) lines.push("🚫 当前可能屏障受损（刺痛/泛红/爆皮）：会更严格避开刺激性强的方案。");
+  else if (input.detected.sensitive_skin) lines.push("⚠️ 你提到敏感：会优先选择更温和/低刺激的配方。");
+
+  if (!input.candidates.length) {
+    lines.push("");
+    lines.push("目前数据库里没有检索到足够的候选。你可以补充：你更偏油皮/干皮？是否在用酸/A醇？预算区间？我可以再筛一次。");
+    return lines.join("\n").trim();
+  }
+
+  lines.push("");
+  lines.push("候选清单（按 Aurora 评分/适配排序）：");
+  for (const [idx, c] of input.candidates.slice(0, 5).entries()) {
+    const cite = c.citations?.[0] ? ` ${c.citations[0]}` : "";
+    const verdict = c.score.vetoed ? `❌ VETO（${c.score.veto_reason ?? "风险过高"}）` : `✅ Total ${Math.round(c.score.total)}/100`;
+    lines.push(`${idx + 1}) ${c.brand} ${c.name}（${priceLabel(c.price_usd)}） ${verdict}${cite}`);
+    if (c.key_actives && c.key_actives.trim()) lines.push(`   - Key actives: ${c.key_actives.trim()}`);
+    if (c.sensitivity_flags && c.sensitivity_flags.trim()) lines.push(`   - Sensitivity: ${c.sensitivity_flags.trim()}`);
+    const avail = Array.isArray(c.availability) && c.availability.length ? c.availability.join(",") : "";
+    if (avail) lines.push(`   - Availability: ${avail}`);
+  }
+
+  lines.push("");
+  lines.push("如果你愿意，我可以在你确认「肤质/是否敏感/预算」后，把清单压缩到 1-2 个最稳的选择。");
+  return lines.join("\n").trim();
+}
+
 function buildFallbackProductAnswer(input: {
   query: string;
   detected: { sensitive_skin: boolean; barrier_impaired: boolean };
@@ -1918,6 +2085,15 @@ export async function POST(req: Request) {
   const regionLabel = detectedRegion ?? "Global";
   const deepScience = detectDeepScienceQuestion(query);
 
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const recentUserContextText = messages.length ? extractRecentUserContextText(messages) : "";
+  const contextualQuery =
+    isShortFollowUpQuery(query) && recentUserContextText.trim() && recentUserContextText.trim() !== query
+      ? `${recentUserContextText}\n\nFollow-up: ${query}`
+      : query;
+  const activeMentions = extractActiveMentions(contextualQuery);
+  const similarEfficacyIntent = detectSimilarEfficacyIntent(query);
+
   const explicitAnchorId =
     typeof body.anchor_product_id === "string" && body.anchor_product_id.trim() ? body.anchor_product_id.trim() : null;
   const dupeIntent = detectDupeIntent(query);
@@ -1926,15 +2102,20 @@ export async function POST(req: Request) {
 
   const aliasCandidates = explicitAnchorId ? [] : await findAnchorCandidatesFromAliases(query);
   const bestAlias = aliasCandidates[0] ?? null;
-  const highConfidenceAlias = bestAlias != null && bestAlias.confidence >= 0.72;
+  const isBrandOnlyAlias = typeof bestAlias?.alias_kind === "string" && bestAlias.alias_kind.toLowerCase().includes("brand");
+  const highConfidenceAlias = bestAlias != null && bestAlias.confidence >= 0.72 && !isBrandOnlyAlias;
+
+  const wantsShortlistNoAnchor =
+    !routineIntent && (detectProductShortlistIntent(query) || similarEfficacyIntent || (evalIntent && activeMentions.length > 0));
 
   // Legacy fallback (brand heuristics + loose token match).
   const legacyAnchorId = !explicitAnchorId && (dupeIntent || evalIntent) ? await findAnchorProductId(query) : null;
 
   const anchorProductId = explicitAnchorId ?? (highConfidenceAlias ? bestAlias.product_id : null) ?? legacyAnchorId;
+  const wantsShortlist = wantsShortlistNoAnchor && (!anchorProductId || !looksLikeUuid(anchorProductId));
 
   // If the user is asking for a dupe/compare, we should not silently drift into a routine.
-  if ((dupeIntent || evalIntent) && (!anchorProductId || !looksLikeUuid(anchorProductId))) {
+  if ((dupeIntent || evalIntent) && !wantsShortlist && (!anchorProductId || !looksLikeUuid(anchorProductId))) {
     const suggestions = aliasCandidates.slice(0, 3).map((c) => c.matched_alias).filter(Boolean);
     const hint = suggestions.length ? `\n\n我猜你可能在说：${suggestions.join(" / ")}。` : "";
     const answer = dupeIntent
@@ -1957,11 +2138,17 @@ export async function POST(req: Request) {
   // SCIENCE-QA PATH (no anchor required):
   // Deep scientific questions (e.g., "有没有临床证据") should not be forced into a routine.
   const wantsScienceOnly =
-    deepScience && !routineIntent && !dupeIntent && !evalIntent && (!anchorProductId || !looksLikeUuid(anchorProductId));
+    deepScience &&
+    !routineIntent &&
+    !dupeIntent &&
+    !evalIntent &&
+    !wantsShortlistNoAnchor &&
+    (!anchorProductId || !looksLikeUuid(anchorProductId));
 
   // Default: Routine planning unless the user explicitly wants dupe/evaluation (or provides an explicit anchor id).
   const forceProductPathForDeepScience = deepScience && !routineIntent && !dupeIntent && !evalIntent && !explicitAnchorId && highConfidenceAlias;
-  const shouldPlanRoutine = routineIntent || (!explicitAnchorId && !dupeIntent && !evalIntent && !forceProductPathForDeepScience && !wantsScienceOnly);
+  const shouldPlanRoutine =
+    routineIntent || (!explicitAnchorId && !wantsShortlist && !dupeIntent && !evalIntent && !forceProductPathForDeepScience && !wantsScienceOnly);
 
   const provider =
     body.llm_provider ??
@@ -2042,6 +2229,264 @@ export async function POST(req: Request) {
         region_preference: detectedRegion,
         ...(external_verification ? { external_verification } : {}),
       },
+    });
+  }
+
+  // PRODUCT SHORTLIST / SUITABILITY PATH (no anchor required)
+  if (wantsShortlist) {
+    const user = buildUserVectorFromQuery(
+      contextualQuery,
+      budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined,
+    );
+    const desiredCategories = inferDesiredCategories(query);
+    const sensitive = detectSensitiveSkin(contextualQuery);
+    const barrierImpaired = detectBarrierImpaired(contextualQuery);
+
+    type RetrievedSku = {
+      product_id: string;
+      sku: SkuVector;
+      similarity: number;
+      availability: string[];
+    };
+
+    let retrieved: RetrievedSku[] = [];
+    let retrieval:
+      | null
+      | {
+          used: boolean;
+          provider: "gemini" | "openai";
+          embedding_model: string;
+          embedding_query: string;
+          retrieved: Array<{ product_id: string; brand: string; name: string; category: string; similarity: number; availability: string[] }>;
+          error?: string;
+        } = null;
+
+    if (process.env.DATABASE_URL && !process.env.DATABASE_URL.includes("${{")) {
+      try {
+        const providerForEmbedding: "gemini" | "openai" =
+          optionalAnyEnv(["GEMINI_API_KEY", "GOOGLE_API_KEY"]) ? "gemini" : process.env.OPENAI_API_KEY ? "openai" : "gemini";
+        const embeddingQueryParts = [buildEmbeddingQueryForRoutine(contextualQuery, user), `desired_categories=${desiredCategories.join(",")}`];
+        if (activeMentions.length) embeddingQueryParts.push(`requested_actives=${activeMentions.join(",")}`);
+        const embeddingQuery = embeddingQueryParts.filter(Boolean).join("\n");
+
+        const embedResult =
+          providerForEmbedding === "gemini"
+            ? await geminiEmbedContent({ text: embeddingQuery })
+            : await openaiEmbedText({ text: embeddingQuery });
+
+        const embedding = normalizeEmbeddingDim(embedResult.embedding, 1536);
+        const found = await findSimilarSkus(embedding, 40, detectedRegion);
+        retrieved = found.map((r) => ({ product_id: r.product_id, sku: r.sku, similarity: r.similarity, availability: r.availability }));
+
+        retrieval = {
+          used: true,
+          provider: providerForEmbedding,
+          embedding_model: embedResult.model,
+          embedding_query: embeddingQuery,
+          retrieved: found.slice(0, 12).map((r) => ({
+            product_id: r.product_id,
+            brand: r.sku.brand,
+            name: r.sku.name,
+            category: r.sku.category,
+            similarity: r.similarity,
+            availability: r.availability,
+          })),
+        };
+      } catch (e) {
+        retrieval = {
+          used: false,
+          provider: optionalAnyEnv(["GEMINI_API_KEY", "GOOGLE_API_KEY"]) ? "gemini" : "openai",
+          embedding_model: "unknown",
+          embedding_query: contextualQuery,
+          retrieved: [],
+          error: e instanceof Error ? e.message : String(e),
+        };
+        retrieved = [];
+      }
+    }
+
+    const dbAll = await getSkuDatabase();
+    if (retrieved.length === 0) {
+      retrieved = dbAll
+        .filter((s) => desiredCategories.includes(s.category))
+        .slice(0, 50)
+        .map((sku) => ({ product_id: sku.sku_id, sku, similarity: 0, availability: [] }));
+    }
+
+    const categoryFiltered = retrieved.filter((r) => desiredCategories.includes(r.sku.category));
+    const poolForScoring = categoryFiltered.length >= 4 ? categoryFiltered : retrieved;
+
+    let scored = poolForScoring
+      .map((r) => ({ ...r, score: calculateScore(r.sku, user) }))
+      .filter((r) => r.score.total > 0);
+
+    if (sensitive) scored = scored.filter((r) => !r.sku.risk_flags.includes("alcohol"));
+    if (barrierImpaired) scored = scored.filter((r) => !r.sku.risk_flags.includes("high_irritation") && (r.sku.social_stats.burn_rate ?? 0) <= 0.1);
+
+    scored.sort((a, b) => b.score.total - a.score.total || b.similarity - a.similarity);
+    const shortlistLimit = Math.min(8, Math.max(3, limit));
+    const top = scored.slice(0, shortlistLimit);
+
+    const candidateIds = uniqueStrings(top.map((c) => c.product_id)).filter((id) => looksLikeUuid(id));
+
+    const ingredientRows = candidateIds.length
+      ? await prisma.ingredientData.findMany({
+          where: { productId: { in: candidateIds } },
+          select: { productId: true, fullList: true, heroActives: true },
+        })
+      : [];
+    const ingredientByProductId = new Map<string, { fullList: unknown; heroActives: unknown }>();
+    for (const row of ingredientRows) ingredientByProductId.set(row.productId, { fullList: row.fullList, heroActives: row.heroActives });
+
+    const kbRows = candidateIds.length
+      ? await prisma.productKbSnippet.findMany({
+          where: { productId: { in: candidateIds } },
+          orderBy: [{ sourceSheet: "asc" }, { field: "asc" }, { updatedAt: "desc" }],
+          select: { id: true, productId: true, sourceSheet: true, field: true, content: true, metadata: true },
+        })
+      : [];
+    const kbByProductId = new Map<string, KbSnippetForEvidence[]>();
+    for (const row of kbRows) {
+      const list = kbByProductId.get(row.productId) ?? [];
+      list.push({ id: row.id, source_sheet: row.sourceSheet, field: row.field, content: row.content, metadata: row.metadata });
+      kbByProductId.set(row.productId, list);
+    }
+
+    const candidates = top.map((c) => {
+      const ing = ingredientByProductId.get(c.product_id);
+      const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives);
+      const skuLlm = sanitizeSkuForLlm(c.sku);
+      const kb_profile = buildKbProfile({
+        product_id: c.product_id,
+        display_name: `${c.sku.brand} ${c.sku.name}`.trim(),
+        region: detectedRegion,
+        availability: c.availability,
+        sku_risk_flags: c.sku.risk_flags,
+        sku_experience: c.sku.experience as any,
+        snippets: kbByProductId.get(c.product_id) ?? [],
+      });
+
+      return {
+        id: c.product_id,
+        brand: c.sku.brand,
+        name: c.sku.name,
+        category: c.sku.category,
+        price_usd: skuLlm.price_usd,
+        availability: c.availability,
+        similarity: c.similarity,
+        score: c.score,
+        vetoed: c.score.vetoed,
+        risk_flags: skuLlm.risk_flags,
+        burn_rate: (skuLlm.social_stats as any)?.burn_rate ?? null,
+        mechanism: skuLlm.mechanism,
+        experience: skuLlm.experience,
+        social_stats: skuLlm.social_stats,
+        ingredients: ingCtx,
+        expert_knowledge: buildExpertKnowledgeFromKb(kbByProductId.get(c.product_id) ?? []),
+        kb_profile: shrinkKbProfileForLlm(kb_profile),
+      };
+    });
+
+    const evidenceSummary = {
+      products_in_shortlist: candidates.length,
+      products_with_kb: candidates.filter((c) => (c.kb_profile?.citations?.length ?? 0) > 0).length,
+    };
+
+    const wantsExternalVerification = deepScience && evidenceSummary.products_with_kb === 0;
+    const external_verification = await maybeGetExternalVerification({ query, enabled: wantsExternalVerification });
+
+    const shortlistContextData = {
+      user_query: query,
+      region_preference: detectedRegion,
+      desired_categories: desiredCategories,
+      active_mentions: activeMentions,
+      detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
+      user_profile_inferred: sanitizeUserForLlm(user),
+      ...(external_verification ? { external_verification } : {}),
+      retrieval,
+      shortlist_evidence_summary: evidenceSummary,
+      candidates,
+    };
+
+    const systemPrompt = buildAuroraStructuredSystemPrompt({
+      regionLabel,
+      contextDataJson: JSON.stringify(shortlistContextData),
+      mode: "product",
+    });
+
+    const fallbackAnswer = buildFallbackShortlistAnswer({
+      query,
+      regionLabel,
+      desiredCategories,
+      activeMentions,
+      detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
+      candidates: candidates.map((c) => ({
+        brand: c.brand,
+        name: c.name,
+        category: c.category,
+        price_usd: c.price_usd,
+        availability: c.availability,
+        score: c.score,
+        citations: c.kb_profile?.citations ?? [],
+        key_actives: (c.expert_knowledge as any)?.key_actives ?? (c.expert_knowledge as any)?.key_actives_summary ?? undefined,
+        sensitivity_flags: (c.expert_knowledge as any)?.sensitivity_flags ?? (c.expert_knowledge as any)?.sensitivity_notes ?? undefined,
+      })),
+    });
+
+    let answer = "";
+    let llm_error: string | null = null;
+    try {
+      const userPrompt = [
+        "User request (Product shortlist / suitability):",
+        query,
+        "",
+        "TASK:",
+        "- Answer whether this is suitable for the user's skin (use the inferred user_profile + strict safety protocol).",
+        "- Recommend 3-5 products from Context Data that match the requested efficacy and region.",
+        "- For each product include: Mechanism (MoA), Expert Note (chemist_notes if present), Evidence Grade, and Trade-off (texture/irritation note).",
+        "- If the user did NOT ask for a full routine, do NOT output an AM/PM routine template.",
+        activeMentions.length ? `Focus actives: ${activeMentions.join(", ")}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      answer =
+        provider === "gemini"
+          ? await geminiGenerateContent({ system_prompt: systemPrompt, user_prompt: userPrompt, model: requestedModel })
+          : await openaiChatCompletion({
+              model: requestedModel,
+              messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userPrompt },
+              ],
+            });
+
+      const looksLikeRoutineTemplate =
+        answer.includes("Part 2: The Routine") || answer.includes("📋 Recommended Routine") || (answer.includes("🌞") && answer.includes("🌙"));
+
+      if (isBadAnswer(answer, "product") || looksLikeRoutineTemplate) {
+        llm_error = "LLM answer unsuitable for shortlist; used fallback.";
+        answer = fallbackAnswer;
+      }
+    } catch (e) {
+      llm_error = e instanceof Error ? e.message : "Unknown error";
+      answer = fallbackAnswer;
+    }
+
+    if (wantsStream) return streamTextResponse(answer);
+
+    return NextResponse.json({
+      query,
+      llm_provider: provider,
+      llm_model:
+        requestedModel ??
+        (provider === "gemini"
+          ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
+          : process.env.OPENAI_MODEL ?? "gpt-4o"),
+      intent: "shortlist",
+      answer,
+      llm_error,
+      context: shortlistContextData,
     });
   }
 
