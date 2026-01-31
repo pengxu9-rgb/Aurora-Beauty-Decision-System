@@ -285,7 +285,7 @@ function buildUserHistoryContext(input: {
 
   return [
     "## User History Context (Memory + Tracker)",
-    "The JSON below is persisted user history (ground truth). If skin_profile is missing/incomplete, you MUST stay in Phase 0 and ask only for the missing items before recommending products.",
+    "The JSON below is user history. Prefer `skin_profile` (persisted). If `skin_profile` is missing/incomplete but `skin_profile_session` is present, you may proceed using the session profile. Only stay in Phase 0 if BOTH are missing/incomplete.",
     "```json",
     JSON.stringify(payload, null, 2),
     "```",
@@ -313,74 +313,6 @@ function detectBarrierHealthyMention(query: string) {
     query.includes("不疼") ||
     query.includes("不痛")
   );
-}
-
-function skinTypeToLabel(skin: SkinType) {
-  switch (skin) {
-    case "oily":
-      return "Oily";
-    case "dry":
-      return "Dry";
-    case "combination":
-      return "Combination";
-    case "sensitive":
-      return "Sensitive";
-    case "normal":
-    default:
-      return "Normal";
-  }
-}
-
-function inferConcernLabelsFromQuery(query: string): string[] {
-  const q = query.toLowerCase();
-  const labels = new Set<string>();
-
-  if (
-    detectOilyAcne(query) ||
-    q.includes("acne") ||
-    q.includes("comed") ||
-    query.includes("痘") ||
-    query.includes("粉刺") ||
-    query.includes("闭口") ||
-    query.includes("黑头")
-  ) {
-    labels.add("Acne");
-  }
-
-  if (
-    q.includes("dark spot") ||
-    q.includes("dark spots") ||
-    q.includes("hyperpig") ||
-    q.includes("brighten") ||
-    query.includes("淡斑") ||
-    query.includes("美白") ||
-    query.includes("提亮") ||
-    query.includes("暗沉") ||
-    query.includes("痘印")
-  ) {
-    labels.add("Brightening");
-  }
-
-  if (
-    q.includes("anti-aging") ||
-    q.includes("anti aging") ||
-    q.includes("aging") ||
-    query.includes("抗老") ||
-    query.includes("皱纹") ||
-    query.includes("细纹")
-  ) {
-    labels.add("Anti-aging");
-  }
-
-  if (detectSensitiveSkin(query) || query.includes("敏感") || query.includes("泛红")) {
-    labels.add("Sensitivity");
-  }
-
-  if (q.includes("barrier") || query.includes("屏障") || query.includes("修护")) {
-    labels.add("Barrier");
-  }
-
-  return Array.from(labels);
 }
 
 function looksLikeUuid(value: string) {
