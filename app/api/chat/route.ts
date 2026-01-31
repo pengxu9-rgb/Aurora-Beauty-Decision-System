@@ -1765,13 +1765,6 @@ function isBadShortlistAnswer(answer: string) {
   if (trimmed.length < 120) return true;
   if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
 
-  // In shortlist mode we should not output a full AM/PM routine template.
-  const looksLikeRoutineTemplate =
-    trimmed.includes("Part 2: The Routine") ||
-    trimmed.includes("📋 Recommended Routine") ||
-    (trimmed.includes("🌞") && trimmed.includes("🌙"));
-  if (looksLikeRoutineTemplate) return true;
-
   return false;
 }
 
@@ -2459,7 +2452,7 @@ export async function POST(req: Request) {
         "- Answer whether this is suitable for the user's skin (use the inferred user_profile + strict safety protocol).",
         "- Recommend 3-5 products from Context Data that match the requested efficacy and region.",
         "- For each product include: Mechanism (MoA), Expert Note (chemist_notes if present), Evidence Grade, and Trade-off (texture/irritation note).",
-        "- If the user did NOT ask for a full routine, do NOT output an AM/PM routine template.",
+        "- OUTPUT MUST BE A PRODUCT SHORTLIST. Do NOT output a full AM/PM routine template. Do NOT include '🌞', '🌙', 'AM', 'PM', or 'Recommended Routine' headings unless the user explicitly asked for a routine.",
         activeMentions.length ? `Focus actives: ${activeMentions.join(", ")}` : "",
       ]
         .filter(Boolean)
