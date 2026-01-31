@@ -2339,6 +2339,12 @@ export async function POST(req: Request) {
   const query = normalizeQuery(body);
   if (!query) return NextResponse.json({ error: "`query` (or `message`) is required" }, { status: 400 });
 
+  const { userId, setCookieHeader } = getOrCreateAnonymousUserId(req);
+  const jsonResponse = (data: unknown, init?: Parameters<typeof NextResponse.json>[1]) =>
+    withSetCookie(NextResponse.json(data, init), setCookieHeader);
+  const streamResponse = (text: string, opts?: Parameters<typeof streamTextResponse>[1]) =>
+    withSetCookie(streamTextResponse(text, opts), setCookieHeader);
+
   const limit = typeof body.limit === "number" && body.limit > 0 ? Math.min(20, body.limit) : 6;
 
   const budgetCny = parseBudgetCny(query);
@@ -2382,8 +2388,8 @@ export async function POST(req: Request) {
     const answer = dupeIntent
       ? `为了帮你找“平替/替代”，我需要你明确 **想对比的具体产品**（发产品名或链接即可）。${hint}`
       : `我需要你提供具体产品名（或传 \`anchor_product_id\`），我才能基于数据库做“适配/风险/替代”分析。${hint}`;
-    if (Boolean(body.stream)) return streamTextResponse(answer);
-    return NextResponse.json({
+    if (Boolean(body.stream)) return streamResponse(answer);
+    return jsonResponse({
       query,
       intent: "clarify",
       answer,
@@ -2419,17 +2425,10 @@ export async function POST(req: Request) {
   const requestedModel = typeof body.llm_model === "string" && body.llm_model.trim() ? body.llm_model.trim() : undefined;
   const wantsStream = Boolean(body.stream);
 
-  const { userId, setCookieHeader } = getOrCreateAnonymousUserId(req);
-
-  const jsonResponse = (data: unknown, init?: Parameters<typeof NextResponse.json>[1]) =>
-    withSetCookie(NextResponse.json(data, init), setCookieHeader);
-  const streamResponse = (text: string, opts?: Parameters<typeof streamTextResponse>[1]) =>
-    withSetCookie(streamTextResponse(text, opts), setCookieHeader);
-
   let userProfile: UserProfile | null = null;
   let recentSkinLogs: SkinLog[] = [];
   let userHistoryDbError: string | null = null;
-  const sessionProfile = inferSessionSkinProfileFromText([recentUserContextText, query].filter(Boolean).join("\n"));
+  const sessionProfile = inferSessionSkinProfileFromText(contextualQuery);
 
   try {
     userProfile = await prisma.userProfile.upsert({
@@ -2825,9 +2824,9 @@ export async function POST(req: Request) {
       answer = fallbackAnswer;
     }
 
-    if (wantsStream) return streamTextResponse(answer);
+    if (wantsStream) return streamResponse(answer);
 
-    return NextResponse.json({
+    return jsonResponse({
       query,
       llm_provider: provider,
       llm_model:
@@ -2849,8 +2848,8 @@ export async function POST(req: Request) {
       const clarify = buildRoutineClarification(query, budgetCny);
       if (clarify.questions.length) {
         const answer = formatClarificationAnswer(clarify.questions);
-        if (wantsStream) return streamTextResponse(answer);
-        return NextResponse.json({
+        if (wantsStream) return streamResponse(answer);
+        return jsonResponse({
           query,
           intent: "clarify",
           answer,
@@ -3063,9 +3062,9 @@ export async function POST(req: Request) {
       answer = fallbackAnswer;
     }
 
-    if (wantsStream) return streamTextResponse(answer);
+    if (wantsStream) return streamResponse(answer);
 
-    return NextResponse.json({
+    return jsonResponse({
       query,
       llm_provider: provider,
       llm_model:
@@ -3095,7 +3094,7 @@ export async function POST(req: Request) {
 
   // PRODUCT / DUPE PATH
   if (!anchorProductId || !looksLikeUuid(anchorProductId)) {
-    return NextResponse.json(
+    return jsonResponse(
       {
         query,
         answer:
@@ -3115,7 +3114,7 @@ export async function POST(req: Request) {
   const user = buildUserVectorFromQuery(query);
 
   if (!anchor) {
-    return NextResponse.json({ error: "Anchor product not found", anchor_product_id: anchorProductId }, { status: 404 });
+    return jsonResponse({ error: "Anchor product not found", anchor_product_id: anchorProductId }, { status: 404 });
   }
 
   // KB-only anchor support: allow the user to ask about products that exist in KB but haven't been vectorized yet.
@@ -3214,9 +3213,9 @@ export async function POST(req: Request) {
       answer = fallbackAnswer;
     }
 
-    if (wantsStream) return streamTextResponse(answer);
+    if (wantsStream) return streamResponse(answer);
 
-    return NextResponse.json({
+    return jsonResponse({
       query,
       anchor_product_id: anchorProductId,
       llm_provider: provider,
@@ -3464,9 +3463,9 @@ export async function POST(req: Request) {
     answer = fallbackAnswer;
   }
 
-  if (wantsStream) return streamTextResponse(answer);
+  if (wantsStream) return streamResponse(answer);
 
-  return NextResponse.json({
+  return jsonResponse({
     query,
     anchor_product_id: anchorProductId,
     llm_provider: provider,
