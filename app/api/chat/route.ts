@@ -1630,6 +1630,43 @@ function isBadAnswer(answer: string, mode: "routine" | "product") {
   return false;
 }
 
+function isBadScienceAnswer(answer: string) {
+  const trimmed = answer.trim();
+  if (trimmed.length < 80) return true;
+  if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
+
+  // In science-only mode we should not output a full AM/PM routine template.
+  const looksLikeRoutineTemplate =
+    trimmed.includes("Part 2: The Routine") ||
+    trimmed.includes("📋 Recommended Routine") ||
+    (trimmed.includes("🌞") && trimmed.includes("🌙"));
+  if (looksLikeRoutineTemplate) return true;
+
+  return false;
+}
+
+function buildFallbackScienceAnswer(input: { query: string; regionLabel: string; external_verification: ExternalVerification | null }) {
+  const lines: string[] = [];
+  const hasCitations = Boolean(input.external_verification?.citations?.length);
+
+  if (!hasCitations) {
+    lines.push("Based on general dermatological consensus（基于一般皮肤科共识）：");
+  } else {
+    lines.push("基于目前可用的外部验证摘要：");
+  }
+
+  lines.push(`- 你问的是“多肽 XYZ 是否有效 / 是否有临床证据”。但“XYZ”并不是标准 INCI 名称，我无法确认你具体指哪一种多肽。`);
+  lines.push(`- 护肤品“多肽”整体证据强弱差异很大：一些多肽/复配在小样本、短周期的人体研究里可能看到“细纹/保湿/弹性”的轻度改善，但很多宣传来自体外/机理推断，不能等同于强临床证据。`);
+  lines.push(`- 如果你告诉我具体 INCI（例如 Copper Tripeptide-1 / Palmitoyl Tripeptide-1 / Acetyl Hexapeptide-8 等），我可以再基于 KB + 外部验证摘要给更精确的证据分级。`);
+  lines.push(`- 安全性上，多肽本身通常刺激性不高，但真实刺激更多来自配方中的酒精、香精/精油、防腐体系或与强酸/高浓度维A同用的叠加。`);
+  lines.push("");
+  lines.push("如果你愿意补充 2 个信息，我可以把答案从“共识级”提升为“可审计的证据级”：");
+  lines.push("1) 你说的“XYZ”具体是哪种多肽/哪个产品里的成分名？");
+  lines.push(`2) 你坐标 ${input.regionLabel}，主要想解决什么问题（闭口/暗沉/泛红/抗老）以及是否敏感/屏障受损？`);
+
+  return lines.join("\n");
+}
+
 function buildFallbackProductAnswer(input: {
   query: string;
   detected: { sensitive_skin: boolean; barrier_impaired: boolean };
@@ -1879,6 +1916,7 @@ export async function POST(req: Request) {
   const budgetCny = parseBudgetCny(query);
   const detectedRegion = detectRegionPreference(query);
   const regionLabel = detectedRegion ?? "Global";
+  const deepScience = detectDeepScienceQuestion(query);
 
   const explicitAnchorId =
     typeof body.anchor_product_id === "string" && body.anchor_product_id.trim() ? body.anchor_product_id.trim() : null;
@@ -1916,8 +1954,14 @@ export async function POST(req: Request) {
     });
   }
 
+  // SCIENCE-QA PATH (no anchor required):
+  // Deep scientific questions (e.g., "有没有临床证据") should not be forced into a routine.
+  const wantsScienceOnly =
+    deepScience && !routineIntent && !dupeIntent && !evalIntent && (!anchorProductId || !looksLikeUuid(anchorProductId));
+
   // Default: Routine planning unless the user explicitly wants dupe/evaluation (or provides an explicit anchor id).
-  const shouldPlanRoutine = routineIntent || (!explicitAnchorId && !dupeIntent && !evalIntent);
+  const forceProductPathForDeepScience = deepScience && !routineIntent && !dupeIntent && !evalIntent && !explicitAnchorId && highConfidenceAlias;
+  const shouldPlanRoutine = routineIntent || (!explicitAnchorId && !dupeIntent && !evalIntent && !forceProductPathForDeepScience && !wantsScienceOnly);
 
   const provider =
     body.llm_provider ??
@@ -1927,9 +1971,83 @@ export async function POST(req: Request) {
   const requestedModel = typeof body.llm_model === "string" && body.llm_model.trim() ? body.llm_model.trim() : undefined;
   const wantsStream = Boolean(body.stream);
 
+  if (wantsScienceOnly) {
+    const external_verification = await maybeGetExternalVerification({ query, enabled: true });
+
+    const scienceContextData = {
+      user_query: query,
+      region_preference: detectedRegion,
+      detected: {
+        sensitive_skin: detectSensitiveSkin(query),
+        barrier_impaired: detectBarrierImpaired(query),
+      },
+      ...(external_verification ? { external_verification } : {}),
+      note: "Science-only question detected; no anchor product identified.",
+    };
+
+    const systemPrompt = buildAuroraStructuredSystemPrompt({
+      regionLabel,
+      contextDataJson: JSON.stringify(scienceContextData),
+      mode: "product",
+    });
+
+    const fallbackAnswer = buildFallbackScienceAnswer({ query, regionLabel, external_verification });
+
+    let answer = "";
+    let llm_error: string | null = null;
+    try {
+      const userPrompt = [
+        "User request (Science question):",
+        query,
+        "",
+        "You must answer ONLY this scientific evidence question.",
+        "Do NOT generate an AM/PM routine or product picks unless the user explicitly asked for a routine.",
+        "If Context Data includes external_verification but citations array is empty, start your answer with: 'Based on general dermatological consensus…' and explain without fabricating citations.",
+      ].join("\n");
+
+      answer =
+        provider === "gemini"
+          ? await geminiGenerateContent({ system_prompt: systemPrompt, user_prompt: userPrompt, model: requestedModel })
+          : await openaiChatCompletion({
+              model: requestedModel,
+              messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userPrompt },
+              ],
+            });
+
+      if (isBadScienceAnswer(answer)) {
+        llm_error = "LLM answer unsuitable for science-only; used fallback.";
+        answer = fallbackAnswer;
+      }
+    } catch (e) {
+      llm_error = e instanceof Error ? e.message : "Unknown error";
+      answer = fallbackAnswer;
+    }
+
+    if (wantsStream) return streamTextResponse(answer);
+
+    return NextResponse.json({
+      query,
+      llm_provider: provider,
+      llm_model:
+        requestedModel ??
+        (provider === "gemini"
+          ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
+          : process.env.OPENAI_MODEL ?? "gpt-4o"),
+      intent: "science",
+      answer,
+      llm_error,
+      context: {
+        region_preference: detectedRegion,
+        ...(external_verification ? { external_verification } : {}),
+      },
+    });
+  }
+
   // ROUTINE PATH
   if (shouldPlanRoutine) {
-    const skipClarify = detectDeepScienceQuestion(query) && !routineIntent;
+    const skipClarify = deepScience && !routineIntent;
     if (!skipClarify) {
       const clarify = buildRoutineClarification(query, budgetCny);
       if (clarify.questions.length) {
