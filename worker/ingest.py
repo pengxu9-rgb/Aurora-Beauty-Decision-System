@@ -698,6 +698,98 @@ def infer_risk_flags_from_ingredients(*, product_name: str, ingredients_text: st
   return stable
 
 
+def infer_key_actives_from_ingredients(*, ingredients_text: str, expert_key_actives: Optional[str] = None) -> List[str]:
+  """
+  Deterministic key-active extraction for KB/RAG grounding.
+
+  Goal:
+  - Provide a conservative, explainable "key_actives" list even when comparison sheets are missing.
+  - Avoid brittle parsing; prefer substring hits for common, high-signal actives.
+  """
+  text = unicodedata.normalize("NFKC", str(ingredients_text or ""))
+  lower = text.lower()
+
+  out: List[str] = []
+  seen = set()
+
+  def _add(label: str) -> None:
+    key = label.lower()
+    if key in seen:
+      return
+    seen.add(key)
+    out.append(label)
+
+  def _has_any(needles: List[str]) -> bool:
+    return any(n.lower() in lower for n in needles)
+
+  # 1) Seed from any provided expert key_actives (already curated from sheets).
+  if expert_key_actives:
+    for part in re.split(r"[|,，;/]+", str(expert_key_actives)):
+      cleaned = part.strip()
+      if len(cleaned) < 2:
+        continue
+      if cleaned.lower() in {"n/a", "na", "none", "unknown"}:
+        continue
+      _add(cleaned)
+
+  # 2) Ingredient-derived actives (small controlled list).
+  if _has_any(["niacinamide", "烟酰胺"]):
+    _add("Niacinamide")
+  if _has_any(["tranexamic acid", "传明酸"]):
+    _add("Tranexamic Acid")
+  if _has_any(["alpha-arbutin", "arbutin", "熊果苷"]):
+    _add("Arbutin")
+  if _has_any(["kojic", "曲酸"]):
+    _add("Kojic Acid")
+  if _has_any(["azelaic", "壬二酸"]):
+    _add("Azelaic Acid")
+
+  # Vitamin C family: multiple derivatives; keep the label generic.
+  if _has_any(["ascorbic acid", "l-ascorbic", "ascorbyl", "ascorbate", "维c", "维生素c"]):
+    _add("Vitamin C (Ascorbate family)")
+
+  # Retinoids
+  if _has_any(["retinol", "retinal", "retinaldehyde", "tretinoin", "adapalene", "retinoate", "a醇", "维a", "视黄"]):
+    _add("Retinoid")
+
+  # Acids
+  if _has_any(["salicylic acid", "betaine salicylate", "capryloyl salicylic", "水杨酸"]):
+    _add("BHA (Salicylic Acid)")
+  if _has_any(["glycolic acid", "lactic acid", "乙醇酸", "乳酸"]):
+    _add("AHA (Glycolic/Lactic)")
+  if _has_any(["mandelic acid", "杏仁酸"]):
+    _add("Mandelic Acid")
+  if _has_any(["gluconolactone", "lactobionic", "pha", "葡糖酸内酯"]):
+    _add("PHA")
+
+  # Peptides (broad)
+  if _has_any(["peptide", "tripeptide", "hexapeptide", "palmitoyl", "ghk", "copper tripeptide", "多肽", "蓝铜"]):
+    _add("Peptides")
+
+  # Barrier / soothing staples
+  if _has_any(["panthenol", "d-panthenol", "泛醇"]):
+    _add("Panthenol (B5)")
+  if _has_any(["ceramide", "神经酰胺"]):
+    _add("Ceramides")
+  if _has_any(["cholesterol", "胆固醇"]):
+    _add("Cholesterol")
+  if _has_any(["centella", "madecassoside", "asiaticoside", "积雪草"]):
+    _add("Centella (Madecassoside family)")
+  if _has_any(["allantoin", "尿囊素"]):
+    _add("Allantoin")
+  if _has_any(["hyaluronic", "sodium hyaluronate", "透明质酸", "玻尿酸"]):
+    _add("Hyaluronic Acid")
+
+  # Acne treatments
+  if _has_any(["benzoyl peroxide", "过氧化苯甲酰"]):
+    _add("Benzoyl Peroxide")
+  if _has_any(["adapalene", "阿达帕林"]):
+    _add("Adapalene")
+
+  # Keep it compact for RAG/token budgets.
+  return out[:16]
+
+
 def postprocess_risk_flags(
   *, llm_flags: List[str], product_name: str, ingredients_text: str
 ) -> List[str]:
@@ -1900,17 +1992,78 @@ def ingest_one(
         source_sheet="expert_knowledge",
         field=canonicalize_kb_field(str(key)),
         content=content,
-        metadata={"source": "expert_knowledge", "brand": sku.brand, "name": sku.name},
+        metadata={
+          "source": "expert_knowledge",
+          "brand": sku.brand,
+          "name": sku.name,
+          # Provide a stable ontology key for downstream RAG bucketing.
+          "canonical_key": infer_kb_canonical_key(str(key)) or "notes",
+          "canonical_key_source": "expert_fields_v1",
+        },
       )
       upserted += 1
+    return upserted
+
+  def _upsert_ingredient_derived_kb(*, product_id: str) -> int:
+    ing = (sku.ingredients_text or "").strip()
+    if len(ing) < 5:
+      return 0
+
+    ek = sku.expert_knowledge if isinstance(sku.expert_knowledge, dict) else {}
+    expert_key_actives = ""
+    if isinstance(ek, dict):
+      expert_key_actives = str(ek.get("key_actives") or ek.get("key_actives_summary") or "").strip()
+
+    key_actives = infer_key_actives_from_ingredients(ingredients_text=ing, expert_key_actives=expert_key_actives)
+    risk_flags = infer_risk_flags_from_ingredients(product_name=f"{sku.brand} {sku.name}".strip(), ingredients_text=ing)
+
+    upserted = 0
+
+    if key_actives:
+      db.upsert_kb_snippet(
+        product_id=product_id,
+        # "zz_" keeps these derived snippets after human notes in deterministic ordering.
+        source_sheet="zz_ingredients_derived",
+        field="key_actives",
+        content=" | ".join(key_actives),
+        metadata={
+          "source": "ingredients_rules_v1",
+          "canonical_key": "key_actives",
+          "canonical_key_source": "ingredients_rules_v1",
+          "brand": sku.brand,
+          "name": sku.name,
+        },
+      )
+      upserted += 1
+
+    if risk_flags:
+      db.upsert_kb_snippet(
+        product_id=product_id,
+        source_sheet="zz_ingredients_derived",
+        field="sensitivity_flags",
+        content=" | ".join(risk_flags),
+        metadata={
+          "source": "ingredients_rules_v1",
+          "canonical_key": "sensitivity",
+          "canonical_key_source": "ingredients_rules_v1",
+          "brand": sku.brand,
+          "name": sku.name,
+        },
+      )
+      upserted += 1
+
     return upserted
 
   existing_id = db.find_product_id_loose(brand=sku.brand, name=sku.name)
   if existing_id and not overwrite:
     upserted = _upsert_expert_knowledge(product_id=str(existing_id))
-    if upserted:
+    derived = _upsert_ingredient_derived_kb(product_id=str(existing_id))
+    if upserted or derived:
       db.conn.commit()
-      print(f"📝 Expert knowledge upserted: {upserted}")
+      if upserted:
+        print(f"📝 Expert knowledge upserted: {upserted}")
+      if derived:
+        print(f"🧩 Ingredient-derived KB upserted: {derived}")
     print(f"↩️  Skipped (exists): {sku.brand} - {sku.name}")
     return
 
@@ -1981,6 +2134,7 @@ def ingest_one(
       top_keywords=list(social_payload.get("top_keywords", []) if isinstance(social_payload.get("top_keywords", []), list) else []),
     )
     _upsert_expert_knowledge(product_id=str(product_id))
+    _upsert_ingredient_derived_kb(product_id=str(product_id))
     db.conn.commit()
     print(f"✅ Ingested: {sku.brand} - {sku.name}")
   except BaseException:  # noqa: BLE001
