@@ -105,7 +105,7 @@ export default function ConsultPage() {
               isStreaming={isStreaming}
               onRestart={handleRestart}
             />
-            <div className="mt-6">
+            <div className="mt-6 pb-[calc(env(safe-area-inset-bottom)+7rem)]">
               <SkinTracker />
             </div>
           </>
