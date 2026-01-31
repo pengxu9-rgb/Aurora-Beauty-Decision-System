@@ -373,39 +373,68 @@ function normalizeQuery(body: ChatRequest): string {
 
 function detectSensitiveSkin(query: string) {
   const q = query.toLowerCase();
-  return (
-    q.includes("sensitive") ||
-    q.includes("irritat") ||
-    q.includes("redness") ||
-    q.includes("stinging") ||
-    q.includes("burning") ||
-    query.includes("敏感") ||
-    query.includes("泛红") ||
-    query.includes("刺痛") ||
-    query.includes("疼") ||
-    query.includes("痛") ||
-    query.includes("红血丝")
-  );
+
+  const hasEn = (term: string, negations: string[]) => {
+    if (!q.includes(term)) return false;
+    return !negations.some((n) => q.includes(`${n} ${term}`) || q.includes(`${n}${term}`));
+  };
+
+  const en =
+    hasEn("sensitive", ["not"]) ||
+    hasEn("irritat", ["no", "not", "without"]) ||
+    hasEn("redness", ["no", "not", "without"]) ||
+    hasEn("stinging", ["no", "not", "without"]) ||
+    hasEn("burning", ["no", "not", "without"]);
+
+  const cnSensitive = query.includes("敏感") && !query.includes("不敏感") && !query.includes("没那么敏感");
+  const cnRedness =
+    (query.includes("泛红") || query.includes("红血丝")) &&
+    !query.includes("不泛红") &&
+    !query.includes("没泛红") &&
+    !query.includes("没有泛红");
+  const cnSting = query.includes("刺痛") && !query.includes("不刺痛") && !query.includes("没刺痛") && !query.includes("没有刺痛");
+  const cnPain = (query.includes("疼") && !query.includes("不疼")) || (query.includes("痛") && !query.includes("不痛"));
+
+  const cn = cnSensitive || cnRedness || cnSting || cnPain;
+  return en || cn;
 }
 
 function detectBarrierImpaired(query: string) {
   const q = query.toLowerCase();
-  return (
-    q.includes("barrier") ||
+
+  const hasEn = (term: string, negations: string[]) => {
+    if (!q.includes(term)) return false;
+    return !negations.some((n) => q.includes(`${n} ${term}`) || q.includes(`${n}${term}`));
+  };
+
+  const enBarrierDamage =
     q.includes("broken barrier") ||
-    q.includes("compromised") ||
-    q.includes("peeling") ||
-    q.includes("burning") ||
-    q.includes("stinging") ||
-    query.includes("屏障") ||
+    q.includes("damaged barrier") ||
+    q.includes("impaired barrier") ||
+    q.includes("compromised barrier") ||
+    (q.includes("barrier") && (q.includes("compromised") || q.includes("damaged") || q.includes("impaired")));
+
+  const enSymptoms =
+    hasEn("peeling", ["no", "not", "without"]) ||
+    hasEn("burning", ["no", "not", "without"]) ||
+    hasEn("stinging", ["no", "not", "without"]);
+
+  const cnBarrierDamage =
+    (query.includes("屏障") && (query.includes("受损") || query.includes("破") || query.includes("不稳"))) ||
     query.includes("受损") ||
     query.includes("烂脸") ||
-    query.includes("爆皮") ||
-    query.includes("疼") ||
-    query.includes("痛") ||
-    query.includes("刺痛") ||
-    query.includes("火辣")
-  );
+    query.includes("爆皮");
+  const cnSymptoms =
+    (query.includes("刺痛") && !query.includes("不刺痛") && !query.includes("没刺痛") && !query.includes("没有刺痛")) ||
+    (query.includes("火辣") && !query.includes("不火辣")) ||
+    (query.includes("疼") && !query.includes("不疼")) ||
+    (query.includes("痛") && !query.includes("不痛"));
+
+  // If the user explicitly states their barrier is stable/healthy (e.g. "no stinging"),
+  // only consider it impaired when there are other impairment signals present.
+  if (detectBarrierHealthyMention(query) && !(enBarrierDamage || enSymptoms || cnBarrierDamage || cnSymptoms)) return false;
+
+  return enBarrierDamage || enSymptoms || cnBarrierDamage || cnSymptoms;
 }
 
 function detectRegionPreference(query: string): RegionPreference {
