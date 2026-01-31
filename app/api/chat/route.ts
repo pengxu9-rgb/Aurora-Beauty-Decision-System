@@ -2286,6 +2286,9 @@ export async function POST(req: Request) {
 
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const recentUserContextText = messages.length ? extractRecentUserContextText(messages) : "";
+  // Use recent user messages as additional context for Phase-0 clarification and profile inference.
+  // This prevents redundant questions when the user already provided skin type / barrier / goals earlier in the session.
+  const profileText = [recentUserContextText, query].filter(Boolean).join("\n");
   const contextualQuery =
     isShortFollowUpQuery(query) && recentUserContextText.trim() && recentUserContextText.trim() !== query
       ? `${recentUserContextText}\n\nFollow-up: ${query}`
@@ -2360,7 +2363,7 @@ export async function POST(req: Request) {
   let userProfile: UserProfile | null = null;
   let recentSkinLogs: SkinLog[] = [];
   let userHistoryDbError: string | null = null;
-  const sessionProfile = inferSessionSkinProfileFromText(contextualQuery);
+  const sessionProfile = inferSessionSkinProfileFromText(profileText);
 
   try {
     userProfile = await prisma.userProfile.upsert({
@@ -2777,7 +2780,7 @@ export async function POST(req: Request) {
   if (shouldPlanRoutine) {
     const skipClarify = deepScience && !routineIntent;
     if (!skipClarify) {
-      const clarify = buildRoutineClarification(query, budgetCny);
+      const clarify = buildRoutineClarification(profileText, budgetCny);
       if (clarify.questions.length) {
         const answer = formatClarificationAnswer(clarify.questions);
         if (wantsStream) return streamResponse(answer);
@@ -2791,7 +2794,7 @@ export async function POST(req: Request) {
     }
 
     // Build a lightweight user vector from query text.
-    const user = buildUserVectorFromQuery(query, budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined);
+    const user = buildUserVectorFromQuery(profileText, budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined);
     const dbAll = await getSkuDatabase();
 
     const mergeSkuPool = (items: Array<SkuVector | null | undefined>) => {
