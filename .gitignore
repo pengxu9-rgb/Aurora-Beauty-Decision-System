@@ -26,3 +26,6 @@ pnpm-debug.log*
 .venv-worker
 .venv*
 __pycache__/
+
+# Generated batch files (data exports)
+batch_final.json
