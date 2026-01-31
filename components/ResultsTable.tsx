@@ -142,6 +142,7 @@ function ResultRow({
   return (
     <tr className="hover:bg-gray-50 transition-colors fade-in group">
       <td className="px-6 py-4 whitespace-nowrap">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src="https://via.placeholder.com/40x40/e5e7eb/9ca3af?text=IMG"
           alt="Thumb"

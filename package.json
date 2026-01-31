@@ -6,8 +6,8 @@
     "dev": "next dev",
     "build": "prisma generate && next build",
     "lint": "next lint",
-    "test": "node --test --experimental-strip-types",
-    "db:seed": "node --experimental-strip-types prisma/seed.ts",
+    "test": "node --test --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON",
+    "db:seed": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON prisma/seed.ts",
     "start": "next start"
   },
   "dependencies": {
