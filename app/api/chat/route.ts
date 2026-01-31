@@ -1941,9 +1941,19 @@ function isBadAnswer(answer: string, mode: "routine" | "product") {
   if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
 
   if (mode === "routine") {
-    const hasAm = trimmed.includes("🌞") || /\bAM\b/i.test(trimmed);
-    const hasPm = trimmed.includes("🌙") || /\bPM\b/i.test(trimmed);
-    if (!hasAm || !hasPm) return true;
+    // Accept both EN + CN section markers to avoid false fallbacks when Gemini answers in Chinese.
+    const hasAm =
+      /(^|\n)\s*(?:🌞|☀️?|🌤️?|🌅|AM\b|Morning\b|早上|早间|上午|白天|日间)/i.test(trimmed) || /\bAM\b/i.test(trimmed);
+    const hasPm =
+      /(^|\n)\s*(?:🌙|🌛|🌜|🌃|PM\b|Night\b|晚上|夜间|夜晚|睡前)/i.test(trimmed) || /\bPM\b/i.test(trimmed);
+
+    // Also allow "Phase 0" clarification-style outputs (Diagnosis first) without forcing AM/PM.
+    const looksLikeClarification =
+      /[?？]/.test(trimmed) &&
+      /(需要|请问|先确认|为了|to evaluate|need to know|I need to know|before I recommend)/i.test(trimmed) &&
+      (/\n\s*\d+[\)\.、]\s+/.test(trimmed) || /\n\s*[-*•]\s+/.test(trimmed));
+
+    if ((!hasAm || !hasPm) && !looksLikeClarification) return true;
   }
 
   if (mode === "product") {
