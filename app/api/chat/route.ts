@@ -1760,6 +1760,21 @@ function isBadScienceAnswer(answer: string) {
   return false;
 }
 
+function isBadShortlistAnswer(answer: string) {
+  const trimmed = answer.trim();
+  if (trimmed.length < 120) return true;
+  if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
+
+  // In shortlist mode we should not output a full AM/PM routine template.
+  const looksLikeRoutineTemplate =
+    trimmed.includes("Part 2: The Routine") ||
+    trimmed.includes("📋 Recommended Routine") ||
+    (trimmed.includes("🌞") && trimmed.includes("🌙"));
+  if (looksLikeRoutineTemplate) return true;
+
+  return false;
+}
+
 function buildFallbackScienceAnswer(input: { query: string; regionLabel: string; external_verification: ExternalVerification | null }) {
   const lines: string[] = [];
   const hasCitations = Boolean(input.external_verification?.citations?.length);
@@ -2461,10 +2476,7 @@ export async function POST(req: Request) {
               ],
             });
 
-      const looksLikeRoutineTemplate =
-        answer.includes("Part 2: The Routine") || answer.includes("📋 Recommended Routine") || (answer.includes("🌞") && answer.includes("🌙"));
-
-      if (isBadAnswer(answer, "product") || looksLikeRoutineTemplate) {
+      if (isBadShortlistAnswer(answer)) {
         llm_error = "LLM answer unsuitable for shortlist; used fallback.";
         answer = fallbackAnswer;
       }
