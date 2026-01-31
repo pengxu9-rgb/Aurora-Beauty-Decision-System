@@ -2429,7 +2429,7 @@ export async function POST(req: Request) {
   let userProfile: UserProfile | null = null;
   let recentSkinLogs: SkinLog[] = [];
   let userHistoryDbError: string | null = null;
-  const sessionProfile = inferSessionSkinProfileFromText(contextualQuery);
+  const sessionProfile = inferSessionSkinProfileFromText([recentUserContextText, query].filter(Boolean).join("\n"));
 
   try {
     userProfile = await prisma.userProfile.upsert({
@@ -2468,7 +2468,7 @@ export async function POST(req: Request) {
     dbError: userHistoryDbError,
   });
 
-  const phase0Enforcement = skinProfileComplete
+  const phase0Enforcement = skinProfileComplete || wantsScienceOnly
     ? undefined
     : [
         "## Phase 0 Enforcement (Server)",

@@ -12,8 +12,28 @@ function cx(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
 }
 
+function readCookie(name: string) {
+  if (typeof document === "undefined") return null;
+  const parts = document.cookie.split(";").map((p) => p.trim());
+  for (const part of parts) {
+    if (!part) continue;
+    const idx = part.indexOf("=");
+    if (idx <= 0) continue;
+    const k = part.slice(0, idx).trim();
+    if (k !== name) continue;
+    return decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return null;
+}
+
 function getOrCreateAuroraUid() {
   if (typeof window === "undefined") return null;
+
+  const fromCookie = readCookie(COOKIE_NAME);
+  if (fromCookie && fromCookie.trim()) {
+    window.localStorage.setItem(UID_KEY, fromCookie.trim());
+    return fromCookie.trim();
+  }
 
   const existing = window.localStorage.getItem(UID_KEY);
   if (existing && existing.trim()) return existing.trim();
@@ -146,4 +166,3 @@ export function SkinTracker() {
     </section>
   );
 }
-
