@@ -1762,7 +1762,7 @@ function isBadScienceAnswer(answer: string) {
 
 function isBadShortlistAnswer(answer: string) {
   const trimmed = answer.trim();
-  if (trimmed.length < 120) return true;
+  if (trimmed.length < 60) return true;
   if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
 
   return false;
