@@ -162,3 +162,47 @@ model ProductAlias {
   @@index([productId])
   @@map("product_aliases")
 }
+
+// 6. User Profile Memory (Lifecycle)
+model UserProfile {
+  id            String     @id @default(uuid())
+  // 简单的指纹或基于 Cookie 的 ID
+  userId        String     @unique @map("user_id")
+
+  skinType      String?    @map("skin_type") // "Oily", "Dry"
+  concerns      String[]   @default([]) // ["Acne", "Aging"]
+  barrierStatus String?    @map("barrier_status") // "Healthy", "Impaired"
+  budgetTier    String?    @map("budget_tier") // "Low", "High"
+
+  currentRoutine Json?     @map("current_routine") // [{"step": "cleanser", "product": "CeraVe"}]
+
+  logs          SkinLog[]
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+
+  @@map("user_profiles")
+}
+
+model SkinLog {
+  id          String      @id @default(uuid())
+  profileId   String      @map("profile_id")
+  profile     UserProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  date        DateTime    @default(now())
+
+  // 状态追踪 (0-5 Scale)
+  rednessLevel Int        @default(0) @map("redness_level")
+  acneCount    Int        @default(0) @map("acne_count")
+  hydration    Int        @default(0)
+
+  // 产品反馈
+  targetProduct String?   @map("target_product") // e.g., "Used Tom Ford Serum"
+  sensation     String?   // "Tingling", "Burning", "Nothing"
+
+  notes       String?
+
+  @@index([profileId])
+  @@index([date])
+  @@index([profileId, date])
+  @@map("skin_logs")
+}

@@ -7,6 +7,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { AnalyzingView } from "@/components/consult/AnalyzingView";
 import { ConsultWizard, type ConsultWizardAnswers } from "@/components/consult/ConsultWizard";
 import { ReportCard } from "@/components/consult/ReportCard";
+import { SkinTracker } from "@/components/SkinTracker";
 
 type ViewState = "wizard" | "analyzing" | "report";
 
@@ -97,7 +98,17 @@ export default function ConsultPage() {
         {view === "wizard" ? <ConsultWizard onComplete={handleWizardComplete} /> : null}
         {view === "analyzing" ? <AnalyzingView /> : null}
         {view === "report" && profile ? (
-          <ReportCard profile={profile} answer={latestAssistant || "No response yet."} isStreaming={isStreaming} onRestart={handleRestart} />
+          <>
+            <ReportCard
+              profile={profile}
+              answer={latestAssistant || "No response yet."}
+              isStreaming={isStreaming}
+              onRestart={handleRestart}
+            />
+            <div className="mt-6">
+              <SkinTracker />
+            </div>
+          </>
         ) : null}
 
         {error ? (

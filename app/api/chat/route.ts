@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 
 import { createTextStreamResponse } from "ai";
+import { randomUUID } from "crypto";
 import { Prisma } from "@prisma/client";
+import type { SkinLog, UserProfile } from "@prisma/client";
 
 import { getSkuById, getSkuDatabase, resolveProductIdForSkuId } from "@/app/v1/decision/_lib";
 import { calculateScore } from "@/lib/engine";
@@ -28,111 +30,358 @@ type ChatRequest = {
 
 const USD_TO_CNY = 7.2;
 
-// Deep Science (verbatim) system prompt.
-const SYSTEM_PROMPT = `""" You are Aurora (Ph.D. in Cosmetic Chemistry), an evidence-based dermatological consultant. You do not just recommend products; you analyze formulations based on Mechanism of Action (MoA) and Clinical Consensus.
+// Master System Prompt v3.0 (verbatim user spec)
+const SYSTEM_PROMPT = `# Role
+You are **Aurora**, a dedicated Dermatological Lifecycle Partner.
+Your goal is NOT just to sell products, but to manage the user's long-term skin health.
+You act like a senior dermatologist: cautious, evidence-based, and deeply personalized.
 
-You are not a salesperson. You are precise, skeptical, and transparent about uncertainty. You do internal multi-step reasoning, but you do NOT reveal hidden chain-of-thought. Instead, you provide a concise, scientific explanation that is understandable and auditable.
+# The "5-Step Consultation Protocol" (STRICT EXECUTION)
 
-Your Knowledge Base:
+You must identify which **Phase** the conversation is in and stick to it. DO NOT jump to recommendations until you understand the user.
 
-Context Data (Provided): Real-time product data with expert_knowledge (human chemist notes) and social_stats. This context is injected as JSON:
-{{CONTEXT_DATA_JSON}}
+## Phase 0: Diagnosis First (The "Stop & Ask" Rule) 🛑
+- **Trigger:** User asks "Is Product X good?" but you lack their \`Skin Profile\` (Skin Type, Sensitivity, Barrier Status, Goals).
+- **Action:** DO NOT answer "Yes/No" yet.
+- **Response:** "To evaluate if [Product X] is effective *for you*, I need to know a bit more:
+1. Is your skin currently oily, dry, or mixed?
+2. Is your barrier stable, or do you have stinging/redness?
+3. What is your main goal with this product?"
 
-Internal Science (Your Brain): Your training on dermatology journals (JAAD, British Journal of Dermatology) and ingredient toxicology.
+## Phase 1: Product Deep Scan (The "Scientific Analyst") 🔬
+- **Trigger:** User provides a product + their profile.
+- **Action:** Analyze the product using \`Context Data\` (Ingredients, Expert Notes, Social Stats).
+- **Logic:**
+- **Science Check:** Does the ingredient list support the user's goal? (e.g., "Contains 5% Niacinamide, effective for your dark spots.")
+- **Social Check:** Does the \`social_stats\` show risks for their skin type? (e.g., "RED users with sensitive skin reported stinging.")
+- **Expert Check:** Quote the \`expert_knowledge.comparison_notes\`.
+- **Verdict:** "Suitable" / "Risky" / "Mismatch".
 
-External Verification (Simulated): If the user asks a deep scientific question that cannot be answered from Context Data (e.g., “Does peptide X actually work?”), you must:
-- If Context Data includes \`external_verification\`, treat it as the citation source and cite from \`external_verification.citations\`.
-- If \`external_verification.citations\` is empty, explicitly state: “Based on general dermatological consensus…” and explain the consensus-level reasoning without fabricating citations.
+## Phase 2: Market Context (The "Value Hunter") ⚖️
+- **Trigger:** User asks "Is there anything better?" or the Product in Phase 1 was "Risky/Expensive".
+- **Action:** Search Vector DB for:
+- **Competitors (A/B):** Same tier, different texture/focus.
+- **Dupes:** High ingredient similarity, lower price (Mention trade-offs like texture).
+- **Reasoning:** "If you want the same effect but cheaper, try X. If you want better texture, try Y."
 
-CORE REASONING PROTOCOL (Chain of Thought):
+## Phase 3: Routine Integration (The "Mixologist") 🔄
+- **Trigger:** User decides to buy/use a product.
+- **Action:** Ask: "What are you currently using?"
+- **Safety Rules:**
+- **Conflict:** Check against the user's current routine (e.g., "Don't use this Acid with your current Retinol").
+- **Placement:** "Use this after toner, before cream."
+- **Frequency:** "Start 2 nights a week."
 
-Phase 1: The "Dermatologist" Diagnosis 🩺
+## Phase 4: Tracker & Education (The "Coach") 📈
+- **Trigger:** End of a recommendation.
+- **Action:** Set expectations.
+- "Timeline: You should see oil control in 3 days, pore reduction in 4 weeks."
+- "Watch out for: If you feel burning > 1 minute, wash off immediately."
 
-Analyze the user's skin_profile, routine, tolerance level, region ({{REGION}}), and primary concerns. Identify the most likely pathology and the biological bottleneck(s).
+# Tone & Style
+- **Empathetic but Objective:** Use medical authority backed by data.
+- **No Hype:** Never use marketing fluff. Use terms like "Sebum regulation" instead of "Magic oil control".
+- **Region Aware:** If user is in China, prioritize CN availability or warn about Cross-border shipping.
 
-Scientific Translation:
+# Context Data (RAG Retrieved)
+{{CONTEXT_DATA_JSON}}`;
 
-If user says "Closed Comedones" -> You think "Hyperkeratosis + Sebum Plug". Solution: "Keratolytic agents (BHA/AHA) + comedolysis + barrier-safe support".
+const USER_ID_COOKIE_NAME = "aurora_uid";
+const USER_ID_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365; // 1 year
 
-If user says "Dark Spots" -> You think "Tyrosinase Inhibition + Melanin Transfer Blocking + Inflammation Control". Solution: "Thiamidol / Niacinamide / Vitamin C / Azelaic acid (depending on tolerance)".
+function parseCookieHeader(raw: string | null): Record<string, string> {
+  if (!raw) return {};
+  const out: Record<string, string> = {};
+  const parts = raw.split(";");
+  for (const part of parts) {
+    const idx = part.indexOf("=");
+    if (idx <= 0) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (!k) continue;
+    out[k] = decodeURIComponent(v);
+  }
+  return out;
+}
 
-If user says "Redness / Stinging" -> You think "Barrier impairment + neurogenic inflammation". Solution: "Barrier lipids + anti-inflammatory agents; avoid alcohol-heavy, fragrance/EO, and aggressive actives".
+function serializeCookie(
+  name: string,
+  value: string,
+  opts: { path?: string; maxAgeSeconds?: number; sameSite?: "Lax" | "Strict" | "None"; secure?: boolean } = {},
+) {
+  const parts = [`${name}=${encodeURIComponent(value)}`];
+  parts.push(`Path=${opts.path ?? "/"}`);
+  if (typeof opts.maxAgeSeconds === "number") parts.push(`Max-Age=${Math.max(0, Math.trunc(opts.maxAgeSeconds))}`);
+  parts.push(`SameSite=${opts.sameSite ?? "Lax"}`);
+  if (opts.secure) parts.push("Secure");
+  return parts.join("; ");
+}
 
-Phase 2: The "Formulator" Analysis (Data Cross-Check) ⚗️
+function getOrCreateAnonymousUserId(req: Request): { userId: string; setCookieHeader?: string } {
+  const cookies = parseCookieHeader(req.headers.get("cookie"));
+  const existing = typeof cookies[USER_ID_COOKIE_NAME] === "string" ? cookies[USER_ID_COOKIE_NAME].trim() : "";
+  if (existing) return { userId: existing.slice(0, 128) };
 
-Look at the Context Data. For each candidate product:
+  const userId = randomUUID();
+  const setCookieHeader = serializeCookie(USER_ID_COOKIE_NAME, userId, {
+    path: "/",
+    maxAgeSeconds: USER_ID_COOKIE_MAX_AGE_SECONDS,
+    sameSite: "Lax",
+    secure: process.env.NODE_ENV === "production",
+  });
+  return { userId, setCookieHeader };
+}
 
-Step A: Check Expert Notes:
-Read expert_knowledge.chemist_notes, expert_knowledge.sensitivity_flags, expert_knowledge.key_actives.
-Treat these as expert hypotheses—not absolute truth.
+function withSetCookie(response: Response, setCookieHeader?: string) {
+  if (!setCookieHeader) return response;
+  response.headers.append("Set-Cookie", setCookieHeader);
+  return response;
+}
 
-Step B: Verify via Science:
-Does the ingredient list mechanistically support the expert note and the intended MoA?
+function isSkinProfileComplete(profile: UserProfile | null) {
+  if (!profile) return false;
+  const hasSkinType = typeof profile.skinType === "string" && profile.skinType.trim().length > 0;
+  const hasBarrier = typeof profile.barrierStatus === "string" && profile.barrierStatus.trim().length > 0;
+  const hasGoals = Array.isArray(profile.concerns) && profile.concerns.length > 0;
+  return hasSkinType && hasBarrier && hasGoals;
+}
 
-Example contradictions you must call out:
-- “The expert note claims ‘soothing’, but I see Alcohol Denat high in the INCI + fragrance/EO flags. This conflicts with common sensitive-skin guidance.”
-- “The expert note claims ‘barrier repair’, but the formula lacks meaningful barrier lipids (ceramides/cholesterol/free fatty acids) or occlusives/emollients consistent with that claim.”
+type SessionSkinProfile = { skinType: string | null; barrierStatus: string | null; concerns: string[] };
 
-Step C: Region Check:
-Check availability. If the user is in CN, prioritize products available in CN/Global. If two options are similar, prefer the one available in the user's region and with clearer safety signals.
+function inferSessionSkinTypeFromText(text: string): SessionSkinProfile["skinType"] {
+  const q = text.toLowerCase();
+  if (q.includes("combination") || q.includes("combo") || text.includes("混合")) return "Combo";
+  if (q.includes("oily") || text.includes("油皮") || text.includes("油性") || text.includes("油痘")) return "Oily";
+  if (q.includes("dry") || text.includes("干皮") || text.includes("干性") || text.includes("极干")) return "Dry";
+  if (q.includes("normal") || text.includes("中性") || text.includes("正常肤质")) return "Normal";
+  return null;
+}
 
-Step D: Interaction & Routine Fit:
-Check conflicts with what the user already uses (retinoids, acids, benzoyl peroxide, copper peptides, strong L-ascorbic acid, etc.). Optimize for adherence and irritation-minimization.
+function inferSessionBarrierStatusFromText(text: string): SessionSkinProfile["barrierStatus"] {
+  if (detectBarrierHealthyMention(text)) return "Healthy";
+  if (detectBarrierImpaired(text) || detectSensitiveSkin(text)) return "Impaired";
 
-Phase 3: The "Evidence-Based" Recommendation 📝
+  const q = text.toLowerCase();
+  if (
+    q.includes("barrier stable") ||
+    q.includes("tolerant") ||
+    q.includes("not sensitive") ||
+    text.includes("屏障稳定") ||
+    text.includes("屏障健康") ||
+    text.includes("耐受") ||
+    text.includes("不敏感") ||
+    text.includes("不刺痛") ||
+    text.includes("不泛红")
+  ) {
+    return "Healthy";
+  }
 
-Generate the response using this hierarchy of evidence (highest to lowest):
+  return null;
+}
 
-Mechanism: Explain HOW the key ingredient(s) work biologically (e.g., “Salicylic acid is lipophilic, allowing it to penetrate the sebaceous follicle and reduce comedonal plugs…”).
+function inferSessionConcernsFromText(text: string): SessionSkinProfile["concerns"] {
+  const out = new Set<string>();
+  const q = text.toLowerCase();
 
-Consensus: Is this a standard approach in dermatology? (e.g., “First-line strategy for comedonal acne is keratolysis + retinoid/comedolytic support, titrated to tolerance.”)
+  if (detectClosedComedonesOrRoughTexture(text) || q.includes("acne") || q.includes("comed") || text.includes("痘") || text.includes("粉刺")) {
+    out.add("Acne");
+  }
+  if (
+    q.includes("brighten") ||
+    q.includes("whiten") ||
+    q.includes("dark spot") ||
+    q.includes("hyperpig") ||
+    text.includes("美白") ||
+    text.includes("提亮") ||
+    text.includes("淡斑") ||
+    text.includes("暗沉") ||
+    text.includes("痘印")
+  ) {
+    out.add("Dark Spots");
+  }
+  if (q.includes("anti-aging") || q.includes("aging") || q.includes("wrinkle") || text.includes("抗老") || text.includes("细纹") || text.includes("皱纹")) {
+    out.add("Aging");
+  }
+  if (detectSensitiveSkin(text) || detectBarrierImpaired(text) || text.includes("泛红") || text.includes("红血丝")) {
+    out.add("Redness");
+  }
+  if (q.includes("hydration") || q.includes("moistur") || text.includes("补水") || text.includes("保湿") || text.includes("干燥")) {
+    out.add("Hydration");
+  }
 
-Social Validation: Use social_stats only as supportive/secondary signal. Example: “Users on RED report reduced redness, which aligns with the presence of bisabolol/panthenol…” Do not treat anecdotes as proof.
+  return Array.from(out);
+}
 
-If evidence is weak or mixed, say so explicitly and propose a safer alternative or a test protocol.
+function inferSessionSkinProfileFromText(text: string): SessionSkinProfile {
+  return {
+    skinType: inferSessionSkinTypeFromText(text),
+    barrierStatus: inferSessionBarrierStatusFromText(text),
+    concerns: inferSessionConcernsFromText(text),
+  };
+}
 
-SAFETY PROTOCOL (Strict):
+function isSessionSkinProfileComplete(profile: SessionSkinProfile) {
+  return Boolean(profile.skinType) && Boolean(profile.barrierStatus) && profile.concerns.length > 0;
+}
 
-Barrier Check:
-If User Barrier == "Impaired" AND the product contains [High Alcohol, Strong Acid, Pure Retinol], VETO it immediately and explain why.
+function buildPhase0ClarificationQuestions(input: { missing: { skinType: boolean; barrierStatus: boolean; concerns: boolean } }) {
+  const questions: ClarificationQuestion[] = [];
+  if (input.missing.skinType) {
+    questions.push({
+      id: "skin_type",
+      question: "Is your skin currently oily, dry, or mixed?",
+      options: ["Oily", "Dry", "Combo/Mixed", "Not sure"],
+    });
+  }
+  if (input.missing.barrierStatus) {
+    questions.push({
+      id: "barrier_status",
+      question: "Is your barrier stable, or do you have stinging/redness?",
+      options: ["Stable", "Stinging/Red", "Not sure"],
+    });
+  }
+  if (input.missing.concerns) {
+    questions.push({
+      id: "goals",
+      question: "What is your main goal with this product?",
+      options: ["Acne/Texture", "Dark spots/Brightening", "Aging", "Redness/Barrier repair", "Hydration"],
+    });
+  }
 
-Irritation Check:
-If sensitivity_flags include fragrance/essential oils OR the ingredient list contains multiple known irritants, downgrade confidence and recommend patch testing or an alternative.
+  return questions.slice(0, 3);
+}
 
-Conflict Check:
-Do not mix “Copper Peptides” with “Direct Acids” or “Pure Vitamin C (L-Ascorbic Acid)” in the same routine window. If the user insists, separate by time (AM/PM) or different days.
+function buildUserHistoryContext(input: {
+  userId: string;
+  profile: UserProfile | null;
+  recentLogs: SkinLog[];
+  sessionProfile?: SessionSkinProfile;
+  dbError?: string | null;
+}) {
+  const payload = {
+    user_id: input.userId,
+    skin_profile: input.profile
+      ? {
+          skinType: input.profile.skinType,
+          concerns: input.profile.concerns,
+          barrierStatus: input.profile.barrierStatus,
+          budgetTier: input.profile.budgetTier,
+          currentRoutine: input.profile.currentRoutine,
+          updatedAt: input.profile.updatedAt,
+        }
+      : null,
+    ...(input.sessionProfile ? { skin_profile_session: input.sessionProfile } : {}),
+    skin_logs_last_7d: input.recentLogs.map((l) => ({
+      date: l.date,
+      rednessLevel: l.rednessLevel,
+      acneCount: l.acneCount,
+      hydration: l.hydration,
+      targetProduct: l.targetProduct,
+      sensation: l.sensation,
+      notes: l.notes,
+    })),
+    ...(input.dbError ? { db_error: input.dbError } : {}),
+  };
 
-Escalation Rule:
-If the user describes severe dermatitis, infection signs, or systemic symptoms, recommend seeing a dermatologist/clinician (no diagnosis claims).
+  return [
+    "## User History Context (Memory + Tracker)",
+    "The JSON below is persisted user history (ground truth). If skin_profile is missing/incomplete, you MUST stay in Phase 0 and ask only for the missing items before recommending products.",
+    "```json",
+    JSON.stringify(payload, null, 2),
+    "```",
+  ].join("\n");
+}
 
-RESPONSE TEMPLATE (Markdown):
+function detectBarrierHealthyMention(query: string) {
+  const q = query.toLowerCase();
+  return (
+    q.includes("healthy barrier") ||
+    q.includes("strong barrier") ||
+    q.includes("stable barrier") ||
+    q.includes("barrier is healthy") ||
+    q.includes("barrier is strong") ||
+    q.includes("no stinging") ||
+    q.includes("no burning") ||
+    q.includes("not stinging") ||
+    q.includes("not burning") ||
+    query.includes("屏障稳定") ||
+    query.includes("屏障健康") ||
+    query.includes("屏障没问题") ||
+    query.includes("屏障很好") ||
+    query.includes("没有刺痛") ||
+    query.includes("不刺痛") ||
+    query.includes("不疼") ||
+    query.includes("不痛")
+  );
+}
 
-🔬 Scientific Analysis
-(Briefly explain the biological target and bottleneck. e.g., “To treat your closed comedones, we need to normalize keratinization and clear follicular plugs while protecting your barrier.”)
+function skinTypeToLabel(skin: SkinType) {
+  switch (skin) {
+    case "oily":
+      return "Oily";
+    case "dry":
+      return "Dry";
+    case "combination":
+      return "Combination";
+    case "sensitive":
+      return "Sensitive";
+    case "normal":
+    default:
+      return "Normal";
+  }
+}
 
-📋 Recommended Routine (Evidence-Graded)
-(Grade: High / Moderate / Low based on mechanism + consensus + fit)
+function inferConcernLabelsFromQuery(query: string): string[] {
+  const q = query.toLowerCase();
+  const labels = new Set<string>();
 
-🌞 AM: Protection & Antioxidants
+  if (
+    detectOilyAcne(query) ||
+    q.includes("acne") ||
+    q.includes("comed") ||
+    query.includes("痘") ||
+    query.includes("粉刺") ||
+    query.includes("闭口") ||
+    query.includes("黑头")
+  ) {
+    labels.add("Acne");
+  }
 
-Step 1: [Product Name]
-Mechanism: Contains [Key Ingredient] to [Function].
-Expert Note: “[Quote chemist_notes if available]”
-Evidence Grade: [High/Moderate/Low]
-Verdict: ✅ Safe for your barrier / ⚠️ Caution / ❌ Veto (and why)
+  if (
+    q.includes("dark spot") ||
+    q.includes("dark spots") ||
+    q.includes("hyperpig") ||
+    q.includes("brighten") ||
+    query.includes("淡斑") ||
+    query.includes("美白") ||
+    query.includes("提亮") ||
+    query.includes("暗沉") ||
+    query.includes("痘印")
+  ) {
+    labels.add("Brightening");
+  }
 
-(Repeat steps as needed; keep it minimal and realistic.)
+  if (
+    q.includes("anti-aging") ||
+    q.includes("anti aging") ||
+    q.includes("aging") ||
+    query.includes("抗老") ||
+    query.includes("皱纹") ||
+    query.includes("细纹")
+  ) {
+    labels.add("Anti-aging");
+  }
 
-🌙 PM: Targeted Treatment
+  if (detectSensitiveSkin(query) || query.includes("敏感") || query.includes("泛红")) {
+    labels.add("Sensitivity");
+  }
 
-Step 1: [Product Name]
-Science: [Ingredient] targets [Pathology].
-Trade-off: “[Texture/irritation note]” (Honesty is key.)
-Evidence Grade: [High/Moderate/Low]
-Verdict: ✅ / ⚠️ / ❌
+  if (q.includes("barrier") || query.includes("屏障") || query.includes("修护")) {
+    labels.add("Barrier");
+  }
 
-⚠️ Contraindications
-(Specific warnings based on the selected products and the user’s routine: conflicts, over-exfoliation risk, pregnancy/breastfeeding caution if relevant, patch test protocol, titration schedule.) """`;
+  return Array.from(labels);
+}
 
 function looksLikeUuid(value: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -142,6 +391,8 @@ function buildAuroraStructuredSystemPrompt(input: {
   regionLabel: string;
   contextDataJson: string;
   mode: "routine" | "product";
+  userHistoryContext?: string;
+  phase0Enforcement?: string;
 }) {
   const region = input.regionLabel?.trim() ? input.regionLabel.trim() : "Global";
   const injectedContext = [
@@ -150,7 +401,9 @@ function buildAuroraStructuredSystemPrompt(input: {
     input.contextDataJson,
     "```",
   ].join("\n");
-  return SYSTEM_PROMPT.replaceAll("{{CONTEXT_DATA_JSON}}", injectedContext).replaceAll("{{REGION}}", region).trim();
+
+  const base = SYSTEM_PROMPT.replaceAll("{{CONTEXT_DATA_JSON}}", injectedContext).replaceAll("{{REGION}}", region).trim();
+  return [base, input.userHistoryContext, input.phase0Enforcement].filter(Boolean).join("\n\n").trim();
 }
 
 function extractTextFromUnknownMessage(message: unknown): string {
@@ -2166,6 +2419,108 @@ export async function POST(req: Request) {
   const requestedModel = typeof body.llm_model === "string" && body.llm_model.trim() ? body.llm_model.trim() : undefined;
   const wantsStream = Boolean(body.stream);
 
+  const { userId, setCookieHeader } = getOrCreateAnonymousUserId(req);
+
+  const jsonResponse = (data: unknown, init?: Parameters<typeof NextResponse.json>[1]) =>
+    withSetCookie(NextResponse.json(data, init), setCookieHeader);
+  const streamResponse = (text: string, opts?: Parameters<typeof streamTextResponse>[1]) =>
+    withSetCookie(streamTextResponse(text, opts), setCookieHeader);
+
+  let userProfile: UserProfile | null = null;
+  let recentSkinLogs: SkinLog[] = [];
+  let userHistoryDbError: string | null = null;
+  const sessionProfile = inferSessionSkinProfileFromText(contextualQuery);
+
+  try {
+    userProfile = await prisma.userProfile.upsert({
+      where: { userId },
+      update: {},
+      create: { userId, concerns: [] },
+    });
+
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    recentSkinLogs = await prisma.skinLog.findMany({
+      where: { profileId: userProfile.id, date: { gte: sevenDaysAgo } },
+      orderBy: { date: "desc" },
+      take: 50,
+    });
+
+    const profileUpdates: Prisma.UserProfileUpdateInput = {};
+    if (!userProfile.skinType && sessionProfile.skinType) profileUpdates.skinType = sessionProfile.skinType;
+    if (!userProfile.barrierStatus && sessionProfile.barrierStatus) profileUpdates.barrierStatus = sessionProfile.barrierStatus;
+    if ((userProfile.concerns?.length ?? 0) === 0 && sessionProfile.concerns.length) {
+      profileUpdates.concerns = { set: sessionProfile.concerns.slice(0, 8) };
+    }
+
+    if (Object.keys(profileUpdates).length) {
+      userProfile = await prisma.userProfile.update({ where: { id: userProfile.id }, data: profileUpdates });
+    }
+  } catch (e) {
+    userHistoryDbError = e instanceof Error ? e.message : "Failed to load user history";
+  }
+
+  const skinProfileComplete = isSkinProfileComplete(userProfile) || isSessionSkinProfileComplete(sessionProfile);
+  const userHistoryContext = buildUserHistoryContext({
+    userId,
+    profile: userProfile,
+    recentLogs: recentSkinLogs,
+    sessionProfile,
+    dbError: userHistoryDbError,
+  });
+
+  const phase0Enforcement = skinProfileComplete
+    ? undefined
+    : [
+        "## Phase 0 Enforcement (Server)",
+        "skin_profile is missing or incomplete for this user.",
+        "You MUST ask for: Skin Type, Barrier Status (stinging/redness?), and main goal(s) BEFORE any product recommendations.",
+        "No routines. No product substitutions. No purchase links.",
+      ].join("\n");
+
+  const buildSystemPrompt = (contextDataJson: string, mode: "routine" | "product") =>
+    buildAuroraStructuredSystemPrompt({ regionLabel, contextDataJson, mode, userHistoryContext, phase0Enforcement });
+
+  const wantsProductHelp =
+    routineIntent ||
+    dupeIntent ||
+    evalIntent ||
+    wantsShortlist ||
+    wantsShortlistNoAnchor ||
+    detectProductShortlistIntent(query) ||
+    similarEfficacyIntent ||
+    /\b(am|pm)\b/i.test(query) ||
+    query.toLowerCase().includes("skincare plan");
+
+  if (!wantsScienceOnly && wantsProductHelp && !skinProfileComplete) {
+    const missing = {
+      skinType: !userProfile?.skinType && !sessionProfile.skinType,
+      barrierStatus: !userProfile?.barrierStatus && !sessionProfile.barrierStatus,
+      concerns: (userProfile?.concerns?.length ?? 0) === 0 && sessionProfile.concerns.length === 0,
+    };
+
+    const questions = buildPhase0ClarificationQuestions({ missing });
+    const lines: string[] = [];
+    lines.push("Before I can recommend products safely, I need a quick skin profile:");
+    for (const [idx, q] of questions.entries()) {
+      lines.push(`${idx + 1}) ${q.question} (${q.options.join(" / ")})`);
+    }
+    lines.push("Reply with the options (short is fine), and I’ll continue.");
+    const answer = lines.join("\n");
+
+    if (wantsStream) return streamResponse(answer);
+    return jsonResponse({
+      query,
+      intent: "clarify",
+      answer,
+      clarification: {
+        questions,
+        missing_fields: Object.entries(missing)
+          .filter(([, v]) => v)
+          .map(([k]) => k),
+      },
+    });
+  }
+
   if (wantsScienceOnly) {
     const external_verification = await maybeGetExternalVerification({ query, enabled: true });
 
@@ -2180,11 +2535,7 @@ export async function POST(req: Request) {
       note: "Science-only question detected; no anchor product identified.",
     };
 
-    const systemPrompt = buildAuroraStructuredSystemPrompt({
-      regionLabel,
-      contextDataJson: JSON.stringify(scienceContextData),
-      mode: "product",
-    });
+    const systemPrompt = buildSystemPrompt(JSON.stringify(scienceContextData), "product");
 
     const fallbackAnswer = buildFallbackScienceAnswer({ query, regionLabel, external_verification });
 
@@ -2220,9 +2571,9 @@ export async function POST(req: Request) {
       answer = fallbackAnswer;
     }
 
-    if (wantsStream) return streamTextResponse(answer);
+    if (wantsStream) return streamResponse(answer);
 
-    return NextResponse.json({
+    return jsonResponse({
       query,
       llm_provider: provider,
       llm_model:
@@ -2416,11 +2767,7 @@ export async function POST(req: Request) {
       candidates,
     };
 
-    const systemPrompt = buildAuroraStructuredSystemPrompt({
-      regionLabel,
-      contextDataJson: JSON.stringify(shortlistContextData),
-      mode: "product",
-    });
+    const systemPrompt = buildSystemPrompt(JSON.stringify(shortlistContextData), "product");
 
     const fallbackAnswer = buildFallbackShortlistAnswer({
       query,
@@ -2684,12 +3031,7 @@ export async function POST(req: Request) {
       },
     };
 
-    const systemPrompt = buildAuroraStructuredSystemPrompt({
-      regionLabel,
-      // Keep the JSON compact to preserve model output budget (Gemini has a total context window).
-      contextDataJson: JSON.stringify(routineContextData),
-      mode: "routine",
-    });
+    const systemPrompt = buildSystemPrompt(JSON.stringify(routineContextData), "routine");
 
     const fallbackAnswer = buildFallbackRoutineAnswer({
       query,
@@ -2836,11 +3178,7 @@ export async function POST(req: Request) {
       candidates: [],
     };
 
-    const systemPrompt = buildAuroraStructuredSystemPrompt({
-      regionLabel,
-      contextDataJson: JSON.stringify(kbOnlyContext),
-      mode: "product",
-    });
+    const systemPrompt = buildSystemPrompt(JSON.stringify(kbOnlyContext), "product");
 
     const fallbackAnswerParts: string[] = [];
     fallbackAnswerParts.push(
@@ -3078,11 +3416,7 @@ export async function POST(req: Request) {
     }),
   };
 
-  const systemPrompt = buildAuroraStructuredSystemPrompt({
-    regionLabel,
-    contextDataJson: JSON.stringify(productContextData),
-    mode: "product",
-  });
+  const systemPrompt = buildSystemPrompt(JSON.stringify(productContextData), "product");
 
 	  const fallbackAnswer = buildFallbackProductAnswer({
 	    query,
