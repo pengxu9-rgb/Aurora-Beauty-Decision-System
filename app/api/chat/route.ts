@@ -1259,7 +1259,7 @@ async function geminiGenerateContent(input: {
 
   const body = {
     contents: [{ role: "user", parts: [{ text: combinedPrompt }] }],
-    generationConfig: { temperature, maxOutputTokens: 1536 },
+    generationConfig: { temperature, maxOutputTokens: 2048 },
   };
 
   const res = await fetch(url, {
@@ -1943,9 +1943,9 @@ function isBadAnswer(answer: string, mode: "routine" | "product") {
   if (mode === "routine") {
     // Accept both EN + CN section markers to avoid false fallbacks when Gemini answers in Chinese.
     const hasAm =
-      /(^|\n)\s*(?:🌞|☀️?|🌤️?|🌅|AM\b|Morning\b|早上|早间|上午|白天|日间)/i.test(trimmed) || /\bAM\b/i.test(trimmed);
+      /(^|\n)\s*(?:🌞|☀️?|🌤️?|🌅|AM\b|Morning\b|早上|早间|上午|白天|日间|早[:：])/i.test(trimmed) || /\bAM\b/i.test(trimmed);
     const hasPm =
-      /(^|\n)\s*(?:🌙|🌛|🌜|🌃|PM\b|Night\b|晚上|夜间|夜晚|睡前)/i.test(trimmed) || /\bPM\b/i.test(trimmed);
+      /(^|\n)\s*(?:🌙|🌛|🌜|🌃|PM\b|Night\b|晚上|夜间|夜晚|睡前|晚[:：])/i.test(trimmed) || /\bPM\b/i.test(trimmed);
 
     // Also allow "Phase 0" clarification-style outputs (Diagnosis first) without forcing AM/PM.
     const looksLikeClarification =
