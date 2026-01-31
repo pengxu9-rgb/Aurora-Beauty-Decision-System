@@ -2175,6 +2175,7 @@ export async function POST(req: Request) {
         routine_primary,
         routine_budget,
         over_budget,
+        ...(external_verification ? { external_verification } : {}),
       },
     });
   }
@@ -2574,6 +2575,7 @@ export async function POST(req: Request) {
     intent: "product",
     context: {
       detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired, region_preference: detectedRegion },
+      ...(external_verification ? { external_verification } : {}),
       anchor: {
         id: anchor.id,
         brand: anchor.brand,
