@@ -1,5 +1,8 @@
 "use client";
 
+import type { SkinIdentitySnapshot } from "@/actions/userProfile";
+import { getSkinIdentitySnapshot, setUserConcerns } from "@/actions/userProfile";
+import { SkinIdentityCard } from "@/components/chat/SkinIdentityCard";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
@@ -41,6 +44,56 @@ function toApiMessages(messages: ChatMessage[]) {
   return messages.map((m) => ({ role: m.role, content: m.content }));
 }
 
+const UID_KEY = "aurora_uid";
+const COOKIE_NAME = "aurora_uid";
+const ONE_YEAR_SECONDS = 60 * 60 * 24 * 365;
+
+function readCookie(name: string) {
+  if (typeof document === "undefined") return null;
+  const parts = document.cookie.split(";").map((p) => p.trim());
+  for (const part of parts) {
+    if (!part) continue;
+    const idx = part.indexOf("=");
+    if (idx <= 0) continue;
+    const k = part.slice(0, idx).trim();
+    if (k !== name) continue;
+    return decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return null;
+}
+
+function getOrCreateAuroraUid() {
+  if (typeof window === "undefined") return null;
+
+  const fromCookie = readCookie(COOKIE_NAME);
+  if (fromCookie && fromCookie.trim()) {
+    window.localStorage.setItem(UID_KEY, fromCookie.trim());
+    return fromCookie.trim();
+  }
+
+  const existing = window.localStorage.getItem(UID_KEY);
+  if (existing && existing.trim()) return existing.trim();
+
+  const cryptoObj = globalThis.crypto as Crypto | undefined;
+  const uid = (cryptoObj?.randomUUID?.() ?? `uid_${Date.now()}_${Math.random().toString(16).slice(2)}`).slice(0, 64);
+  window.localStorage.setItem(UID_KEY, uid);
+  return uid;
+}
+
+function setAuroraUidCookie(uid: string) {
+  if (typeof document === "undefined") return;
+  const secure = typeof window !== "undefined" && window.location.protocol === "https:";
+  document.cookie = [
+    `${COOKIE_NAME}=${encodeURIComponent(uid)}`,
+    "Path=/",
+    `Max-Age=${ONE_YEAR_SECONDS}`,
+    "SameSite=Lax",
+    secure ? "Secure" : null,
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
+
 export function AuroraChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
     {
@@ -56,6 +109,12 @@ export function AuroraChatPage() {
   const [sendError, setSendError] = useState<string | null>(null);
 
   const listRef = useRef<HTMLDivElement | null>(null);
+  const selfieInputRef = useRef<HTMLInputElement | null>(null);
+
+  const [userId, setUserId] = useState<string | null>(null);
+  const [skinIdentity, setSkinIdentity] = useState<SkinIdentitySnapshot | null>(null);
+  const [isIdentityLoading, setIsIdentityLoading] = useState(false);
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
 
   const lastMessageId = useMemo(() => messages[messages.length - 1]?.id ?? null, [messages]);
 
@@ -63,6 +122,34 @@ export function AuroraChatPage() {
     if (!listRef.current) return;
     listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [lastMessageId]);
+
+  const refreshIdentity = useCallback(async (uid: string) => {
+    setIsIdentityLoading(true);
+    setSendError(null);
+    try {
+      const snapshot = await getSkinIdentitySnapshot(uid);
+      setSkinIdentity(snapshot);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to load profile";
+      setSendError(msg);
+    } finally {
+      setIsIdentityLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const uid = getOrCreateAuroraUid();
+    if (!uid) return;
+    setAuroraUidCookie(uid);
+    setUserId(uid);
+    void refreshIdentity(uid);
+  }, [refreshIdentity]);
+
+  useEffect(() => {
+    return () => {
+      if (avatarUrl) URL.revokeObjectURL(avatarUrl);
+    };
+  }, [avatarUrl]);
 
   const pushMessage = useCallback((message: ChatMessage) => {
     setMessages((prev) => [...prev, message]);
@@ -109,6 +196,8 @@ export function AuroraChatPage() {
 
         const questions = Array.isArray(data.clarification?.questions) ? data.clarification?.questions : null;
         setPendingQuestionSet(questions?.length ? questions : null);
+
+        if (userId) void refreshIdentity(userId);
       } catch (e) {
         const err = e instanceof Error ? e.message : "Failed to reach /api/chat";
         setSendError(err);
@@ -117,7 +206,7 @@ export function AuroraChatPage() {
         setIsSending(false);
       }
     },
-    [isSending, messages, pushMessage],
+    [isSending, messages, pushMessage, refreshIdentity, userId],
   );
 
   const onSubmit = useCallback(
@@ -138,6 +227,52 @@ export function AuroraChatPage() {
     [],
   );
 
+  const handleConfirmProfile = useCallback(async () => {
+    if (!userId) return;
+    await refreshIdentity(userId);
+    pushMessage({
+      id: makeId("a"),
+      role: "assistant",
+      content:
+        "Profile confirmed. Next: paste a product name/link for a safety+fit check, or tell me your main goal (acne / redness / dark spots / anti‑aging).",
+    });
+  }, [pushMessage, refreshIdentity, userId]);
+
+  const handleUploadSelfie = useCallback(() => {
+    selfieInputRef.current?.click();
+  }, []);
+
+  const handleSelfiePicked = useCallback(
+    (file: File | null) => {
+      if (!file) return;
+      if (avatarUrl) URL.revokeObjectURL(avatarUrl);
+      const url = URL.createObjectURL(file);
+      setAvatarUrl(url);
+      pushMessage({
+        id: makeId("a"),
+        role: "assistant",
+        content:
+          "Selfie selected (preview). CV-based analysis is coming next — for now, please answer the quick profile questions so I can stay safe and consistent.",
+      });
+    },
+    [avatarUrl, pushMessage],
+  );
+
+  const handleConcernsChange = useCallback(
+    async (next: string[]) => {
+      if (!userId) return;
+      setSkinIdentity((prev) => (prev ? { ...prev, concerns: next } : prev));
+      try {
+        const updated = await setUserConcerns(userId, next);
+        setSkinIdentity(updated);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Failed to update concerns";
+        setSendError(msg);
+      }
+    },
+    [userId],
+  );
+
   return (
     <main className="min-h-screen bg-gradient-to-b from-white via-slate-50 to-slate-100">
       <div className="mx-auto w-full max-w-sm">
@@ -153,6 +288,7 @@ export function AuroraChatPage() {
             <button
               type="button"
               onClick={() => {
+                if (avatarUrl) URL.revokeObjectURL(avatarUrl);
                 setMessages([
                   {
                     id: makeId("a"),
@@ -164,6 +300,8 @@ export function AuroraChatPage() {
                 setPendingQuestionSet(null);
                 setSendError(null);
                 setInput("");
+                setAvatarUrl(null);
+                if (userId) void refreshIdentity(userId);
               }}
               className="text-xs font-semibold text-slate-600 hover:text-slate-900"
             >
@@ -177,6 +315,33 @@ export function AuroraChatPage() {
           className="px-4 pb-28 overflow-y-auto"
           style={{ maxHeight: "calc(100vh - 56px)" }}
         >
+          <input
+            ref={selfieInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => handleSelfiePicked(e.target.files?.[0] ?? null)}
+          />
+
+          {skinIdentity ? (
+            <div className="mb-3">
+              <SkinIdentityCard
+                name="You"
+                avatarUrl={avatarUrl}
+                status={skinIdentity.status}
+                resilienceScore={skinIdentity.resilienceScore}
+                hydration={skinIdentity.hydration}
+                sebum={skinIdentity.sebum}
+                sensitivity={skinIdentity.sensitivity}
+                concerns={skinIdentity.concerns}
+                onConcernsChange={handleConcernsChange}
+                onConfirmProfile={handleConfirmProfile}
+                onUploadSelfie={handleUploadSelfie}
+              />
+              {isIdentityLoading ? <div className="mt-2 text-[11px] text-slate-500">Updating profile…</div> : null}
+            </div>
+          ) : null}
+
           <div className="space-y-3">
             {messages.map((m) => (
               <div
