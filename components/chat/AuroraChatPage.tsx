@@ -2,7 +2,11 @@
 
 import type { SkinIdentitySnapshot } from "@/actions/userProfile";
 import { getSkinIdentitySnapshot, setUserConcerns } from "@/actions/userProfile";
+import { ActionChips, type NextActionChip } from "@/components/chat/ActionChips";
+import { BudgetCard, type BudgetContext } from "@/components/chat/BudgetCard";
+import { RoutineTimeline, type RoutineRec } from "@/components/chat/RoutineTimeline";
 import { SkinIdentityCard } from "@/components/chat/SkinIdentityCard";
+import { cn } from "@/lib/cn";
 import { ChevronDown, ChevronUp, Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -25,16 +29,15 @@ type ChatApiResponse = {
   query?: string;
   intent?: string;
   answer?: string;
+  current_state?: string;
+  next_actions?: NextActionChip[];
+  context?: Record<string, unknown>;
   clarification?: {
     questions?: ClarificationQuestion[];
     missing_fields?: string[];
   };
   error?: string;
 };
-
-function cx(...parts: Array<string | false | null | undefined>) {
-  return parts.filter(Boolean).join(" ");
-}
 
 function makeId(prefix: string) {
   const cryptoObj = globalThis.crypto as Crypto | undefined;
@@ -108,6 +111,9 @@ export function AuroraChatPage() {
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+
+  const [nextActions, setNextActions] = useState<NextActionChip[]>([]);
+  const [lastContext, setLastContext] = useState<Record<string, unknown> | null>(null);
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const selfieInputRef = useRef<HTMLInputElement | null>(null);
@@ -192,6 +198,7 @@ export function AuroraChatPage() {
       setIsSending(true);
       setSendError(null);
       setPendingQuestionSet(null);
+      setNextActions([]);
       // Reset "analysis progress" override for this request.
       setDiagnosisProgressOverride(0);
 
@@ -227,6 +234,10 @@ export function AuroraChatPage() {
 
         const questions = Array.isArray(data.clarification?.questions) ? data.clarification?.questions : null;
         setPendingQuestionSet(questions?.length ? questions : null);
+
+        const actions = Array.isArray(data.next_actions) ? data.next_actions.filter((a) => a && typeof a.label === "string") : [];
+        setNextActions(actions);
+        setLastContext(data.context && typeof data.context === "object" ? (data.context as Record<string, unknown>) : null);
 
         // If we're no longer in "clarify", treat this as a completed diagnostic pass.
         // This avoids the UI being stuck at <100% after the engine has already returned an answer.
@@ -310,6 +321,37 @@ export function AuroraChatPage() {
     [userId],
   );
 
+  const routineFromContext = useMemo(() => {
+    const ctx = lastContext;
+    if (!ctx) return null;
+    const routine = (ctx as any).routine_primary ?? (ctx as any).routine;
+    if (!routine || typeof routine !== "object") return null;
+    const am = Array.isArray((routine as any).am) ? (routine as any).am : null;
+    const pm = Array.isArray((routine as any).pm) ? (routine as any).pm : null;
+    if (!am || !pm) return null;
+    return routine as unknown as RoutineRec;
+  }, [lastContext]);
+
+  const budgetFromContext = useMemo(() => {
+    const ctx = lastContext;
+    if (!ctx || typeof ctx !== "object") return null;
+    const budget = (ctx as any).budget;
+    if (!budget || typeof budget !== "object") return null;
+    return budget as BudgetContext;
+  }, [lastContext]);
+
+  const budgetCny = useMemo(() => {
+    const ctx = lastContext;
+    const v = ctx ? (ctx as any).budget_cny : null;
+    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+  }, [lastContext]);
+
+  const budgetUsdEst = useMemo(() => {
+    const ctx = lastContext;
+    const v = ctx ? (ctx as any).budget_usd_est : null;
+    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+  }, [lastContext]);
+
   return (
     <main className="min-h-screen bg-gradient-to-b from-white via-slate-50 to-slate-100">
       <div className="mx-auto w-full max-w-sm">
@@ -360,7 +402,7 @@ export function AuroraChatPage() {
             onChange={(e) => handleSelfiePicked(e.target.files?.[0] ?? null)}
           />
 
-          {skinIdentity ? (
+          {skinIdentity && !(diagnosisProgress >= 100 && !diagnosisExpanded) ? (
             <div className="mb-3 sticky top-0 z-20 pt-2 -mt-2">
               <div className="rounded-2xl border border-slate-200 bg-white/90 backdrop-blur shadow-sm">
                 <button
@@ -435,7 +477,7 @@ export function AuroraChatPage() {
             {messages.map((m) => (
               <div
                 key={m.id}
-                className={cx(
+                className={cn(
                   "rounded-2xl border px-4 py-3 text-sm leading-relaxed shadow-sm",
                   m.role === "user"
                     ? "ml-auto max-w-[92%] border-indigo-200 bg-indigo-50 text-slate-900"
@@ -448,6 +490,9 @@ export function AuroraChatPage() {
               </div>
             ))}
           </div>
+
+          <RoutineTimeline title="Your Routine" routine={routineFromContext} />
+          <BudgetCard budgetCny={budgetCny} budgetUsdEst={budgetUsdEst} budget={budgetFromContext} />
 
           {messages.length <= 1 ? (
             <div className="mt-4 flex flex-wrap gap-2">
@@ -491,6 +536,8 @@ export function AuroraChatPage() {
             </div>
           ) : null}
 
+          <ActionChips actions={nextActions} onSelect={(a) => void sendText(a.text)} />
+
           {sendError ? (
             <div className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-800">
               {sendError}
@@ -513,7 +560,7 @@ export function AuroraChatPage() {
             <button
               type="submit"
               disabled={isSending || !input.trim()}
-              className={cx(
+              className={cn(
                 "rounded-2xl px-4 py-3 text-sm font-semibold",
                 isSending || !input.trim()
                   ? "bg-slate-100 text-slate-400 cursor-not-allowed"

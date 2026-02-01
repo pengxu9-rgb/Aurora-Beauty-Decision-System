@@ -2,6 +2,17 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  /* Clinical Luxury palette (CSS variables; can be expanded later) */
+  --aurora-bg: 240 20% 99%;
+  --aurora-card: 0 0% 100%;
+  --aurora-text: 222 47% 11%;
+  --aurora-muted: 215 20% 65%;
+  --aurora-border: 214 32% 91%;
+  --aurora-accent: 243 75% 59%;
+  --aurora-accent-2: 160 84% 39%;
+}
+
 html,
 body {
   height: 100%;
