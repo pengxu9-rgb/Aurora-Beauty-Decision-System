@@ -39,6 +39,16 @@ type NextActionChip = {
 };
 
 const USD_TO_CNY = 7.2;
+const BUDGET_TIER_THRESHOLD_MULTIPLIER = 1.2;
+
+type BudgetTier = "Low" | "Mid" | "High";
+
+function inferBudgetTierFromUsd(budgetUsd: number | null): { tier: BudgetTier | null; tier_cap_usd: number | null } {
+  if (budgetUsd == null || !Number.isFinite(budgetUsd) || budgetUsd <= 0) return { tier: null, tier_cap_usd: null };
+  if (budgetUsd < 50) return { tier: "Low", tier_cap_usd: 50 };
+  if (budgetUsd < 150) return { tier: "Mid", tier_cap_usd: 150 };
+  return { tier: "High", tier_cap_usd: 9999 };
+}
 
 // Master System Prompt v3.0 (verbatim user spec)
 const SYSTEM_PROMPT = `# Role
@@ -100,6 +110,15 @@ You must identify which **Phase** the conversation is in and stick to it. DO NOT
 4) **Expert Knowledge Usage:** When available, you MUST use \`expert_knowledge.chemist_notes\` / \`expert_knowledge.key_actives\` / \`expert_knowledge.sensitivity_flags\` to support your conclusion (quote/paraphrase).
 5) **Safety First:** If user is sensitive/barrier-impaired, be conservative. VETO high-risk picks and clearly explain the risk; recommend patch testing and slow titration.
 6) **Structure:** Always start with a brief Diagnosis (2–4 bullets). If you recommend products/routines, keep steps minimal and actionable, and explicitly state trade-offs.
+7) **Budget Negotiation Strategy (Soft-Selling):**
+   - Maintain a running total of \`CURRENT_ROUTINE_COST\` (use \`price_summary.primary\` and \`price_summary.strict_budget\` in Context Data).
+   - Determine \`USER_BUDGET_TIER\` from Context Data (\`budget.tier\` / \`budget.tier_cap_usd\`):
+     - Low: < $50/month
+     - Mid: < $150/month
+     - High: > $150/month
+   - IF \`budget.trigger_budget_optimization_protocol\` is true, TRIGGER BUDGET_OPTIMIZATION_PROTOCOL:
+     - Script (use this tone): "I noticed we're a bit over your usual range. Since [Product A] is a wash-off product, we could swap it for [Product B] to save [Amount], allowing you to invest more in what stays on your skin. Thoughts?"
+   - If any prices are unknown, say the total is incomplete and negotiate using the known subtotal only.
 
 # Context Data (RAG Retrieved; read-only)
 {{CONTEXT_DATA_JSON}}`;
@@ -3363,6 +3382,59 @@ export async function POST(req: Request) {
       region_preference: detectedRegion,
       budget_cny: budgetCny,
       budget_usd_est: budgetCny != null ? budgetCny / USD_TO_CNY : null,
+      budget: (() => {
+        const budgetUsd = budgetCny != null ? budgetCny / USD_TO_CNY : null;
+        const { tier, tier_cap_usd } = inferBudgetTierFromUsd(budgetUsd);
+        const primary = summarizeRoutinePrices(routine_primary);
+        const strictBudget = summarizeRoutinePrices(routine_budget);
+        const currentCostUsd = primary.unknown_count === 0 ? primary.known_usd : null;
+        const compareCap = tier_cap_usd != null && tier_cap_usd > 0 ? tier_cap_usd : null;
+        const overThreshold =
+          currentCostUsd != null && compareCap != null ? currentCostUsd > compareCap * BUDGET_TIER_THRESHOLD_MULTIPLIER : null;
+        const savingsUsd =
+          primary.unknown_count === 0 && strictBudget.unknown_count === 0 ? Math.max(0, primary.known_usd - strictBudget.known_usd) : null;
+
+        // Heuristic: propose swapping the first wash-off category that differs between primary and strict-budget.
+        const findSwap = () => {
+          const washOffSteps = new Set<string>(["Cleanser", "Toner", "Toner/Acid"]);
+          const byStep = (r: RoutineRec) => new Map<string, string>([...r.am, ...r.pm].map((s) => [s.step, s.sku.sku_id]));
+          const p = byStep(routine_primary);
+          const b = byStep(routine_budget);
+          for (const step of washOffSteps) {
+            const fromId = p.get(step);
+            const toId = b.get(step);
+            if (!fromId || !toId) continue;
+            if (fromId === toId) continue;
+            const fromSku = [...routine_primary.am, ...routine_primary.pm].find((s) => s.sku.sku_id === fromId)?.sku ?? null;
+            const toSku = [...routine_budget.am, ...routine_budget.pm].find((s) => s.sku.sku_id === toId)?.sku ?? null;
+            if (!fromSku || !toSku) continue;
+            const fromPrice = normalizeUsdPrice(fromSku.price);
+            const toPrice = normalizeUsdPrice(toSku.price);
+            const delta = fromPrice != null && toPrice != null ? Math.max(0, fromPrice - toPrice) : null;
+            return {
+              step,
+              from: { brand: fromSku.brand, name: fromSku.name, price_usd: fromPrice },
+              to: { brand: toSku.brand, name: toSku.name, price_usd: toPrice },
+              estimated_savings_usd: delta,
+            };
+          }
+          return null;
+        };
+
+        return {
+          tier,
+          tier_cap_usd,
+          threshold_multiplier: BUDGET_TIER_THRESHOLD_MULTIPLIER,
+          current_routine_cost_usd_known: primary.known_usd,
+          current_routine_cost_usd: currentCostUsd,
+          current_routine_cost_cny_est_known: primary.known_cny_est,
+          current_routine_cost_unknown_count: primary.unknown_count,
+          trigger_budget_optimization_protocol: Boolean(overThreshold),
+          over_tier_threshold: overThreshold,
+          estimated_savings_usd_if_strict_budget: savingsUsd,
+          suggested_swap: findSwap(),
+        };
+      })(),
       detected: {
         oily_acne: detectOilyAcne(routineProfileText),
         sensitive_skin: detectSensitiveSkin(routineProfileText),
