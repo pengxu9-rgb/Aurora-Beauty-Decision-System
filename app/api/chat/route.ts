@@ -3138,8 +3138,44 @@ export async function POST(req: Request) {
             });
 
       if (isBadAnswer(answer, "product")) {
-        llm_error = "LLM answer too short/unactionable for shortlist; used fallback.";
-        answer = fallbackAnswer;
+        // Best-effort retry: Gemini sometimes returns a partial diagnosis even though we asked for a shortlist.
+        // Retry once with a stronger "must be a list" constraint before falling back to deterministic output.
+        try {
+          const retryPrompt = [
+            userPrompt,
+            "",
+            "RETRY (STRICT):",
+            "- Your previous answer was too short or not a shortlist.",
+            "- OUTPUT MUST include 3–5 concrete products from Context Data as a numbered list.",
+            "- Each item must include: (1) why it fits (MoA), (2) one expert note, (3) one trade-off/risk note, (4) one citation (kb:...) if available.",
+            "- Do NOT ask me questions in this retry.",
+            "- Aim for >= 220 characters.",
+          ].join("\n");
+
+          answer =
+            provider === "gemini"
+              ? await geminiGenerateContent({
+                  system_prompt: systemPrompt,
+                  user_prompt: retryPrompt,
+                  model: requestedModel,
+                  temperature: 0.3,
+                })
+              : await openaiChatCompletion({
+                  model: requestedModel,
+                  temperature: 0.3,
+                  messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: retryPrompt },
+                  ],
+                });
+        } catch {
+          // ignore; we'll decide fallback below
+        }
+
+        if (isBadAnswer(answer, "product")) {
+          llm_error = "LLM answer too short/unactionable for shortlist; used fallback.";
+          answer = fallbackAnswer;
+        }
       }
     } catch (e) {
       llm_error = e instanceof Error ? e.message : "Unknown error";
