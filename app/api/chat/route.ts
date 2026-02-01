@@ -3063,8 +3063,8 @@ export async function POST(req: Request) {
               ],
             });
 
-      if (!answer.trim() || answer.trim().length < 20) {
-        llm_error = "LLM answer empty/too short for shortlist; used fallback.";
+      if (isBadAnswer(answer, "product")) {
+        llm_error = "LLM answer too short/unactionable for shortlist; used fallback.";
         answer = fallbackAnswer;
       }
     } catch (e) {
