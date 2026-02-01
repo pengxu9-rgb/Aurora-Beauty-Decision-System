@@ -2,7 +2,10 @@
 
 import { AnimatePresence, motion } from "framer-motion";
 import { Camera, User, X } from "lucide-react";
+import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useState } from "react";
+
+import { cn } from "@/lib/cn";
 
 type SkinHealthStatus = "good" | "attention";
 
@@ -27,9 +30,10 @@ export type SkinIdentityCardProps = {
   onUploadSelfie?: () => void;
 };
 
-function cx(...parts: Array<string | false | null | undefined>) {
-  return parts.filter(Boolean).join(" ");
-}
+const SkinIdentityRadar = dynamic(() => import("./SkinIdentityRadar").then((m) => m.SkinIdentityRadar), {
+  ssr: false,
+  loading: () => <div className="h-44 w-full rounded-xl border border-slate-200 bg-slate-50" />,
+});
 
 function clampPercent(value: number) {
   if (!Number.isFinite(value)) return 0;
@@ -111,7 +115,7 @@ function MetricBar({
       </div>
       <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-100">
         <div
-          className={cx("h-full rounded-full transition-colors", high ? "bg-amber-500" : barClassName)}
+          className={cn("h-full rounded-full transition-colors", high ? "bg-amber-500" : barClassName)}
           style={{ width: `${value}%` }}
           aria-hidden
         />
@@ -168,7 +172,7 @@ export function SkinIdentityCard({
       initial={{ opacity: 0, y: 14 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.35, ease: "easeOut" }}
-      className={cx(
+      className={cn(
         "w-full max-w-sm rounded-2xl border border-slate-200 bg-white/90 backdrop-blur shadow-sm",
         "border-l-4",
         statusBorderClass(status),
@@ -192,7 +196,7 @@ export function SkinIdentityCard({
               <div className="text-sm font-semibold text-slate-900">Skin Identity</div>
               <div className="mt-0.5 flex items-center gap-2">
                 <div className="text-xs text-slate-500">{name}</div>
-                <div className={cx("inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1", pill.className)}>
+                <div className={cn("inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1", pill.className)}>
                   {pill.label}
                 </div>
               </div>
@@ -206,6 +210,14 @@ export function SkinIdentityCard({
           <MetricBar metric={metrics[0]} barClassName="bg-sky-500" />
           <MetricBar metric={metrics[1]} barClassName="bg-emerald-500" />
           <MetricBar metric={metrics[2]} barClassName="bg-rose-500" />
+        </div>
+
+        <div className="mt-3 rounded-xl border border-slate-200 bg-white/70 p-3">
+          <div className="text-xs font-semibold text-slate-700">Vector Snapshot</div>
+          <div className="mt-2">
+            <SkinIdentityRadar hydration={hydration} sebum={sebum} sensitivity={sensitivity} resilienceScore={resilienceScore} />
+          </div>
+          <div className="mt-1 text-[10px] text-slate-500">Missing dimensions default to 0.</div>
         </div>
 
         <div className="mt-4">
@@ -225,7 +237,7 @@ export function SkinIdentityCard({
                   <button
                     type="button"
                     onClick={() => removeConcern(tag)}
-                    className={cx(
+                    className={cn(
                       "inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-semibold text-slate-700",
                       "hover:bg-slate-100",
                       "focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-200",
@@ -246,7 +258,7 @@ export function SkinIdentityCard({
           <button
             type="button"
             onClick={onConfirmProfile}
-            className={cx(
+            className={cn(
               "w-full rounded-xl px-4 py-2.5 text-sm font-semibold text-white",
               "bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900",
               "shadow-sm hover:shadow-md hover:brightness-110 transition",
@@ -259,7 +271,7 @@ export function SkinIdentityCard({
           <button
             type="button"
             onClick={onUploadSelfie}
-            className={cx(
+            className={cn(
               "mt-2 w-full rounded-xl border border-transparent bg-transparent px-4 py-2 text-sm font-semibold text-slate-600",
               "hover:bg-slate-50 hover:text-slate-900",
               "focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-200",
@@ -274,4 +286,3 @@ export function SkinIdentityCard({
     </motion.section>
   );
 }
-
