@@ -156,6 +156,14 @@ function isSkinProfileComplete(profile: UserProfile | null) {
 
 type SessionSkinProfile = { skinType: string | null; barrierStatus: string | null; concerns: string[] };
 
+type UserLanguage = "en" | "zh";
+
+function detectUserLanguage(text: string): UserLanguage {
+  // Prefer the user's input language over browser locale.
+  // If any CJK characters are present, treat it as Chinese; otherwise default to English.
+  return /[\u4e00-\u9fff]/.test(text) ? "zh" : "en";
+}
+
 function inferSessionSkinTypeFromText(text: string): SessionSkinProfile["skinType"] {
   const q = text.toLowerCase();
   if (q.includes("combination") || q.includes("combo") || text.includes("混合")) return "Combo";
@@ -232,27 +240,36 @@ function isSessionSkinProfileComplete(profile: SessionSkinProfile) {
   return Boolean(profile.skinType) && Boolean(profile.barrierStatus) && profile.concerns.length > 0;
 }
 
-function buildPhase0ClarificationQuestions(input: { missing: { skinType: boolean; barrierStatus: boolean; concerns: boolean } }) {
+function buildPhase0ClarificationQuestions(
+  input: { missing: { skinType: boolean; barrierStatus: boolean; concerns: boolean } },
+  lang: UserLanguage,
+) {
   const questions: ClarificationQuestion[] = [];
   if (input.missing.skinType) {
     questions.push({
       id: "skin_type",
-      question: "Is your skin currently oily, dry, or mixed?",
-      options: ["Oily", "Dry", "Combo/Mixed", "Not sure"],
+      question: lang === "zh" ? "你现在更偏：油皮 / 干皮 / 混合皮？" : "Is your skin currently oily, dry, or mixed?",
+      options: lang === "zh" ? ["油皮", "干皮", "混合/中性", "不确定"] : ["Oily", "Dry", "Combo/Mixed", "Not sure"],
     });
   }
   if (input.missing.barrierStatus) {
     questions.push({
       id: "barrier_status",
-      question: "Is your barrier stable, or do you have stinging/redness?",
-      options: ["Stable", "Stinging/Red", "Not sure"],
+      question:
+        lang === "zh"
+          ? "你的屏障/耐受如何：稳定，还是会刺痛/泛红？"
+          : "Is your barrier stable, or do you have stinging/redness?",
+      options: lang === "zh" ? ["稳定", "刺痛/泛红", "不确定"] : ["Stable", "Stinging/Red", "Not sure"],
     });
   }
   if (input.missing.concerns) {
     questions.push({
       id: "goals",
-      question: "What is your main goal with this product?",
-      options: ["Acne/Texture", "Dark spots/Brightening", "Aging", "Redness/Barrier repair", "Hydration"],
+      question: lang === "zh" ? "你这次最想优先解决的目标是？" : "What is your main goal with this product?",
+      options:
+        lang === "zh"
+          ? ["痘痘/闭口/粗糙", "提亮/淡斑", "抗老/细纹", "泛红/修护屏障", "补水保湿"]
+          : ["Acne/Texture", "Dark spots/Brightening", "Aging", "Redness/Barrier repair", "Hydration"],
     });
   }
 
@@ -333,6 +350,7 @@ function buildAuroraStructuredSystemPrompt(input: {
   mode: "routine" | "product";
   userHistoryContext?: string;
   phase0Enforcement?: string;
+  language?: UserLanguage;
 }) {
   const region = input.regionLabel?.trim() ? input.regionLabel.trim() : "Global";
   const injectedContext = [
@@ -344,22 +362,32 @@ function buildAuroraStructuredSystemPrompt(input: {
 
   const base = SYSTEM_PROMPT.replaceAll("{{CONTEXT_DATA_JSON}}", injectedContext).replaceAll("{{REGION}}", region).trim();
 
+  const languageRule =
+    input.language === "zh"
+      ? "LANGUAGE: Reply in Simplified Chinese."
+      : "LANGUAGE: Reply in English.";
+
+  const unknownPriceLabel = input.language === "zh" ? "价格未知" : "Price unknown";
+
   const modeGuidance =
     input.mode === "routine"
       ? [
           "## Mode Guidance (Routine)",
           "- If a `routine` object is present in Context Data, you MUST base any AM/PM steps on it. Do not invent new products.",
           "- If Phase 0 Enforcement is present, ask 1–2 clarification questions and STOP (no routine).",
-          "- If prices are unknown (null/0), label them as “价格未知” and do not output $0.",
+          `- If prices are unknown (null/0), label them as “${unknownPriceLabel}” and do not output $0.`,
         ].join("\n")
       : [
           "## Mode Guidance (Product)",
           "- If `candidates` / `similar_products` are present, recommend from those lists only.",
           "- If Context Data indicates vectors/embedding are missing, explain you cannot do dupe search and stick to KB-only analysis.",
-          "- If prices are unknown (null/0), label them as “价格未知” and do not output $0.",
+          `- If prices are unknown (null/0), label them as “${unknownPriceLabel}” and do not output $0.`,
         ].join("\n");
 
-  return [base, modeGuidance, input.userHistoryContext, input.phase0Enforcement].filter(Boolean).join("\n\n").trim();
+  return [base, languageRule, modeGuidance, input.userHistoryContext, input.phase0Enforcement]
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
 }
 
 function extractTextFromUnknownMessage(message: unknown): string {
@@ -2175,8 +2203,11 @@ function buildFallbackRoutineAnswer(input: {
   budget_cny: number | null;
   routine_primary: RoutineRecWithEvidence;
   routine_budget?: RoutineRecWithEvidence;
+  language?: UserLanguage;
 }) {
   const { budget_cny, routine_primary, routine_budget } = input;
+  const lang = input.language ?? detectUserLanguage(input.query);
+  const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
   const detectedRegion = detectRegionPreference(input.query);
 
   const wantsBrightening =
@@ -2196,11 +2227,11 @@ function buildFallbackRoutineAnswer(input: {
   const barrierImpaired = detectBarrierImpaired(input.query);
 
   const diagnosisTags: string[] = [];
-  if (wantsBrightening) diagnosisTags.push("提亮/淡斑");
-  if (barrierImpaired) diagnosisTags.push("屏障受损/刺痛");
-  else if (sensitive) diagnosisTags.push("敏感/泛红");
-  if (comedones) diagnosisTags.push("闭口/粗糙");
-  if (!comedones && oilyAcne) diagnosisTags.push("油痘倾向");
+  if (wantsBrightening) diagnosisTags.push(t("Brightening / Dark spots", "提亮/淡斑"));
+  if (barrierImpaired) diagnosisTags.push(t("Barrier impaired / stinging", "屏障受损/刺痛"));
+  else if (sensitive) diagnosisTags.push(t("Sensitive / redness", "敏感/泛红"));
+  if (comedones) diagnosisTags.push(t("Closed comedones / rough texture", "闭口/粗糙"));
+  if (!comedones && oilyAcne) diagnosisTags.push(t("Oily/acne-prone tendency", "油痘倾向"));
 
   const uniqueSkus = () => {
     const seen = new Set<string>();
@@ -2230,17 +2261,26 @@ function buildFallbackRoutineAnswer(input: {
   const withinBudget =
     budget_cny != null && costSummary.unknownCount === 0 ? costSummary.knownCny <= budget_cny : null;
 
-  const priceLabel = (usd: number) => (!Number.isFinite(usd) || usd <= 0 ? "价格未知" : formatUsd(usd));
+  const priceLabel = (usd: number) => (!Number.isFinite(usd) || usd <= 0 ? t("Price unknown", "价格未知") : formatUsd(usd));
 
   const lines: string[] = [];
   lines.push("Part 1: Diagnosis 🩺");
   lines.push(
-    `- 目标：${diagnosisTags.length ? diagnosisTags.join(" / ") : "根据你的描述给出温和入门流程"}${
-      detectedRegion ? `；坐标：${detectedRegion}` : ""
-    }。`,
+    lang === "zh"
+      ? `- 目标：${diagnosisTags.length ? diagnosisTags.join(" / ") : "根据你的描述给出温和入门流程"}${
+          detectedRegion ? `；坐标：${detectedRegion}` : ""
+        }。`
+      : `- Goal: ${diagnosisTags.length ? diagnosisTags.join(" / ") : "gentle starter routine based on your description"}${
+          detectedRegion ? `; Location: ${detectedRegion}` : ""
+        }.`,
   );
   if (barrierImpaired || sensitive) {
-    lines.push("- 重点：你提到「刺痛/敏感」，优先走温和、低刺激路线，先稳住屏障再加大活性。");
+    lines.push(
+      t(
+        "- Focus: you mentioned stinging/sensitivity — we’ll prioritize a gentle, barrier-first approach before stronger actives.",
+        "- 重点：你提到「刺痛/敏感」，优先走温和、低刺激路线，先稳住屏障再加大活性。",
+      ),
+    );
   }
 
   lines.push("");
@@ -2263,43 +2303,63 @@ function buildFallbackRoutineAnswer(input: {
   lines.push("");
   lines.push("Part 3: Budget Analysis 💰");
   if (budget_cny != null) {
-    lines.push(`- 预算：${formatCny(budget_cny)}（≈${formatUsd(budget_cny / USD_TO_CNY)}）`);
+    lines.push(
+      t(
+        `- Budget: ${formatCny(budget_cny)} (≈${formatUsd(budget_cny / USD_TO_CNY)})`,
+        `- 预算：${formatCny(budget_cny)}（≈${formatUsd(budget_cny / USD_TO_CNY)}）`,
+      ),
+    );
   }
   if (costSummary.unknownCount > 0) {
     lines.push(
-      `- 价格数据不完整：${costSummary.unknownCount}/${costSummary.totalUnique} 个商品缺少价格；已知价格合计≈${formatUsd(
-        costSummary.knownUsd,
-      )}（≈${formatCny(costSummary.knownCny)}）`,
+      t(
+        `- Incomplete price data: ${costSummary.unknownCount}/${costSummary.totalUnique} items are missing prices; known total ≈${formatUsd(
+          costSummary.knownUsd,
+        )} (≈${formatCny(costSummary.knownCny)})`,
+        `- 价格数据不完整：${costSummary.unknownCount}/${costSummary.totalUnique} 个商品缺少价格；已知价格合计≈${formatUsd(
+          costSummary.knownUsd,
+        )}（≈${formatCny(costSummary.knownCny)}）`,
+      ),
     );
   } else {
     lines.push(
-      `- 主方案合计≈${formatUsd(costSummary.knownUsd)}（≈${formatCny(costSummary.knownCny)}）${
-        withinBudget == null ? "" : withinBudget ? "，在预算内" : "，可能超预算"
-      }。`,
+      t(
+        `- Total ≈${formatUsd(costSummary.knownUsd)} (≈${formatCny(costSummary.knownCny)})${
+          withinBudget == null ? "" : withinBudget ? ", within budget" : ", may be over budget"
+        }.`,
+        `- 主方案合计≈${formatUsd(costSummary.knownUsd)}（≈${formatCny(costSummary.knownCny)}）${
+          withinBudget == null ? "" : withinBudget ? "，在预算内" : "，可能超预算"
+        }。`,
+      ),
     );
   }
 
   if (budget_cny != null && !withinBudget && routine_budget) {
     lines.push("");
-    lines.push("如果你必须严格不超预算（备选方案）：");
-    lines.push(`- 合计≈${formatCny(routine_budget.total_cny)}（${formatUsd(routine_budget.total_usd)}）`);
+    lines.push(t("If you must stay strictly within budget (alternative):", "如果你必须严格不超预算（备选方案）："));
+    lines.push(t(`- Total ≈${formatCny(routine_budget.total_cny)} (${formatUsd(routine_budget.total_usd)})`, `- 合计≈${formatCny(routine_budget.total_cny)}（${formatUsd(routine_budget.total_usd)}）`));
 
     lines.push("");
-    lines.push("AM（备选）：");
+    lines.push(t("AM (alternative):", "AM（备选）："));
     for (const step of routine_budget.am) {
-      lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）`);
+      lines.push(t(`- ${step.step}: ${step.sku.brand} ${step.sku.name} (${priceLabel(step.sku.price)})`, `- ${step.step}：${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）`));
     }
 
     lines.push("");
-    lines.push("PM（备选）：");
+    lines.push(t("PM (alternative):", "PM（备选）："));
     for (const step of routine_budget.pm) {
-      lines.push(`- ${step.step}：${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）`);
+      lines.push(t(`- ${step.step}: ${step.sku.brand} ${step.sku.name} (${priceLabel(step.sku.price)})`, `- ${step.step}：${step.sku.brand} ${step.sku.name}（${priceLabel(step.sku.price)}）`));
     }
   }
 
   lines.push("");
   lines.push("Part 4: Safety Warning ⚠️");
-  lines.push("注意：活性类（酸/维A类）先从每周 2-3 次开始，出现刺痛爆皮就先停，用修护类把屏障养好。");
+  lines.push(
+    t(
+      "Note: For actives (acids/retinoids), start 2–3 nights/week. If you get stinging or peeling, stop and focus on barrier repair.",
+      "注意：活性类（酸/维A类）先从每周 2-3 次开始，出现刺痛爆皮就先停，用修护类把屏障养好。",
+    ),
+  );
   return lines.join("\n").trim();
 }
 
@@ -2342,11 +2402,6 @@ export async function POST(req: Request) {
 
   const limit = typeof body.limit === "number" && body.limit > 0 ? Math.min(20, body.limit) : 6;
 
-  const budgetCny = parseBudgetCny(query);
-  const detectedRegion = detectRegionPreference(query);
-  const regionLabel = detectedRegion ?? "Global";
-  const deepScience = detectDeepScienceQuestion(query);
-
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const recentUserContextText = messages.length ? extractRecentUserContextText(messages) : "";
   // Use recent user messages as additional context for Phase-0 clarification and profile inference.
@@ -2356,25 +2411,35 @@ export async function POST(req: Request) {
     isShortFollowUpQuery(query) && recentUserContextText.trim() && recentUserContextText.trim() !== query
       ? `${recentUserContextText}\n\nFollow-up: ${query}`
       : query;
-  const activeMentions = extractActiveMentions(contextualQuery);
-  const similarEfficacyIntent = detectSimilarEfficacyIntent(query);
+
+  const userLang = detectUserLanguage(profileText);
+  const intentText = contextualQuery;
+
+  const budgetCny = parseBudgetCny(intentText);
+  const detectedRegion = detectRegionPreference(intentText);
+  const regionLabel = detectedRegion ?? "Global";
+  const deepScience = detectDeepScienceQuestion(intentText);
+
+  const activeMentions = extractActiveMentions(intentText);
+  const similarEfficacyIntent = detectSimilarEfficacyIntent(intentText);
 
   const explicitAnchorId =
     typeof body.anchor_product_id === "string" && body.anchor_product_id.trim() ? body.anchor_product_id.trim() : null;
-  const dupeIntent = detectDupeIntent(query);
-  const evalIntent = detectProductEvaluationIntent(query);
-  const routineIntent = query.includes("流程") || query.includes("早晚") || query.toLowerCase().includes("routine");
+  const dupeIntent = detectDupeIntent(intentText);
+  const evalIntent = detectProductEvaluationIntent(intentText);
+  const routineIntent = intentText.includes("流程") || intentText.includes("早晚") || intentText.toLowerCase().includes("routine");
 
-  const aliasCandidates = explicitAnchorId ? [] : await findAnchorCandidatesFromAliases(query);
+  const aliasCandidates = explicitAnchorId ? [] : await findAnchorCandidatesFromAliases(intentText);
   const bestAlias = aliasCandidates[0] ?? null;
   const isBrandOnlyAlias = typeof bestAlias?.alias_kind === "string" && bestAlias.alias_kind.toLowerCase().includes("brand");
   const highConfidenceAlias = bestAlias != null && bestAlias.confidence >= 0.72 && !isBrandOnlyAlias;
 
   const wantsShortlistNoAnchor =
-    !routineIntent && (detectProductShortlistIntent(query) || similarEfficacyIntent || (evalIntent && activeMentions.length > 0));
+    !routineIntent &&
+    (detectProductShortlistIntent(intentText) || similarEfficacyIntent || (evalIntent && activeMentions.length > 0));
 
   // Legacy fallback (brand heuristics + loose token match).
-  const legacyAnchorId = !explicitAnchorId && (dupeIntent || evalIntent) ? await findAnchorProductId(query) : null;
+  const legacyAnchorId = !explicitAnchorId && (dupeIntent || evalIntent) ? await findAnchorProductId(intentText) : null;
 
   const anchorProductId = explicitAnchorId ?? (highConfidenceAlias ? bestAlias.product_id : null) ?? legacyAnchorId;
   const wantsShortlist = wantsShortlistNoAnchor && (!anchorProductId || !looksLikeUuid(anchorProductId));
@@ -2382,10 +2447,18 @@ export async function POST(req: Request) {
   // If the user is asking for a dupe/compare, we should not silently drift into a routine.
   if ((dupeIntent || evalIntent) && !wantsShortlist && (!anchorProductId || !looksLikeUuid(anchorProductId))) {
     const suggestions = aliasCandidates.slice(0, 3).map((c) => c.matched_alias).filter(Boolean);
-    const hint = suggestions.length ? `\n\n我猜你可能在说：${suggestions.join(" / ")}。` : "";
+    const hint = suggestions.length
+      ? userLang === "zh"
+        ? `\n\n我猜你可能在说：${suggestions.join(" / ")}。`
+        : `\n\nI think you may mean: ${suggestions.join(" / ")}.`
+      : "";
     const answer = dupeIntent
-      ? `为了帮你找“平替/替代”，我需要你明确 **想对比的具体产品**（发产品名或链接即可）。${hint}`
-      : `我需要你提供具体产品名（或传 \`anchor_product_id\`），我才能基于数据库做“适配/风险/替代”分析。${hint}`;
+      ? userLang === "zh"
+        ? `为了帮你找“平替/替代”，我需要你明确 **想对比的具体产品**（发产品名或链接即可）。${hint}`
+        : `To find a dupe/alternative, please tell me the **exact product** you want to compare (name or link is fine).${hint}`
+      : userLang === "zh"
+        ? `我需要你提供具体产品名（或传 \`anchor_product_id\`），我才能基于数据库做“适配/风险/替代”分析。${hint}`
+        : `Please provide the exact product name (or send \`anchor_product_id\`) so I can run a fit/risk/alternative analysis from the database.${hint}`;
     if (Boolean(body.stream)) return streamResponse(answer);
     return jsonResponse({
       query,
@@ -2393,7 +2466,9 @@ export async function POST(req: Request) {
       answer,
       clarification: {
         questions: [
-          { id: "anchor", question: "你想对比/评估的具体产品是？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] },
+          userLang === "zh"
+            ? { id: "anchor", question: "你想对比/评估的具体产品是？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] }
+            : { id: "anchor", question: "Which product do you want to evaluate/compare?", options: ["Send product name", "Send a link", "Send anchor_product_id"] },
         ],
         candidates: aliasCandidates,
       },
@@ -2475,7 +2550,14 @@ export async function POST(req: Request) {
       ].join("\n");
 
   const buildSystemPrompt = (contextDataJson: string, mode: "routine" | "product") =>
-    buildAuroraStructuredSystemPrompt({ regionLabel, contextDataJson, mode, userHistoryContext, phase0Enforcement });
+    buildAuroraStructuredSystemPrompt({
+      regionLabel,
+      contextDataJson,
+      mode,
+      userHistoryContext,
+      phase0Enforcement,
+      language: userLang,
+    });
 
   const wantsProductHelp =
     routineIntent ||
@@ -2483,10 +2565,10 @@ export async function POST(req: Request) {
     evalIntent ||
     wantsShortlist ||
     wantsShortlistNoAnchor ||
-    detectProductShortlistIntent(query) ||
+    detectProductShortlistIntent(intentText) ||
     similarEfficacyIntent ||
-    /\b(am|pm)\b/i.test(query) ||
-    query.toLowerCase().includes("skincare plan");
+    /\b(am|pm)\b/i.test(intentText) ||
+    intentText.toLowerCase().includes("skincare plan");
 
   if (!wantsScienceOnly && wantsProductHelp && !skinProfileComplete) {
     const missing = {
@@ -2495,13 +2577,17 @@ export async function POST(req: Request) {
       concerns: (userProfile?.concerns?.length ?? 0) === 0 && sessionProfile.concerns.length === 0,
     };
 
-    const questions = buildPhase0ClarificationQuestions({ missing });
+    const questions = buildPhase0ClarificationQuestions({ missing }, userLang);
     const lines: string[] = [];
-    lines.push("Before I can recommend products safely, I need a quick skin profile:");
+    lines.push(
+      userLang === "zh"
+        ? "为了安全地给出建议，我需要你先补齐一个简短的皮肤画像："
+        : "Before I can recommend products safely, I need a quick skin profile:",
+    );
     for (const [idx, q] of questions.entries()) {
       lines.push(`${idx + 1}) ${q.question} (${q.options.join(" / ")})`);
     }
-    lines.push("Reply with the options (short is fine), and I’ll continue.");
+    lines.push(userLang === "zh" ? "直接回复选项即可（越短越好），我继续。" : "Reply with the options (short is fine), and I’ll continue.");
     const answer = lines.join("\n");
 
     if (wantsStream) return streamResponse(answer);
@@ -3035,6 +3121,7 @@ export async function POST(req: Request) {
       budget_cny: budgetCny,
       routine_primary: routine_primary_with_evidence,
       routine_budget: over_budget ? routine_budget_with_evidence ?? undefined : undefined,
+      language: userLang,
     });
 
     let answer = "";
