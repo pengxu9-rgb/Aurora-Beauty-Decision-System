@@ -165,17 +165,46 @@ function detectUserLanguage(text: string): UserLanguage {
 }
 
 function inferSessionSkinTypeFromText(text: string): SessionSkinProfile["skinType"] {
+  const lines = text
+    .split(/\n+/g)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const last = lines.length ? lines[lines.length - 1] : text.trim();
+  const lastClean = last.replace(/[。！？!?，,]+$/g, "").trim();
+
   const q = text.toLowerCase();
   if (q.includes("combination") || q.includes("combo") || text.includes("混合")) return "Combo";
   if (q.includes("oily") || text.includes("油皮") || text.includes("油性") || text.includes("油痘")) return "Oily";
   if (q.includes("dry") || text.includes("干皮") || text.includes("干性") || text.includes("极干")) return "Dry";
   if (q.includes("normal") || text.includes("中性") || text.includes("正常肤质")) return "Normal";
+
+  // Handle quick-reply chips (avoid Phase-0 loops when user taps "不确定/Not sure").
+  if (lastClean === "不确定" || lastClean === "不太确定" || lastClean === "不知道") return "Unknown";
+  if (/^(not sure|unsure)$/i.test(lastClean)) return "Unknown";
+
   return null;
 }
 
 function inferSessionBarrierStatusFromText(text: string): SessionSkinProfile["barrierStatus"] {
-  if (detectBarrierHealthyMention(text)) return "Healthy";
+  const lines = text
+    .split(/\n+/g)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const last = lines.length ? lines[lines.length - 1] : text.trim();
+  const lastClean = last.replace(/[。！？!?，,]+$/g, "").trim();
+
+  // Safety-first: if any clear impaired signal exists, treat as impaired.
   if (detectBarrierImpaired(text) || detectSensitiveSkin(text)) return "Impaired";
+  if (detectBarrierHealthyMention(text)) return "Healthy";
+
+  // Handle quick-reply chips used by the UI (prevents infinite "ask again" loops).
+  if (lastClean === "稳定" || lastClean === "稳定的") return "Healthy";
+  if (lastClean === "刺痛/泛红" || lastClean === "刺痛泛红" || lastClean === "刺痛" || lastClean === "泛红") return "Impaired";
+  if (lastClean === "不确定" || lastClean === "不太确定" || lastClean === "不知道") return "Unknown";
+  if (/^(stable)$/i.test(lastClean)) return "Healthy";
+  if (lastClean.toLowerCase() === "stinging/red" || lastClean.toLowerCase() === "stinging" || lastClean.toLowerCase() === "red")
+    return "Impaired";
+  if (/^(not sure|unsure)$/i.test(lastClean)) return "Unknown";
 
   const q = text.toLowerCase();
   if (
