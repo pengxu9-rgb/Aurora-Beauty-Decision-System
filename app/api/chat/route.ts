@@ -26,6 +26,7 @@ type ChatRequest = {
   llm_provider?: "gemini" | "openai";
   llm_model?: string;
   stream?: boolean;
+  debug?: boolean;
 };
 
 type AuroraState = "S_DIAGNOSIS" | "S_SKU_BROWSING" | "S_COMPARING" | "S_ROUTINE_CHECK" | "S_SCIENCE";
@@ -3109,77 +3110,64 @@ export async function POST(req: Request) {
       })),
     });
 
-    let answer = "";
+    // Deterministic-first: always return a usable shortlist (no "LLM too short" failures).
+    // Then best-effort ask the LLM to *rewrite* the shortlist with better rationale, without changing the list.
+    let answer = fallbackAnswer;
     let llm_error: string | null = null;
-    try {
-      const userPrompt = [
-        "User request (Product shortlist / suitability):",
-        query,
-        "",
-        "TASK:",
-        "- Answer whether this is suitable for the user's skin (use the inferred user_profile + strict safety protocol).",
-        "- Recommend 3-5 products from Context Data that match the requested efficacy and region.",
-        "- For each product include: Mechanism (MoA), Expert Note (chemist_notes if present), Evidence Grade, and Trade-off (texture/irritation note).",
-        "- OUTPUT MUST BE A PRODUCT SHORTLIST. Do NOT output a full AM/PM routine template. Do NOT include '🌞', '🌙', 'AM', 'PM', or 'Recommended Routine' headings unless the user explicitly asked for a routine.",
-        activeMentions.length ? `Focus actives: ${activeMentions.join(", ")}` : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
 
-      answer =
+    const includeLlmError = process.env.NODE_ENV === "development" || body.debug === true;
+
+    const lockedProducts = candidates.slice(0, 5).map((c) => `${c.brand} ${c.name}`.trim()).filter(Boolean);
+    const refinementPrompt = [
+      "You are improving an existing shortlist draft.",
+      "CRITICAL: You MUST NOT change the product list (names/order). You may only improve explanations, add safety notes, and add citations if present.",
+      "If any price is unknown, say '价格未知' (do not print $0). Do not invent prices.",
+      "",
+      "DRAFT SHORTLIST (DO NOT CHANGE THE LIST):",
+      "```text",
+      fallbackAnswer,
+      "```",
+      "",
+      "OUTPUT REQUIREMENTS:",
+      "- Keep the same numbered list items 1..N with the exact same product names.",
+      "- For each item add: Mechanism (MoA), Expert note (chemist_notes if present), Trade-off/risk, and one citation if available.",
+      "- Keep it concise and actionable (no full AM/PM routine template).",
+    ].join("\n");
+
+    const looksLikeRefinementOk = (text: string) => {
+      const t = text.trim();
+      if (isBadAnswer(t, "product")) return false;
+      if (!/\n\s*\d+[\)\.]\s+/.test(t)) return false;
+      // Ensure at least 2 locked product names appear to avoid irrelevant answers.
+      const hits = lockedProducts.filter((p) => p && t.toLowerCase().includes(p.toLowerCase()));
+      return hits.length >= Math.min(2, lockedProducts.length);
+    };
+
+    try {
+      const refined =
         provider === "gemini"
-          ? await geminiGenerateContent({ system_prompt: systemPrompt, user_prompt: userPrompt, model: requestedModel })
+          ? await geminiGenerateContent({
+              system_prompt: systemPrompt,
+              user_prompt: refinementPrompt,
+              model: requestedModel,
+              temperature: 0.3,
+            })
           : await openaiChatCompletion({
               model: requestedModel,
+              temperature: 0.3,
               messages: [
                 { role: "system", content: systemPrompt },
-                { role: "user", content: userPrompt },
+                { role: "user", content: refinementPrompt },
               ],
             });
 
-      if (isBadAnswer(answer, "product")) {
-        // Best-effort retry: Gemini sometimes returns a partial diagnosis even though we asked for a shortlist.
-        // Retry once with a stronger "must be a list" constraint before falling back to deterministic output.
-        try {
-          const retryPrompt = [
-            userPrompt,
-            "",
-            "RETRY (STRICT):",
-            "- Your previous answer was too short or not a shortlist.",
-            "- OUTPUT MUST include 3–5 concrete products from Context Data as a numbered list.",
-            "- Each item must include: (1) why it fits (MoA), (2) one expert note, (3) one trade-off/risk note, (4) one citation (kb:...) if available.",
-            "- Do NOT ask me questions in this retry.",
-            "- Aim for >= 220 characters.",
-          ].join("\n");
-
-          answer =
-            provider === "gemini"
-              ? await geminiGenerateContent({
-                  system_prompt: systemPrompt,
-                  user_prompt: retryPrompt,
-                  model: requestedModel,
-                  temperature: 0.3,
-                })
-              : await openaiChatCompletion({
-                  model: requestedModel,
-                  temperature: 0.3,
-                  messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: retryPrompt },
-                  ],
-                });
-        } catch {
-          // ignore; we'll decide fallback below
-        }
-
-        if (isBadAnswer(answer, "product")) {
-          llm_error = "LLM answer too short/unactionable for shortlist; used fallback.";
-          answer = fallbackAnswer;
-        }
+      if (looksLikeRefinementOk(refined)) {
+        answer = refined;
+      } else {
+        llm_error = "LLM refinement unsuitable; used deterministic shortlist.";
       }
     } catch (e) {
       llm_error = e instanceof Error ? e.message : "Unknown error";
-      answer = fallbackAnswer;
     }
 
     if (wantsStream) return streamResponse(answer);
@@ -3194,7 +3182,7 @@ export async function POST(req: Request) {
           : process.env.OPENAI_MODEL ?? "gpt-4o"),
       intent: "shortlist",
       answer,
-      llm_error,
+      ...(includeLlmError ? { llm_error } : {}),
       current_state: shortlistState,
       next_actions: buildNextActionsForState({ state: shortlistState, language: userLang, hasAnchor: false }),
       context: shortlistContextData,
