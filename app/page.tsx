@@ -1,5 +1,5 @@
-import { AuroraChatPage } from "@/components/chat/AuroraChatPage";
+import { AuroraApp } from "@/components/aurora/AuroraApp";
 
 export default function Page() {
-  return <AuroraChatPage />;
+  return <AuroraApp />;
 }

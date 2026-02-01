@@ -146,8 +146,8 @@ export function AuroraChatPage() {
             <div>
               <div className="text-sm font-semibold text-slate-900">Aurora Chat</div>
               <div className="mt-0.5 text-xs text-slate-500">
-                Chat-first skincare partner · <a className="underline" href="/consult">Consult</a> ·{" "}
-                <a className="underline" href="/lab">Lab</a>
+                Chat-first skincare partner · <a className="underline" href="/chat">Chat</a> ·{" "}
+                <a className="underline" href="/consult">Consult</a> · <a className="underline" href="/lab">Lab</a>
               </div>
             </div>
             <button
