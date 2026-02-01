@@ -120,6 +120,17 @@ You must identify which **Phase** the conversation is in and stick to it. DO NOT
      - Script (use this tone): "I noticed we're a bit over your usual range. Since [Product A] is a wash-off product, we could swap it for [Product B] to save [Amount], allowing you to invest more in what stays on your skin. Thoughts?"
    - If any prices are unknown, say the total is incomplete and negotiate using the known subtotal only.
 
+# State Machine & Navigation (STRICT)
+- You are a navigational engine with an internal state variable CURRENT_STATE.
+- CURRENT_STATE is provided in Context Data (e.g., \`navigation.current_state\` or \`current_state\`).
+- Behavior by state:
+  - \`S_DIAGNOSIS\`: Ask at most 1–2 clarification questions and STOP. Do NOT recommend products/routines yet.
+  - \`S_SKU_BROWSING\`: Provide a shortlist of 3–6 products from Context Data only (no invented products).
+  - \`S_COMPARING\`: Compare 2–3 options, emphasize trade-offs (texture/irritation/availability/price).
+  - \`S_ROUTINE_CHECK\`: Integrate a routine and check conflicts (acid/retinoid/copper peptides/Vit C).
+  - \`S_SCIENCE\`: Answer the science question only; do NOT output an AM/PM routine unless explicitly asked.
+- Do NOT repeat a question if the answer is already present in User History Context (Memory) or in the recent chat messages.
+
 # Context Data (RAG Retrieved; read-only)
 {{CONTEXT_DATA_JSON}}`;
 
@@ -332,8 +343,85 @@ function inferSessionSkinProfileFromText(text: string): SessionSkinProfile {
   };
 }
 
+function inferSessionSkinProfileFromMessages(messages: unknown[], query: string): SessionSkinProfile {
+  const merged: SessionSkinProfile = { skinType: null, barrierStatus: null, concerns: [] };
+  const concerns = new Set<string>();
+
+  const userTexts: string[] = [];
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (!m || typeof m !== "object") continue;
+    if ((m as any).role !== "user") continue;
+    const t = extractTextFromUnknownMessage(m);
+    if (t.trim()) userTexts.push(t.trim());
+  }
+  if (typeof query === "string" && query.trim()) userTexts.push(query.trim());
+
+  // Merge per-message signals. This is intentionally more robust than concatenating
+  // everything into a single blob: it prevents missing a quick-reply like “稳定”
+  // when the last query is another chip like “提亮/淡斑”.
+  for (const t of userTexts.slice(-8)) {
+    if (!merged.skinType) merged.skinType = inferSessionSkinTypeFromText(t);
+    if (!merged.barrierStatus) merged.barrierStatus = inferSessionBarrierStatusFromText(t);
+    for (const c of inferSessionConcernsFromText(t)) concerns.add(c);
+  }
+
+  merged.concerns = Array.from(concerns);
+  return merged;
+}
+
 function isSessionSkinProfileComplete(profile: SessionSkinProfile) {
   return Boolean(profile.skinType) && Boolean(profile.barrierStatus) && profile.concerns.length > 0;
+}
+
+function detectProfileAnswerKind(query: string): "skinType" | "barrierStatus" | "concerns" | null {
+  const t = query.trim().replace(/[。！？!?，,]+$/g, "");
+  if (!t) return null;
+
+  // Skin type quick replies
+  if (["油皮", "油性", "油痘", "干皮", "干性", "混合", "混合/中性", "中性", "正常肤质", "不确定", "不知道"].includes(t)) return "skinType";
+  if (/^(oily|dry|combo|combination|normal|not sure|unsure)$/i.test(t)) return "skinType";
+
+  // Barrier quick replies
+  if (["稳定", "稳定的", "刺痛/泛红", "刺痛泛红", "刺痛", "泛红", "不确定", "不知道"].includes(t)) return "barrierStatus";
+  if (/^(stable|stinging\/red|stinging|red|not sure|unsure)$/i.test(t)) return "barrierStatus";
+
+  // Goals quick replies
+  if (["痘痘/闭口/粗糙", "提亮/淡斑", "抗老/细纹", "泛红/修护屏障", "补水保湿"].includes(t)) return "concerns";
+  if (["Acne/Texture", "Dark spots/Brightening", "Aging", "Redness/Barrier repair", "Hydration"].includes(t)) return "concerns";
+
+  return null;
+}
+
+function looksLikeStandaloneProfileAnswer(input: { query: string; messages: unknown[] }) {
+  const kind = detectProfileAnswerKind(input.query);
+  if (!kind) return false;
+
+  // If the query also includes a real question/request, don't treat it as "just a chip".
+  const q = input.query.trim();
+  const hasAsk =
+    q.includes("推荐") ||
+    q.includes("流程") ||
+    q.includes("平替") ||
+    q.includes("替代") ||
+    q.includes("适合") ||
+    q.includes("?") ||
+    q.includes("？") ||
+    /recommend|routine|dupe|alternative|suitable|fit|work/i.test(q);
+  if (hasAsk) return false;
+
+  // If the history contains a substantive request, also avoid the "profile-only" short-circuit.
+  const history = extractRecentUserContextText(input.messages, 6, 1200);
+  const hasHistoryAsk =
+    history.includes("推荐") ||
+    history.includes("精华") ||
+    history.includes("流程") ||
+    history.includes("平替") ||
+    history.includes("替代") ||
+    history.includes("适合") ||
+    /recommend|routine|dupe|alternative|suitable|fit|work/i.test(history);
+  if (hasHistoryAsk) return false;
+
+  return true;
 }
 
 function buildPhase0ClarificationQuestions(
@@ -2815,7 +2903,8 @@ export async function POST(req: Request) {
   let userProfile: UserProfile | null = null;
   let recentSkinLogs: SkinLog[] = [];
   let userHistoryDbError: string | null = null;
-  const sessionProfile = inferSessionSkinProfileFromText(profileText);
+  const sessionProfile = inferSessionSkinProfileFromMessages(messages, query);
+  const profileAnswerOnly = looksLikeStandaloneProfileAnswer({ query, messages });
 
   try {
     userProfile = await prisma.userProfile.upsert({
@@ -2887,6 +2976,78 @@ export async function POST(req: Request) {
   const looksLikeFollowUpAnswer =
     isShortFollowUpQuery(query) &&
     !/^(?:ok|okay|kk|thx|thanks|thank you|ty|好的|好|嗯|收到|明白|了解|谢谢|谢了|不用了|不用|先这样)$/i.test(query.trim());
+
+  // If the user is only answering a profile chip (and there is no prior "ask"),
+  // short-circuit into deterministic Phase-0 progression to avoid LLM loops.
+  if (!wantsScienceOnly && profileAnswerOnly) {
+    const missing = {
+      skinType: !userProfile?.skinType && !sessionProfile.skinType,
+      barrierStatus: !userProfile?.barrierStatus && !sessionProfile.barrierStatus,
+      concerns: (userProfile?.concerns?.length ?? 0) === 0 && sessionProfile.concerns.length === 0,
+    };
+
+    const phase0Questions = buildPhase0ClarificationQuestions({ missing }, userLang);
+    if (phase0Questions.length) {
+      const lines: string[] = [];
+      lines.push(
+        userLang === "zh"
+          ? "为了安全地给出建议，我需要你先补齐一个简短的皮肤画像："
+          : "Before I can recommend products safely, I need a quick skin profile:",
+      );
+      for (const [idx, q] of phase0Questions.entries()) {
+        lines.push(`${idx + 1}) ${q.question} (${q.options.join(" / ")})`);
+      }
+      lines.push(userLang === "zh" ? "直接回复选项即可（越短越好），我继续。" : "Reply with the options (short is fine), and I’ll continue.");
+      const answer = lines.join("\n");
+
+      if (wantsStream) return streamResponse(answer);
+      return jsonResponse({
+        query,
+        intent: "clarify",
+        answer,
+        current_state: "S_DIAGNOSIS" satisfies AuroraState,
+        next_actions: buildNextActionsFromClarificationQuestions(phase0Questions),
+        clarification: {
+          questions: phase0Questions,
+          missing_fields: Object.entries(missing)
+            .filter(([, v]) => v)
+            .map(([k]) => k),
+        },
+      });
+    }
+
+    const answer =
+      userLang === "zh"
+        ? "收到：你的皮肤画像我记下了。你接下来想让我做哪一件事？"
+        : "Got it — I’ve saved your skin profile. What would you like to do next?";
+    const options = userLang === "zh"
+      ? [
+          "给我推荐 1–3 款温和有效的单品（比如精华）",
+          "给我一套早晚流程（AM/PM）",
+          "评估某个具体产品是否适合我",
+          "找平替/更便宜的替代",
+          "问成分科学（证据/机制）",
+        ]
+      : ["Recommend 1–3 gentle products", "Build an AM/PM routine", "Evaluate a specific product", "Find a cheaper alternative", "Ask ingredient science"];
+
+    const nextQuestions: ClarificationQuestion[] = [
+      {
+        id: "next",
+        question: userLang === "zh" ? "你接下来想让我帮你做哪一件事？" : "What do you want me to do next?",
+        options,
+      },
+    ];
+
+    if (wantsStream) return streamResponse(answer);
+    return jsonResponse({
+      query,
+      intent: "clarify",
+      answer,
+      current_state: "S_DIAGNOSIS" satisfies AuroraState,
+      next_actions: buildNextActionsFromClarificationQuestions(nextQuestions),
+      clarification: { questions: nextQuestions },
+    });
+  }
 
   if (!wantsScienceOnly && (wantsProductHelp || looksLikeFollowUpAnswer) && !skinProfileComplete) {
     const missing = {
