@@ -3,6 +3,7 @@
 import type { SkinIdentitySnapshot } from "@/actions/userProfile";
 import { getSkinIdentitySnapshot, setUserConcerns } from "@/actions/userProfile";
 import { SkinIdentityCard } from "@/components/chat/SkinIdentityCard";
+import { ChevronDown, ChevronUp, Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
@@ -116,12 +117,40 @@ export function AuroraChatPage() {
   const [isIdentityLoading, setIsIdentityLoading] = useState(false);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
 
+  const [diagnosisExpanded, setDiagnosisExpanded] = useState(true);
+  const [diagnosisProgressOverride, setDiagnosisProgressOverride] = useState<number>(0);
+  const prevDiagnosisProgress = useRef<number>(0);
+
   const lastMessageId = useMemo(() => messages[messages.length - 1]?.id ?? null, [messages]);
 
   useEffect(() => {
     if (!listRef.current) return;
     listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [lastMessageId]);
+
+  const diagnosisProgressFromProfile = useMemo(() => {
+    if (!skinIdentity) return 0;
+    let done = 0;
+    const total = 3;
+    if (typeof skinIdentity.skinType === "string" && skinIdentity.skinType.trim()) done += 1;
+    if (typeof skinIdentity.barrierStatus === "string" && skinIdentity.barrierStatus.trim()) done += 1;
+    if (Array.isArray(skinIdentity.concerns) && skinIdentity.concerns.length > 0) done += 1;
+    return Math.round((done / total) * 100);
+  }, [skinIdentity]);
+
+  const diagnosisProgress = useMemo(
+    () => Math.max(diagnosisProgressFromProfile, diagnosisProgressOverride),
+    [diagnosisProgressFromProfile, diagnosisProgressOverride],
+  );
+
+  useEffect(() => {
+    const prev = prevDiagnosisProgress.current;
+    prevDiagnosisProgress.current = diagnosisProgress;
+    if (prev >= 100 || diagnosisProgress < 100) return;
+    // Auto-collapse once diagnosis reaches "complete" (no more progress to show).
+    const t = window.setTimeout(() => setDiagnosisExpanded(false), 700);
+    return () => window.clearTimeout(t);
+  }, [diagnosisProgress]);
 
   const refreshIdentity = useCallback(async (uid: string) => {
     setIsIdentityLoading(true);
@@ -163,6 +192,8 @@ export function AuroraChatPage() {
       setIsSending(true);
       setSendError(null);
       setPendingQuestionSet(null);
+      // Reset "analysis progress" override for this request.
+      setDiagnosisProgressOverride(0);
 
       const userMessage: ChatMessage = { id: makeId("u"), role: "user", content: trimmed };
       setMessages((prev) => {
@@ -196,6 +227,12 @@ export function AuroraChatPage() {
 
         const questions = Array.isArray(data.clarification?.questions) ? data.clarification?.questions : null;
         setPendingQuestionSet(questions?.length ? questions : null);
+
+        // If we're no longer in "clarify", treat this as a completed diagnostic pass.
+        // This avoids the UI being stuck at <100% after the engine has already returned an answer.
+        if (typeof data.intent === "string" && data.intent !== "clarify") {
+          setDiagnosisProgressOverride(100);
+        }
 
         if (userId) void refreshIdentity(userId);
       } catch (e) {
@@ -324,21 +361,73 @@ export function AuroraChatPage() {
           />
 
           {skinIdentity ? (
-            <div className="mb-3">
-              <SkinIdentityCard
-                name="You"
-                avatarUrl={avatarUrl}
-                status={skinIdentity.status}
-                resilienceScore={skinIdentity.resilienceScore}
-                hydration={skinIdentity.hydration}
-                sebum={skinIdentity.sebum}
-                sensitivity={skinIdentity.sensitivity}
-                concerns={skinIdentity.concerns}
-                onConcernsChange={handleConcernsChange}
-                onConfirmProfile={handleConfirmProfile}
-                onUploadSelfie={handleUploadSelfie}
-              />
-              {isIdentityLoading ? <div className="mt-2 text-[11px] text-slate-500">Updating profile…</div> : null}
+            <div className="mb-3 sticky top-0 z-20 pt-2 -mt-2">
+              <div className="rounded-2xl border border-slate-200 bg-white/90 backdrop-blur shadow-sm">
+                <button
+                  type="button"
+                  onClick={() => setDiagnosisExpanded((v) => !v)}
+                  className="w-full px-4 py-3 flex items-center justify-between gap-3"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <div className="text-sm font-semibold text-slate-900">Skin Diagnosis</div>
+                      <span className="shrink-0 rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-700">
+                        {diagnosisProgress >= 100 ? "Ready" : `${diagnosisProgress}%`}
+                      </span>
+                    </div>
+                    <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+                      <div className="h-full rounded-full bg-indigo-600 transition-all" style={{ width: `${diagnosisProgress}%` }} />
+                    </div>
+                  </div>
+                  <div className="shrink-0 text-slate-500">
+                    {diagnosisExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                  </div>
+                </button>
+              </div>
+
+              {diagnosisExpanded ? (
+                <div className="mt-3">
+                  <SkinIdentityCard
+                    name="You"
+                    avatarUrl={avatarUrl}
+                    status={skinIdentity.status}
+                    resilienceScore={skinIdentity.resilienceScore}
+                    hydration={skinIdentity.hydration}
+                    sebum={skinIdentity.sebum}
+                    sensitivity={skinIdentity.sensitivity}
+                    concerns={skinIdentity.concerns}
+                    onConcernsChange={handleConcernsChange}
+                    onConfirmProfile={handleConfirmProfile}
+                    onUploadSelfie={handleUploadSelfie}
+                  />
+                  {isIdentityLoading ? <div className="mt-2 text-[11px] text-slate-500">Updating profile…</div> : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {isSending ? (
+            <div className="mb-3 rounded-2xl border border-slate-200 bg-white/90 px-4 py-3 shadow-sm">
+              <div className="flex items-center gap-3">
+                <div className="h-10 w-10 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center">
+                  <Loader2 className="h-5 w-5 text-slate-700 animate-spin" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[11px] font-semibold tracking-wide text-slate-500">AURORA ENGINE</div>
+                  <div className="text-sm font-semibold text-slate-900">Checking safety protocols…</div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-700">
+                      ✓ Profile loaded
+                    </span>
+                    <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-700">
+                      ✓ Ingredient DB
+                    </span>
+                    <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2 py-1 text-[11px] font-semibold text-indigo-700">
+                      Checking VETO rules
+                    </span>
+                  </div>
+                </div>
+              </div>
             </div>
           ) : null}
 

@@ -384,6 +384,7 @@ function buildUserHistoryContext(input: {
 }
 
 function detectBarrierHealthyMention(query: string) {
+  const trimmed = query.trim();
   const q = query.toLowerCase();
   return (
     q.includes("healthy barrier") ||
@@ -399,6 +400,7 @@ function detectBarrierHealthyMention(query: string) {
     query.includes("屏障健康") ||
     query.includes("屏障没问题") ||
     query.includes("屏障很好") ||
+    trimmed === "稳定" ||
     query.includes("没有刺痛") ||
     query.includes("不刺痛") ||
     query.includes("不疼") ||
@@ -1791,6 +1793,7 @@ type RoutineStepWithEvidence = {
   notes: string[];
   product_id: string | null;
   evidence_pack: RoutineEvidencePack | null;
+  ingredients: IngredientContext | null;
 };
 
 type RoutineRecWithEvidence = {
@@ -1839,14 +1842,16 @@ async function buildRoutineEvidenceIndex(input: {
   productIdBySkuId: Map<string, string>;
   availabilityByProductId: Map<string, string[]>;
   evidenceByProductId: Map<string, RoutineEvidencePack>;
+  ingredientsByProductId: Map<string, IngredientContext>;
 }> {
   const productIdBySkuId = new Map<string, string>();
   const availabilityByProductId = new Map<string, string[]>();
   const evidenceByProductId = new Map<string, RoutineEvidencePack>();
+  const ingredientsByProductId = new Map<string, IngredientContext>();
 
   // Best-effort: if DB is not configured, skip KB enrichment.
   const dbUrl = process.env.DATABASE_URL;
-  if (!dbUrl || dbUrl.includes("${{")) return { productIdBySkuId, availabilityByProductId, evidenceByProductId };
+  if (!dbUrl || dbUrl.includes("${{")) return { productIdBySkuId, availabilityByProductId, evidenceByProductId, ingredientsByProductId };
 
   const skuById = new Map<string, SkuVector>();
   for (const r of input.routines) {
@@ -1874,13 +1879,21 @@ async function buildRoutineEvidenceIndex(input: {
   }
 
   const productIds = uniqueStrings(Array.from(productIdBySkuId.values()));
-  if (!productIds.length) return { productIdBySkuId, availabilityByProductId, evidenceByProductId };
+  if (!productIds.length) return { productIdBySkuId, availabilityByProductId, evidenceByProductId, ingredientsByProductId };
 
   const products = await prisma.product.findMany({
     where: { id: { in: productIds } },
     select: { id: true, regionAvailability: true },
   });
   for (const p of products) availabilityByProductId.set(p.id, Array.isArray(p.regionAvailability) ? p.regionAvailability : []);
+
+  const ingredientRows = await prisma.ingredientData.findMany({
+    where: { productId: { in: productIds } },
+    select: { productId: true, fullList: true, heroActives: true },
+  });
+  for (const row of ingredientRows) {
+    ingredientsByProductId.set(row.productId, summarizeIngredients(row.fullList, row.heroActives));
+  }
 
   const kbRows = await prisma.productKbSnippet.findMany({
     where: { productId: { in: productIds } },
@@ -1909,17 +1922,18 @@ async function buildRoutineEvidenceIndex(input: {
     evidenceByProductId.set(productId, pack);
   }
 
-  return { productIdBySkuId, availabilityByProductId, evidenceByProductId };
+  return { productIdBySkuId, availabilityByProductId, evidenceByProductId, ingredientsByProductId };
 }
 
 function attachEvidenceToRoutine(
   routine: RoutineRec,
-  index: { productIdBySkuId: Map<string, string>; evidenceByProductId: Map<string, RoutineEvidencePack> },
+  index: { productIdBySkuId: Map<string, string>; evidenceByProductId: Map<string, RoutineEvidencePack>; ingredientsByProductId: Map<string, IngredientContext> },
 ): RoutineRecWithEvidence {
   const enrichStep = (s: { step: string; sku: SkuVector; notes: string[] }): RoutineStepWithEvidence => {
     const productId = index.productIdBySkuId.get(s.sku.sku_id) ?? (looksLikeUuid(s.sku.sku_id) ? s.sku.sku_id : null);
     const evidence = productId ? index.evidenceByProductId.get(productId) ?? null : null;
-    return { ...s, product_id: productId, evidence_pack: evidence };
+    const ingredients = productId ? index.ingredientsByProductId.get(productId) ?? null : null;
+    return { ...s, product_id: productId, evidence_pack: evidence, ingredients };
   };
 
   return {
@@ -3255,11 +3269,11 @@ export async function POST(req: Request) {
     const routine = routine_primary;
 
     const evidenceIndex = await buildRoutineEvidenceIndex({
-      routines: [routine_primary, ...(over_budget ? [routine_budget] : [])],
+      routines: [routine_primary, routine_budget],
       region: detectedRegion,
     });
     const routine_primary_with_evidence = attachEvidenceToRoutine(routine_primary, evidenceIndex);
-    const routine_budget_with_evidence = over_budget ? attachEvidenceToRoutine(routine_budget, evidenceIndex) : null;
+    const routine_budget_with_evidence = attachEvidenceToRoutine(routine_budget, evidenceIndex);
     const evidencePacks = Array.from(evidenceIndex.evidenceByProductId.values());
     const evidenceSummary = {
       products_in_routine: evidencePacks.length,
@@ -3392,9 +3406,9 @@ export async function POST(req: Request) {
           region_preference: detectedRegion,
         },
         budget_cny: budgetCny,
-        routine,
-        routine_primary,
-        routine_budget,
+        routine: routine_primary_with_evidence,
+        routine_primary: routine_primary_with_evidence,
+        routine_budget: routine_budget_with_evidence,
         over_budget,
         ...(external_verification ? { external_verification } : {}),
       },
