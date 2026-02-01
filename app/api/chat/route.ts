@@ -28,6 +28,15 @@ type ChatRequest = {
   stream?: boolean;
 };
 
+type AuroraState = "S_DIAGNOSIS" | "S_SKU_BROWSING" | "S_COMPARING" | "S_ROUTINE_CHECK" | "S_SCIENCE";
+
+type NextActionChip = {
+  id: string;
+  label: string;
+  text: string;
+  next_state?: AuroraState;
+};
+
 const USD_TO_CNY = 7.2;
 
 // Master System Prompt v3.0 (verbatim user spec)
@@ -162,6 +171,34 @@ function detectUserLanguage(text: string): UserLanguage {
   // Prefer the user's input language over browser locale.
   // If any CJK characters are present, treat it as Chinese; otherwise default to English.
   return /[\u4e00-\u9fff]/.test(text) ? "zh" : "en";
+}
+
+function detectPriceSensitivity(query: string) {
+  const q = query.toLowerCase();
+  const cn =
+    query.includes("太贵") ||
+    query.includes("贵了") ||
+    query.includes("太高") ||
+    query.includes("超预算") ||
+    query.includes("不想太贵") ||
+    query.includes("便宜点") ||
+    query.includes("更便宜") ||
+    query.includes("平价") ||
+    query.includes("省钱") ||
+    (query.includes("预算") && !/\d/.test(query));
+
+  const en =
+    q.includes("expensive") ||
+    q.includes("too much") ||
+    q.includes("pricey") ||
+    q.includes("over budget") ||
+    q.includes("tight budget") ||
+    q.includes("cheaper") ||
+    q.includes("affordable") ||
+    q.includes("save money") ||
+    (q.includes("budget") && !/\d/.test(q));
+
+  return cn || en;
 }
 
 function inferSessionSkinTypeFromText(text: string): SessionSkinProfile["skinType"] {
@@ -874,6 +911,92 @@ function parseBudgetCny(query: string): number | null {
 }
 
 type ClarificationQuestion = { id: string; question: string; options: string[] };
+
+function buildNextActionsFromClarificationQuestions(questions: ClarificationQuestion[]): NextActionChip[] {
+  const out: NextActionChip[] = [];
+  for (const q of questions.slice(0, 2)) {
+    const options = Array.isArray(q.options) ? q.options : [];
+    for (let idx = 0; idx < options.length; idx += 1) {
+      const opt = String(options[idx] ?? "").trim();
+      if (!opt) continue;
+      out.push({ id: `${q.id}:${idx}`, label: opt, text: opt, next_state: "S_DIAGNOSIS" });
+    }
+  }
+  return out.slice(0, 10);
+}
+
+function buildNextActionsForState(input: { state: AuroraState; language: UserLanguage; hasAnchor: boolean }): NextActionChip[] {
+  const zh = input.language === "zh";
+  const chip = (id: string, label: string, text: string, next_state?: AuroraState): NextActionChip => ({ id, label, text, next_state });
+
+  switch (input.state) {
+    case "S_SCIENCE":
+      return zh
+        ? [
+            chip("ask_fit", "适合我吗？", "这类成分适合我的肤质吗？", "S_DIAGNOSIS"),
+            chip("ask_products", "哪些产品含它？", "如果我想用这类成分，有哪些温和的护肤品推荐？", "S_SKU_BROWSING"),
+            chip("ask_risks", "有风险/副作用吗？", "这类成分常见风险是什么？敏感肌怎么用更安全？", "S_SCIENCE"),
+          ]
+        : [
+            chip("ask_fit", "Fit for me?", "Is this ingredient class suitable for my skin?", "S_DIAGNOSIS"),
+            chip("ask_products", "Products with it", "Which products contain this and are considered gentle?", "S_SKU_BROWSING"),
+            chip("ask_risks", "Risks", "What are the common risks/side effects and how to use safely?", "S_SCIENCE"),
+          ];
+
+    case "S_SKU_BROWSING":
+      return zh
+        ? [
+            chip("pick_one", "选一款让我评估", "我想评估这款：<产品名>", input.hasAnchor ? "S_ROUTINE_CHECK" : "S_COMPARING"),
+            chip("budget", "我预算有限", "预算有点紧/太贵了，想找平价替代。", "S_COMPARING"),
+            chip("region_cn", "坐标国内", "坐标国内/淘宝更方便的渠道。", "S_SKU_BROWSING"),
+          ]
+        : [
+            chip("pick_one", "Pick one to evaluate", "I want to evaluate: <product name>", input.hasAnchor ? "S_ROUTINE_CHECK" : "S_COMPARING"),
+            chip("budget", "Tight budget", "This feels expensive. Please find cheaper alternatives.", "S_COMPARING"),
+            chip("region", "My region", "I'm in CN (prefer CN/Global availability).", "S_SKU_BROWSING"),
+          ];
+
+    case "S_COMPARING":
+      return zh
+        ? [
+            chip("compare_more", "再找更便宜", "还有更便宜但功效接近的替代吗？", "S_COMPARING"),
+            chip("choose", "我选这个", "我决定用：<产品名>。帮我检查搭配/怎么用。", "S_ROUTINE_CHECK"),
+            ...(input.hasAnchor ? [chip("routine_check", "检查搭配", "把它放进我的早晚流程，怎么搭配更安全？", "S_ROUTINE_CHECK")] : []),
+          ]
+        : [
+            chip("compare_more", "Cheaper dupes", "Any cheaper dupes with similar function?", "S_COMPARING"),
+            chip("choose", "I choose this", "I choose: <product name>. Check routine placement & safety.", "S_ROUTINE_CHECK"),
+            ...(input.hasAnchor ? [chip("routine_check", "Routine check", "How do I layer this safely in AM/PM?", "S_ROUTINE_CHECK")] : []),
+          ];
+
+    case "S_ROUTINE_CHECK":
+      return zh
+        ? [
+            chip("share_routine", "我现在在用…", "我现在的早晚流程是：洁面/水/精华/面霜/防晒…", "S_ROUTINE_CHECK"),
+            chip("sensitive", "我很敏感", "我偏敏感/容易刺痛，想更温和一点。", "S_ROUTINE_CHECK"),
+            chip("simplify", "想更精简省钱", "想更精简/更省钱一点（能合并步骤就合并）。", "S_COMPARING"),
+          ]
+        : [
+            chip("share_routine", "My current routine…", "My AM/PM routine is: cleanser/toner/serum/moisturizer/sunscreen…", "S_ROUTINE_CHECK"),
+            chip("sensitive", "I'm sensitive", "I'm sensitive / prone to stinging, please be more conservative.", "S_ROUTINE_CHECK"),
+            chip("simplify", "Simplify & save", "Can we simplify steps and save budget where possible?", "S_COMPARING"),
+          ];
+
+    case "S_DIAGNOSIS":
+    default:
+      return zh
+        ? [
+            chip("skin_oily", "油皮", "油皮", "S_DIAGNOSIS"),
+            chip("barrier_stable", "屏障稳定", "稳定", "S_DIAGNOSIS"),
+            chip("goal_brighten", "淡斑/提亮", "暗沉/美白", "S_SKU_BROWSING"),
+          ]
+        : [
+            chip("skin_oily", "Oily", "Oily skin", "S_DIAGNOSIS"),
+            chip("barrier_stable", "Barrier stable", "Stable", "S_DIAGNOSIS"),
+            chip("goal_brighten", "Brightening", "Dark spots / brightening", "S_SKU_BROWSING"),
+          ];
+  }
+}
 
 function hasExplicitSkinTypeMention(query: string) {
   const q = query.toLowerCase();
@@ -2445,6 +2568,7 @@ export async function POST(req: Request) {
   const intentText = contextualQuery;
 
   const budgetCny = parseBudgetCny(intentText);
+  const priceSensitive = detectPriceSensitivity(intentText);
   const detectedRegion = detectRegionPreference(intentText);
   const regionLabel = detectedRegion ?? "Global";
   const deepScience = detectDeepScienceQuestion(intentText);
@@ -2489,16 +2613,19 @@ export async function POST(req: Request) {
         ? `我需要你提供具体产品名（或传 \`anchor_product_id\`），我才能基于数据库做“适配/风险/替代”分析。${hint}`
         : `Please provide the exact product name (or send \`anchor_product_id\`) so I can run a fit/risk/alternative analysis from the database.${hint}`;
     if (Boolean(body.stream)) return streamResponse(answer);
+    const questions: ClarificationQuestion[] = [
+      userLang === "zh"
+        ? { id: "anchor", question: "你想对比/评估的具体产品是？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] }
+        : { id: "anchor", question: "Which product do you want to evaluate/compare?", options: ["Send product name", "Send a link", "Send anchor_product_id"] },
+    ];
     return jsonResponse({
       query,
       intent: "clarify",
       answer,
+      current_state: "S_SKU_BROWSING" satisfies AuroraState,
+      next_actions: buildNextActionsFromClarificationQuestions(questions),
       clarification: {
-        questions: [
-          userLang === "zh"
-            ? { id: "anchor", question: "你想对比/评估的具体产品是？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] }
-            : { id: "anchor", question: "Which product do you want to evaluate/compare?", options: ["Send product name", "Send a link", "Send anchor_product_id"] },
-        ],
+        questions,
         candidates: aliasCandidates,
       },
     });
@@ -2624,6 +2751,8 @@ export async function POST(req: Request) {
       query,
       intent: "clarify",
       answer,
+      current_state: "S_DIAGNOSIS" satisfies AuroraState,
+      next_actions: buildNextActionsFromClarificationQuestions(questions),
       clarification: {
         questions,
         missing_fields: Object.entries(missing)
@@ -2643,6 +2772,7 @@ export async function POST(req: Request) {
         sensitive_skin: detectSensitiveSkin(query),
         barrier_impaired: detectBarrierImpaired(query),
       },
+      navigation: { current_state: "S_SCIENCE" satisfies AuroraState },
       ...(external_verification ? { external_verification } : {}),
       note: "Science-only question detected; no anchor product identified.",
     };
@@ -2696,6 +2826,8 @@ export async function POST(req: Request) {
       intent: "science",
       answer,
       llm_error,
+      current_state: "S_SCIENCE" satisfies AuroraState,
+      next_actions: buildNextActionsForState({ state: "S_SCIENCE", language: userLang, hasAnchor: false }),
       context: {
         region_preference: detectedRegion,
         ...(external_verification ? { external_verification } : {}),
@@ -2866,6 +2998,8 @@ export async function POST(req: Request) {
     const wantsExternalVerification = deepScience && evidenceSummary.products_with_kb === 0;
     const external_verification = await maybeGetExternalVerification({ query, enabled: wantsExternalVerification });
 
+    const shortlistState: AuroraState = priceSensitive ? "S_COMPARING" : "S_SKU_BROWSING";
+
     const shortlistContextData = {
       user_query: query,
       region_preference: detectedRegion,
@@ -2873,6 +3007,7 @@ export async function POST(req: Request) {
       active_mentions: activeMentions,
       detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
       user_profile_inferred: sanitizeUserForLlm(user),
+      navigation: { current_state: shortlistState },
       ...(external_verification ? { external_verification } : {}),
       retrieval,
       shortlist_evidence_summary: evidenceSummary,
@@ -2950,6 +3085,8 @@ export async function POST(req: Request) {
       intent: "shortlist",
       answer,
       llm_error,
+      current_state: shortlistState,
+      next_actions: buildNextActionsForState({ state: shortlistState, language: userLang, hasAnchor: false }),
       context: shortlistContextData,
     });
   }
@@ -2966,6 +3103,8 @@ export async function POST(req: Request) {
           query,
           intent: "clarify",
           answer,
+          current_state: "S_DIAGNOSIS" satisfies AuroraState,
+          next_actions: buildNextActionsFromClarificationQuestions(clarify.questions),
           clarification: { questions: clarify.questions, missing_fields: clarify.missing, region_preference: detectedRegion },
         });
       }
@@ -3129,6 +3268,7 @@ export async function POST(req: Request) {
         barrier_impaired: detectBarrierImpaired(query),
       },
       user_profile_inferred: sanitizeUserForLlm(user),
+      navigation: { current_state: "S_ROUTINE_CHECK" satisfies AuroraState },
       ...(external_verification ? { external_verification } : {}),
       routine_evidence_summary: evidenceSummary,
       retrieval,
@@ -3189,6 +3329,8 @@ export async function POST(req: Request) {
       answer,
       llm_error,
       intent: "routine",
+      current_state: "S_ROUTINE_CHECK" satisfies AuroraState,
+      next_actions: buildNextActionsForState({ state: "S_ROUTINE_CHECK", language: userLang, hasAnchor: false }),
       context: {
         detected: {
           oily_acne: detectOilyAcne(query),
@@ -3208,11 +3350,23 @@ export async function POST(req: Request) {
 
   // PRODUCT / DUPE PATH
   if (!anchorProductId || !looksLikeUuid(anchorProductId)) {
+    const answer =
+      userLang === "zh"
+        ? "我没能从你的问题里识别出要评估/对比的具体产品。请发产品名（或链接），或者传 `anchor_product_id`。"
+        : "I couldn't identify which product you want to evaluate/compare. Please send a product name (or a link), or pass `anchor_product_id`.";
+    const questions: ClarificationQuestion[] = [
+      userLang === "zh"
+        ? { id: "anchor", question: "你想评估/对比的具体产品是？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] }
+        : { id: "anchor", question: "Which product do you want to evaluate/compare?", options: ["Send product name", "Send a link", "Send anchor_product_id"] },
+    ];
     return jsonResponse(
       {
         query,
-        answer:
-          "I couldn't identify an anchor product in your query. Please specify a product name (e.g., “Tom Ford Research Serum Concentrate”) or pass `anchor_product_id`.",
+        intent: "clarify",
+        answer,
+        current_state: "S_SKU_BROWSING" satisfies AuroraState,
+        next_actions: buildNextActionsFromClarificationQuestions(questions),
+        clarification: { questions, candidates: aliasCandidates },
       },
       { status: 200 },
     );
@@ -3228,11 +3382,24 @@ export async function POST(req: Request) {
   const user = buildUserVectorFromQuery(query);
 
   if (!anchor) {
-    return jsonResponse({ error: "Anchor product not found", anchor_product_id: anchorProductId }, { status: 404 });
+    const answer =
+      userLang === "zh"
+        ? "我没在数据库里找到这个产品（可能是别名没命中或还没入库）。你可以换一个更完整的产品名，或让我给你 2-3 个候选让你点选。"
+        : "I couldn't find this product in the database (alias may not match or it's not ingested yet). Please send a more specific name, or ask me to propose 2–3 candidates to pick from.";
+    return jsonResponse(
+      {
+        error: "Anchor product not found",
+        anchor_product_id: anchorProductId,
+        answer,
+        current_state: "S_SKU_BROWSING" satisfies AuroraState,
+        next_actions: buildNextActionsForState({ state: "S_SKU_BROWSING", language: userLang, hasAnchor: false }),
+      },
+      { status: 404 },
+    );
   }
 
-  // KB-only anchor support: allow the user to ask about products that exist in KB but haven't been vectorized yet.
-  if (!anchor.vectors) {
+	  // KB-only anchor support: allow the user to ask about products that exist in KB but haven't been vectorized yet.
+	  if (!anchor.vectors) {
     const availability = Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [];
     const kbRows = await prisma.productKbSnippet.findMany({
       where: { productId: anchor.id },
@@ -3268,20 +3435,23 @@ export async function POST(req: Request) {
         (expert_knowledge as any).key_actives_summary,
         (expert_knowledge as any).comparison_notes,
       ].some((v) => typeof v === "string" && v.trim().length > 0);
-    const wantsExternalVerification =
-      detectDeepScienceQuestion(query) && (kb_profile.citations.length === 0 || !expertHasAnyText);
-    const external_verification = await maybeGetExternalVerification({ query, enabled: wantsExternalVerification });
+	    const wantsExternalVerification =
+	      detectDeepScienceQuestion(query) && (kb_profile.citations.length === 0 || !expertHasAnyText);
+	    const external_verification = await maybeGetExternalVerification({ query, enabled: wantsExternalVerification });
 
-    const kbOnlyContext = {
-      user_query: query,
-      region_preference: detectedRegion,
-      detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
-      user_profile_inferred: sanitizeUserForLlm(user),
-      ...(external_verification ? { external_verification } : {}),
-      limitations: ["Anchor product is present in KB, but vectors/embedding are missing.", "Similarity search and scoring are unavailable for this product."],
-      anchor: {
-        id: anchor.id,
-        brand: anchor.brand,
+	    const productState: AuroraState = dupeIntent || priceSensitive ? "S_COMPARING" : "S_ROUTINE_CHECK";
+
+	    const kbOnlyContext = {
+	      user_query: query,
+	      region_preference: detectedRegion,
+	      detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
+	      user_profile_inferred: sanitizeUserForLlm(user),
+	      navigation: { current_state: productState },
+	      ...(external_verification ? { external_verification } : {}),
+	      limitations: ["Anchor product is present in KB, but vectors/embedding are missing.", "Similarity search and scoring are unavailable for this product."],
+	      anchor: {
+	        id: anchor.id,
+	        brand: anchor.brand,
         name: anchor.name,
         price_usd: normalizeUsdPrice(anchor.priceUsd),
         availability,
@@ -3329,21 +3499,23 @@ export async function POST(req: Request) {
 
     if (wantsStream) return streamResponse(answer);
 
-    return jsonResponse({
-      query,
-      anchor_product_id: anchorProductId,
-      llm_provider: provider,
-      llm_model:
+	    return jsonResponse({
+	      query,
+	      anchor_product_id: anchorProductId,
+	      llm_provider: provider,
+	      llm_model:
         requestedModel ??
         (provider === "gemini"
           ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
           : process.env.OPENAI_MODEL ?? "gpt-4o"),
-      answer,
-      llm_error,
-      intent: "product",
-      context: kbOnlyContext,
-    });
-  }
+	      answer,
+	      llm_error,
+	      intent: "product",
+	      current_state: productState,
+	      next_actions: buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true }),
+	      context: kbOnlyContext,
+	    });
+	  }
 
   // Use the shared DB->SkuVector normalization so scoring behaves like /v1/decision/analyze.
   const normalizedAnchorSku = await getSkuById(anchorProductId);
@@ -3462,11 +3634,14 @@ export async function POST(req: Request) {
     mappedCandidates.every((c) => (c.kb_profile?.citations?.length ?? 0) === 0);
   const external_verification = await maybeGetExternalVerification({ query, enabled: wantsExternalVerification });
 
+  const productState: AuroraState = dupeIntent || priceSensitive ? "S_COMPARING" : "S_ROUTINE_CHECK";
+
   const productContextData = {
     user_query: query,
     region_preference: detectedRegion,
     detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
     user_profile_inferred: sanitizeUserForLlm(user),
+    navigation: { current_state: productState },
     ...(external_verification ? { external_verification } : {}),
     anchor: {
       id: anchor.id,
@@ -3591,6 +3766,8 @@ export async function POST(req: Request) {
     answer,
     llm_error,
     intent: "product",
+    current_state: productState,
+    next_actions: buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true }),
     context: {
       detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired, region_preference: detectedRegion },
       ...(external_verification ? { external_verification } : {}),
