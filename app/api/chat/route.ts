@@ -459,7 +459,30 @@ function buildAuroraStructuredSystemPrompt(input: {
 function extractTextFromUnknownMessage(message: unknown): string {
   if (!message || typeof message !== "object") return "";
 
-  if ("content" in message && typeof (message as any).content === "string") return (message as any).content;
+  // Common shapes:
+  // - { role, content: "..." }
+  // - { role, text: "..." }
+  // - { role, content: { text: "..." } }
+  // - { role, content: [{ type:"text", text:"..." }, ...] }  (some UI libs)
+  if ("content" in message) {
+    const c = (message as any).content;
+    if (typeof c === "string") return c;
+    if (c && typeof c === "object" && typeof (c as any).text === "string") return String((c as any).text);
+    if (Array.isArray(c)) {
+      const texts = c
+        .map((p: unknown) => {
+          if (typeof p === "string") return p;
+          if (!p || typeof p !== "object") return "";
+          if ((p as any).type === "text" && typeof (p as any).text === "string") return (p as any).text;
+          if (typeof (p as any).text === "string") return (p as any).text;
+          if (typeof (p as any).content === "string") return (p as any).content;
+          return "";
+        })
+        .filter(Boolean);
+      if (texts.length) return texts.join("\n");
+    }
+  }
+
   if ("text" in message && typeof (message as any).text === "string") return (message as any).text;
 
   if ("parts" in message && Array.isArray((message as any).parts)) {
@@ -477,8 +500,26 @@ function extractTextFromUnknownMessage(message: unknown): string {
 }
 
 function normalizeQuery(body: ChatRequest): string {
-  if (typeof body.query === "string" && body.query.trim()) return body.query.trim();
-  if (typeof body.message === "string" && body.message.trim()) return body.message.trim();
+  const query = typeof body.query === "string" && body.query.trim() ? body.query.trim() : null;
+  const message = typeof body.message === "string" && body.message.trim() ? body.message.trim() : null;
+
+  // Some clients accidentally keep `query` static while still sending updated `messages[]`.
+  // Heuristic: if `query` matches any earlier user message but differs from the latest user message, prefer the latest.
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  if (query) {
+    const userTexts: string[] = [];
+    for (const m of messages) {
+      if (!m || typeof m !== "object") continue;
+      if ((m as any).role !== "user") continue;
+      const t = extractTextFromUnknownMessage(m);
+      if (t.trim()) userTexts.push(t.trim());
+    }
+    const lastUserText = userTexts.length ? userTexts[userTexts.length - 1] : null;
+    if (lastUserText && lastUserText !== query && userTexts.some((t) => t === query)) return lastUserText;
+    return query;
+  }
+
+  if (message) return message;
 
   if (Array.isArray(body.messages) && body.messages.length > 0) {
     const lastUser = [...body.messages].reverse().find((m) => Boolean(m && typeof m === "object" && (m as any).role === "user"));
@@ -2643,8 +2684,13 @@ export async function POST(req: Request) {
 
   // Default: Routine planning unless the user explicitly wants dupe/evaluation (or provides an explicit anchor id).
   const forceProductPathForDeepScience = deepScience && !routineIntent && !dupeIntent && !evalIntent && !explicitAnchorId && highConfidenceAlias;
+
+  // Only enter the routine builder when the user explicitly asked for a routine / AM-PM plan.
+  // This prevents short profile answers (e.g. "油皮") from being treated as a routine request.
+  const explicitRoutineRequest =
+    routineIntent || /\b(am|pm)\b/i.test(intentText) || intentText.toLowerCase().includes("skincare plan");
   const shouldPlanRoutine =
-    routineIntent || (!explicitAnchorId && !wantsShortlist && !dupeIntent && !evalIntent && !forceProductPathForDeepScience && !wantsScienceOnly);
+    explicitRoutineRequest && !wantsShortlist && !dupeIntent && !evalIntent && !forceProductPathForDeepScience && !wantsScienceOnly;
 
   const provider =
     body.llm_provider ??
@@ -2726,7 +2772,11 @@ export async function POST(req: Request) {
     /\b(am|pm)\b/i.test(intentText) ||
     intentText.toLowerCase().includes("skincare plan");
 
-  if (!wantsScienceOnly && wantsProductHelp && !skinProfileComplete) {
+  const looksLikeFollowUpAnswer =
+    isShortFollowUpQuery(query) &&
+    !/^(?:ok|okay|kk|thx|thanks|thank you|ty|好的|好|嗯|收到|明白|了解|谢谢|谢了|不用了|不用|先这样)$/i.test(query.trim());
+
+  if (!wantsScienceOnly && (wantsProductHelp || looksLikeFollowUpAnswer) && !skinProfileComplete) {
     const missing = {
       skinType: !userProfile?.skinType && !sessionProfile.skinType,
       barrierStatus: !userProfile?.barrierStatus && !sessionProfile.barrierStatus,
@@ -3093,6 +3143,8 @@ export async function POST(req: Request) {
 
   // ROUTINE PATH
   if (shouldPlanRoutine) {
+    const routineRequestText = intentText;
+    const routineProfileText = profileText;
     const skipClarify = deepScience && !routineIntent;
     if (!skipClarify) {
       const clarify = buildRoutineClarification(profileText, budgetCny);
@@ -3111,7 +3163,7 @@ export async function POST(req: Request) {
     }
 
     // Build a lightweight user vector from query text.
-    const user = buildUserVectorFromQuery(profileText, budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined);
+    const user = buildUserVectorFromQuery(routineProfileText, budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined);
     const dbAll = await getSkuDatabase();
 
     const mergeSkuPool = (items: Array<SkuVector | null | undefined>) => {
@@ -3144,7 +3196,7 @@ export async function POST(req: Request) {
     // Uses the same embedding model as ingestion (default: text-embedding-004 truncated/padded to 1536).
     if (process.env.DATABASE_URL && !process.env.DATABASE_URL.includes("${{")) {
       try {
-        const embeddingQuery = buildEmbeddingQueryForRoutine(query, user);
+        const embeddingQuery = buildEmbeddingQueryForRoutine(routineRequestText, user);
         const providerForEmbedding: "gemini" | "openai" =
           optionalAnyEnv(["GEMINI_API_KEY", "GOOGLE_API_KEY"]) ? "gemini" : (process.env.OPENAI_API_KEY ? "openai" : "gemini");
 
@@ -3189,7 +3241,7 @@ export async function POST(req: Request) {
           used: false,
           provider: optionalAnyEnv(["GEMINI_API_KEY", "GOOGLE_API_KEY"]) ? "gemini" : "openai",
           embedding_model: "unknown",
-          embedding_query: query,
+          embedding_query: routineRequestText,
           retrieved: [],
           error: e instanceof Error ? e.message : String(e),
         };
@@ -3197,8 +3249,8 @@ export async function POST(req: Request) {
       }
     }
 
-    const routine_primary = buildPrimaryRoutine(dbForRoutine, user, query, budgetCny);
-    const routine_budget = buildBudgetSafeRoutine(dbForRoutine, user, query, budgetCny);
+    const routine_primary = buildPrimaryRoutine(dbForRoutine, user, routineProfileText, budgetCny);
+    const routine_budget = buildBudgetSafeRoutine(dbForRoutine, user, routineProfileText, budgetCny);
     const over_budget = budgetCny != null && Number.isFinite(budgetCny) ? routine_primary.total_cny > budgetCny : false;
     const routine = routine_primary;
 
@@ -3214,8 +3266,8 @@ export async function POST(req: Request) {
       products_with_kb: evidencePacks.filter((p) => (p.citations?.length ?? 0) > 0).length,
     };
 
-    const wantsExternalVerification = detectDeepScienceQuestion(query) && evidenceSummary.products_with_kb === 0;
-    const external_verification = await maybeGetExternalVerification({ query, enabled: wantsExternalVerification });
+    const wantsExternalVerification = detectDeepScienceQuestion(routineRequestText) && evidenceSummary.products_with_kb === 0;
+    const external_verification = await maybeGetExternalVerification({ query: routineRequestText, enabled: wantsExternalVerification });
 
     const summarizeRoutinePrices = (r: RoutineRec) => {
       const seen = new Set<string>();
@@ -3259,13 +3311,14 @@ export async function POST(req: Request) {
 
     const routineContextData = {
       user_query: query,
+      request_text: routineRequestText,
       region_preference: detectedRegion,
       budget_cny: budgetCny,
       budget_usd_est: budgetCny != null ? budgetCny / USD_TO_CNY : null,
       detected: {
-        oily_acne: detectOilyAcne(query),
-        sensitive_skin: detectSensitiveSkin(query),
-        barrier_impaired: detectBarrierImpaired(query),
+        oily_acne: detectOilyAcne(routineProfileText),
+        sensitive_skin: detectSensitiveSkin(routineProfileText),
+        barrier_impaired: detectBarrierImpaired(routineProfileText),
       },
       user_profile_inferred: sanitizeUserForLlm(user),
       navigation: { current_state: "S_ROUTINE_CHECK" satisfies AuroraState },
@@ -3298,12 +3351,12 @@ export async function POST(req: Request) {
     try {
       answer =
         provider === "gemini"
-          ? await geminiGenerateContent({ system_prompt: systemPrompt, user_prompt: `User request: ${query}`, model: requestedModel })
+          ? await geminiGenerateContent({ system_prompt: systemPrompt, user_prompt: `User request: ${routineRequestText}`, model: requestedModel })
           : await openaiChatCompletion({
               model: requestedModel,
               messages: [
                 { role: "system", content: systemPrompt },
-                { role: "user", content: `User request: ${query}` },
+                { role: "user", content: `User request: ${routineRequestText}` },
               ],
             });
 
@@ -3333,9 +3386,9 @@ export async function POST(req: Request) {
       next_actions: buildNextActionsForState({ state: "S_ROUTINE_CHECK", language: userLang, hasAnchor: false }),
       context: {
         detected: {
-          oily_acne: detectOilyAcne(query),
-          sensitive_skin: detectSensitiveSkin(query),
-          barrier_impaired: detectBarrierImpaired(query),
+          oily_acne: detectOilyAcne(routineProfileText),
+          sensitive_skin: detectSensitiveSkin(routineProfileText),
+          barrier_impaired: detectBarrierImpaired(routineProfileText),
           region_preference: detectedRegion,
         },
         budget_cny: budgetCny,
@@ -3350,26 +3403,56 @@ export async function POST(req: Request) {
 
   // PRODUCT / DUPE PATH
   if (!anchorProductId || !looksLikeUuid(anchorProductId)) {
-    const answer =
-      userLang === "zh"
-        ? "我没能从你的问题里识别出要评估/对比的具体产品。请发产品名（或链接），或者传 `anchor_product_id`。"
-        : "I couldn't identify which product you want to evaluate/compare. Please send a product name (or a link), or pass `anchor_product_id`.";
+    // If the user explicitly asked to evaluate/compare/dupe but didn't specify a product, ask for an anchor.
+    if (dupeIntent || evalIntent) {
+      const answer =
+        userLang === "zh"
+          ? "我没能从你的问题里识别出要评估/对比的具体产品。请发产品名（或链接），或者传 `anchor_product_id`。"
+          : "I couldn't identify which product you want to evaluate/compare. Please send a product name (or a link), or pass `anchor_product_id`.";
+      const questions: ClarificationQuestion[] = [
+        userLang === "zh"
+          ? { id: "anchor", question: "你想评估/对比的具体产品是？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] }
+          : { id: "anchor", question: "Which product do you want to evaluate/compare?", options: ["Send product name", "Send a link", "Send anchor_product_id"] },
+      ];
+      return jsonResponse(
+        {
+          query,
+          intent: "clarify",
+          answer,
+          current_state: "S_SKU_BROWSING" satisfies AuroraState,
+          next_actions: buildNextActionsFromClarificationQuestions(questions),
+          clarification: { questions, candidates: aliasCandidates },
+        },
+        { status: 200 },
+      );
+    }
+
+    // Otherwise: treat as navigation (the user may just be answering a profile question or starting the chat).
     const questions: ClarificationQuestion[] = [
       userLang === "zh"
-        ? { id: "anchor", question: "你想评估/对比的具体产品是？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] }
-        : { id: "anchor", question: "Which product do you want to evaluate/compare?", options: ["Send product name", "Send a link", "Send anchor_product_id"] },
+        ? {
+            id: "next",
+            question: "你接下来想让我帮你做哪一件事？",
+            options: ["给我推荐一款/几款（比如美白精华）", "给我一套早晚流程（AM/PM）", "评估某个具体产品是否适合我", "找平替/更便宜的替代", "问成分科学（证据/机制）"],
+          }
+        : {
+            id: "next",
+            question: "What do you want to do next?",
+            options: ["Recommend a few products (e.g., brightening serum)", "Build an AM/PM routine", "Evaluate a specific product for me", "Find dupes/cheaper alternatives", "Ask ingredient science (evidence/mechanism)"],
+          },
     ];
-    return jsonResponse(
-      {
-        query,
-        intent: "clarify",
-        answer,
-        current_state: "S_SKU_BROWSING" satisfies AuroraState,
-        next_actions: buildNextActionsFromClarificationQuestions(questions),
-        clarification: { questions, candidates: aliasCandidates },
-      },
-      { status: 200 },
-    );
+    const answer =
+      userLang === "zh"
+        ? "我可以继续，但我需要你先选一下方向（点选即可）。"
+        : "I can continue, but please pick what you want next (tap an option).";
+    return jsonResponse({
+      query,
+      intent: "clarify",
+      answer,
+      current_state: "S_DIAGNOSIS" satisfies AuroraState,
+      next_actions: buildNextActionsFromClarificationQuestions(questions),
+      clarification: { questions },
+    });
   }
 
   const anchor = await prisma.product.findUnique({
