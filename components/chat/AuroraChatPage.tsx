@@ -117,6 +117,7 @@ export function AuroraChatPage() {
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const selfieInputRef = useRef<HTMLInputElement | null>(null);
+  const messagesRef = useRef<ChatMessage[]>([]);
 
   const [userId, setUserId] = useState<string | null>(null);
   const [skinIdentity, setSkinIdentity] = useState<SkinIdentitySnapshot | null>(null);
@@ -133,6 +134,10 @@ export function AuroraChatPage() {
     if (!listRef.current) return;
     listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [lastMessageId]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   const diagnosisProgressFromProfile = useMemo(() => {
     if (!skinIdentity) return 0;
@@ -210,7 +215,10 @@ export function AuroraChatPage() {
       setInput("");
 
       try {
-        const snapshot = [...messages, userMessage].slice(-24);
+        const snapshot = [...messagesRef.current, userMessage].slice(-24);
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 25000);
+
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -219,7 +227,9 @@ export function AuroraChatPage() {
             messages: toApiMessages(snapshot),
             stream: false,
           }),
+          signal: controller.signal,
         });
+        window.clearTimeout(timeout);
 
         const data = (await res.json()) as ChatApiResponse;
         if (!res.ok) {
@@ -243,18 +253,26 @@ export function AuroraChatPage() {
         // This avoids the UI being stuck at <100% after the engine has already returned an answer.
         if (typeof data.intent === "string" && data.intent !== "clarify") {
           setDiagnosisProgressOverride(100);
+        } else if (Array.isArray(data.clarification?.missing_fields) && data.clarification?.missing_fields?.length === 0) {
+          // Some flows return `intent=clarify` while missing_fields is empty (navigation step). Treat diagnosis as done.
+          setDiagnosisProgressOverride(100);
         }
 
         if (userId) void refreshIdentity(userId);
       } catch (e) {
-        const err = e instanceof Error ? e.message : "Failed to reach /api/chat";
+        const err =
+          e instanceof DOMException && e.name === "AbortError"
+            ? "Request timed out. Please try again."
+            : e instanceof Error
+              ? e.message
+              : "Failed to reach /api/chat";
         setSendError(err);
         pushMessage({ id: makeId("a"), role: "assistant", content: `Sorry — ${err}.` });
       } finally {
         setIsSending(false);
       }
     },
-    [isSending, messages, pushMessage, refreshIdentity, userId],
+    [isSending, pushMessage, refreshIdentity, userId],
   );
 
   const onSubmit = useCallback(
@@ -402,7 +420,7 @@ export function AuroraChatPage() {
             onChange={(e) => handleSelfiePicked(e.target.files?.[0] ?? null)}
           />
 
-          {skinIdentity && !(diagnosisProgress >= 100 && !diagnosisExpanded) ? (
+          {skinIdentity && diagnosisProgress < 100 ? (
             <div className="mb-3 sticky top-0 z-20 pt-2 -mt-2">
               <div className="rounded-2xl border border-slate-200 bg-white/90 backdrop-blur shadow-sm">
                 <button
