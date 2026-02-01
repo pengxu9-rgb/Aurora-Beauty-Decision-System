@@ -112,6 +112,28 @@ python3 worker/ingest.py --input-json worker/datasets/top10.json --overwrite
 
 你也可以把自己准备的 JSON 列表保存成文件后用 `--input-json` 导入（支持格式：`[{...}, ...]` 或 `{ "items": [...] }`）。
 
+## 4.1.1) 直接导入 KB upsert pack（JSON）
+
+如果你手上有形如 `aurora_kb_upsert_pack.json` 的打包文件（包含 `ingest_ready` / `needs_research`），
+可以先用脚本拆出可直接灌库的 JSON（只会把 **有 ingredients_text** 的条目放到 ready 文件里）：
+
+```bash
+cd client
+python3 worker/kb_pack_to_ingest_json.py \
+  --in /path/to/aurora_kb_upsert_pack.json \
+  --out-ready worker/datasets/kb_ready.json \
+  --out-research worker/datasets/kb_needs_research.json
+```
+
+然后把 ready 文件导入（会跑 LLM 生成向量 + social_stats；并在 `--ingest-kb` 时把 `kb_snippets` 写入 `product_kb_snippets`）：
+
+```bash
+cd client
+python3 worker/ingest.py --input-json worker/datasets/kb_ready.json --overwrite --ingest-kb
+```
+
+`worker/datasets/kb_needs_research.json` 是一个“待补齐 ingredients/价格/链接”的模板；补齐后同样可用 `--input-json` 再导入一次。
+
 ## 4.2) 导入 KB Snippets（专家注脚/对比/敏感提示）
 
 如果你的 Excel 里除了成分列，还包含 “Comparison notes / Sensitivity flags / Key actives / 用法/搭配/质地”等列，

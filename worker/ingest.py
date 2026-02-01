@@ -147,6 +147,7 @@ class InputSku:
   product_url: Optional[str] = None
   image_url: Optional[str] = None
   expert_knowledge: Optional[Dict[str, Any]] = None
+  kb_snippets: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass(frozen=True)
@@ -1837,6 +1838,7 @@ def load_input_skus_from_json(*, path: str, price_cny_rate: float, limit: Option
     ingredients = str(raw.get("ingredients_text") or raw.get("ingredients") or "").strip()
 
     expert_raw = raw.get("expert_knowledge") if isinstance(raw.get("expert_knowledge"), dict) else None
+    kb_snippets_raw = raw.get("kb_snippets") if isinstance(raw.get("kb_snippets"), list) else None
 
     price_usd_raw = raw.get("price_usd", raw.get("price"))
     try:
@@ -1876,6 +1878,7 @@ def load_input_skus_from_json(*, path: str, price_cny_rate: float, limit: Option
         product_url=str(product_url).strip() if product_url else None,
         image_url=str(image_url).strip() if image_url else None,
         expert_knowledge=expert_raw,
+        kb_snippets=kb_snippets_raw,
       )
     )
 
@@ -2429,6 +2432,55 @@ def main() -> None:
         print(f"📚 KB snippets upserted: {upserted} (skipped missing products: {skipped})")
       else:
         print("📚 No KB snippets found in workbook.")
+
+    if args.ingest_kb and args.input_json:
+      product_ids = db.load_all_product_ids()
+      product_ids_norm = db.load_all_product_ids_normalized()
+      product_ids_full_norm: Dict[str, str] = {}
+      for (b, n), pid in product_ids.items():
+        full_key = normalize_match_key(f"{b} {n}")
+        if full_key:
+          product_ids_full_norm.setdefault(full_key, pid)
+
+      upserted = 0
+      skipped = 0
+      for sku in skus:
+        snippets_raw = sku.kb_snippets if isinstance(sku.kb_snippets, list) else []
+        if not snippets_raw:
+          continue
+
+        pid = product_ids.get((sku.brand, sku.name))
+        if not pid:
+          pid = product_ids_norm.get((normalize_match_key(sku.brand), normalize_match_key(sku.name)))
+        if not pid:
+          pid = product_ids_full_norm.get(normalize_match_key(f"{sku.brand} {sku.name}"))
+        if not pid:
+          skipped += len(snippets_raw)
+          continue
+
+        for raw in snippets_raw:
+          if not isinstance(raw, dict):
+            continue
+          source_sheet = str(raw.get("source_sheet") or raw.get("sourceSheet") or "json").strip() or "json"
+          field = str(raw.get("field") or raw.get("canonical_key") or raw.get("canonicalKey") or "notes").strip() or "notes"
+          content = str(raw.get("content") or "").strip()
+          if not content:
+            continue
+
+          metadata = dict(raw)
+          metadata.setdefault("ingested_from", "json")
+          metadata.setdefault("product_full_name", f"{sku.brand} {sku.name}".strip())
+          db.upsert_kb_snippet(
+            product_id=pid,
+            source_sheet=source_sheet,
+            field=field,
+            content=content,
+            metadata=metadata,
+          )
+          upserted += 1
+
+      db.conn.commit()
+      print(f"📚 KB snippets upserted from JSON: {upserted} (skipped missing products: {skipped})")
 
 
 if __name__ == "__main__":
