@@ -232,6 +232,16 @@ function inferSessionBarrierStatusFromText(text: string): SessionSkinProfile["ba
 
   // Safety-first: if any clear impaired signal exists, treat as impaired.
   if (detectBarrierImpaired(text) || detectSensitiveSkin(text)) return "Impaired";
+
+  // Handle quick-reply chips anywhere in the recent message window (not just the last line).
+  // This prevents the system from asking "barrier status" again after the user already tapped "稳定".
+  const hasImpairedChip = lines.some(
+    (l) => l === "刺痛/泛红" || l === "刺痛泛红" || l === "刺痛" || l === "泛红" || l.toLowerCase() === "stinging/red" || l.toLowerCase() === "stinging" || l.toLowerCase() === "red",
+  );
+  if (hasImpairedChip) return "Impaired";
+  const hasStableChip = lines.some((l) => l === "稳定" || l === "稳定的" || /^(stable)$/i.test(l));
+  if (hasStableChip) return "Healthy";
+
   if (detectBarrierHealthyMention(text)) return "Healthy";
 
   // Handle quick-reply chips used by the UI (prevents infinite "ask again" loops).
