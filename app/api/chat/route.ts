@@ -2500,6 +2500,55 @@ function buildFallbackRoutineAnswer(input: {
 
   const priceLabel = (usd: number) => (!Number.isFinite(usd) || usd <= 0 ? t("Price unknown", "价格未知") : formatUsd(usd));
 
+  const budgetNegotiation = (() => {
+    const budgetUsd = budget_cny != null ? budget_cny / USD_TO_CNY : null;
+    const { tier, tier_cap_usd } = inferBudgetTierFromUsd(budgetUsd);
+    const cap = tier_cap_usd != null && tier_cap_usd > 0 ? tier_cap_usd : null;
+    const thresholdUsd = cap != null ? cap * BUDGET_TIER_THRESHOLD_MULTIPLIER : null;
+    const knownSubtotalUsd = costSummary.knownUsd;
+    const unknownCount = costSummary.unknownCount;
+
+    const overThreshold =
+      thresholdUsd != null ? (unknownCount === 0 ? knownSubtotalUsd > thresholdUsd : knownSubtotalUsd > thresholdUsd) : null;
+
+    const findSwap = () => {
+      if (!routine_budget) return null;
+      const washOffSteps = new Set<string>(["Cleanser", "Toner", "Toner/Acid"]);
+      const allPrimary = [...routine_primary.am, ...routine_primary.pm];
+      const allBudget = [...routine_budget.am, ...routine_budget.pm];
+      for (const stepName of washOffSteps) {
+        const from = allPrimary.find((s) => s.step === stepName)?.sku ?? null;
+        const to = allBudget.find((s) => s.step === stepName)?.sku ?? null;
+        if (!from || !to) continue;
+        if (from.sku_id === to.sku_id) continue;
+        const fromPrice = normalizeUsdPrice(from.price);
+        const toPrice = normalizeUsdPrice(to.price);
+        const savings = fromPrice != null && toPrice != null ? Math.max(0, fromPrice - toPrice) : null;
+        return {
+          step: stepName,
+          from: { brand: from.brand, name: from.name, price_usd: fromPrice },
+          to: { brand: to.brand, name: to.name, price_usd: toPrice },
+          estimated_savings_usd: savings,
+        };
+      }
+      return null;
+    };
+
+    const suggested_swap = findSwap();
+    const shouldTrigger = Boolean(overThreshold);
+
+    return {
+      tier,
+      tier_cap_usd,
+      threshold_multiplier: BUDGET_TIER_THRESHOLD_MULTIPLIER,
+      threshold_usd: thresholdUsd,
+      known_subtotal_usd: knownSubtotalUsd,
+      unknown_count: unknownCount,
+      trigger_budget_optimization_protocol: shouldTrigger,
+      suggested_swap,
+    };
+  })();
+
   const lines: string[] = [];
   lines.push("Part 1: Diagnosis 🩺");
   lines.push(
@@ -2567,6 +2616,25 @@ function buildFallbackRoutineAnswer(input: {
         `- 主方案合计≈${formatUsd(costSummary.knownUsd)}（≈${formatCny(costSummary.knownCny)}）${
           withinBudget == null ? "" : withinBudget ? "，在预算内" : "，可能超预算"
         }。`,
+      ),
+    );
+  }
+
+  if (budgetNegotiation.trigger_budget_optimization_protocol) {
+    const swap = budgetNegotiation.suggested_swap;
+    const amount =
+      swap?.estimated_savings_usd != null
+        ? formatUsd(swap.estimated_savings_usd)
+        : t("some budget", "一部分预算");
+    const fromName = swap ? `${swap.from.brand} ${swap.from.name}` : t("a wash-off product", "一个冲洗型产品（如洁面/水）");
+    const toName = swap ? `${swap.to.brand} ${swap.to.name}` : t("a cheaper alternative", "更省钱的替代");
+
+    lines.push("");
+    lines.push(t("🧾 Budget Optimization Protocol", "🧾 预算优化建议"));
+    lines.push(
+      t(
+        `I noticed we're a bit over your usual range. Since ${fromName} is a wash-off product, we could swap it for ${toName} to save ${amount}, allowing you to invest more in what stays on your skin. Thoughts?`,
+        `我注意到我们可能有点超出你的常规预算。因为「${fromName}」属于冲洗型步骤，我们可以换成「${toName}」来省下 ${amount}，把预算更多投到“留肤更久”的精华/治疗上。你觉得呢？`,
       ),
     );
   }
@@ -3512,6 +3580,9 @@ export async function POST(req: Request) {
           region_preference: detectedRegion,
         },
         budget_cny: budgetCny,
+        budget_usd_est: routineContextData.budget_usd_est,
+        budget: routineContextData.budget,
+        price_summary: routineContextData.price_summary,
         routine: routine_primary_with_evidence,
         routine_primary: routine_primary_with_evidence,
         routine_budget: routine_budget_with_evidence,
