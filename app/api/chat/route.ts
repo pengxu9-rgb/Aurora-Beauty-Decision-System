@@ -994,6 +994,10 @@ function detectRoutineIntegrationIntent(query: string) {
     query.includes("怎么用") ||
     query.includes("顺序") ||
     query.includes("先后") ||
+    query.includes("早晚") ||
+    query.includes("早上") ||
+    query.includes("晚上") ||
+    query.includes("每天") ||
     query.includes("频率") ||
     query.includes("每周") ||
     query.includes("几次");
@@ -1414,11 +1418,12 @@ function buildRoutineClarification(query: string, budgetCny: number | null): { q
   const hasSkin = hasExplicitSkinTypeMention(query) || detectSensitiveSkin(query);
   const hasConcern = hasExplicitPrimaryConcern(query);
   const needsBudget = mentionsBudgetButMissing(query, budgetCny);
-  const barrierUnknown = !detectSensitiveSkin(query) && !detectBarrierImpaired(query) && mentionsStrongActives(query);
+  const barrierKnown = inferSessionBarrierStatusFromText(query) != null;
+  const barrierUnknown = !barrierKnown && mentionsStrongActives(query);
 
   // Priority 1: budget only when the user explicitly cares.
   if (needsBudget) {
-    missing.push("budget");
+    missing.push("budget_cny");
     questions.push({
       id: "budget",
       question: "你的月预算大概是多少？",
@@ -1428,7 +1433,7 @@ function buildRoutineClarification(query: string, budgetCny: number | null): { q
 
   // Priority 2: skin type (only if not implied by sensitivity).
   if (!hasSkin && questions.length < 2) {
-    missing.push("skin_type");
+    missing.push("skinType");
     questions.push({
       id: "skin_type",
       question: "你的肤质更接近哪一种？",
@@ -1448,7 +1453,7 @@ function buildRoutineClarification(query: string, budgetCny: number | null): { q
 
   // Optional: barrier status only when actives are mentioned and we still have space.
   if (barrierUnknown && questions.length < 2) {
-    missing.push("barrier_status");
+    missing.push("barrierStatus");
     questions.push({
       id: "barrier_status",
       question: "你最近是否有刺痛/泛红/爆皮（屏障受损）？",
@@ -3097,6 +3102,12 @@ function buildFallbackRoutineCheckAnswer(input: {
   const cite = input.anchor.kb_profile.citations?.[0] ? ` ${input.anchor.kb_profile.citations[0]}` : "";
   const how = buildHowToUseV1({ category: null, kb_profile: input.anchor.kb_profile as any, lang }) ?? {};
   const avoid = Array.isArray(how.avoid_with) ? how.avoid_with : [];
+  const activeLike = detectActiveLikeProductForRoutineCheck({
+    kb_profile: { keyActives: input.anchor.kb_profile.keyActives ?? [], sensitivityFlags: [] },
+    expert_knowledge: input.anchor.expert_knowledge,
+  });
+  const wantsAggressiveUse =
+    /(早晚各(一)?次|早晚都用|一天两次|每晚(使用|用)|每天晚上|every night|nightly|twice a day|morning and night)/i.test(input.query);
   const localizeAvoidRule = (rule: string) => {
     if (lang !== "zh") return rule;
     const r = rule.trim();
@@ -3145,6 +3156,14 @@ function buildFallbackRoutineCheckAnswer(input: {
   if (how.placement) lines.push(`- ${t("Placement", "位置")}: ${how.placement}`);
   if (how.frequency) lines.push(`- ${t("Frequency", "频率")}: ${how.frequency}`);
   if (!how.frequency) lines.push(t("- Frequency: start 2–3 nights/week, then increase as tolerated.", "- 频率：先从每周 2–3 晚开始，耐受后再加频。"));
+  if (activeLike && wantsAggressiveUse) {
+    lines.push(
+      t(
+        "- If you planned to use it nightly or twice daily: don’t. Start 2–3 nights/week and increase only if fully tolerated.",
+        "- 如果你想“每晚/早晚都用”：不建议。先从每周 2–3 晚开始，完全耐受再考虑加频。",
+      ),
+    );
+  }
 
   lines.push("");
   lines.push(t("⚠️ Avoid mixing / conflicts:", "⚠️ 避免叠加/冲突："));
@@ -4686,7 +4705,7 @@ export async function POST(req: Request) {
 	      detectDeepScienceQuestion(query) && (kb_profile.citations.length === 0 || !expertHasAnyText);
 	    const external_verification = await maybeGetExternalVerification({ query, enabled: wantsExternalVerification });
 
-	    const productState: AuroraState = routineIntent ? "S_ROUTINE_CHECK" : "S_COMPARING";
+	    const productState: AuroraState = routineIntent || routineIntegrationIntent ? "S_ROUTINE_CHECK" : "S_COMPARING";
 
 	    const kbOnlyContext = {
 	      user_query: query,
@@ -4964,7 +4983,7 @@ export async function POST(req: Request) {
     mappedCandidates.every((c) => (c.kb_profile?.citations?.length ?? 0) === 0);
   const external_verification = await maybeGetExternalVerification({ query, enabled: wantsExternalVerification });
 
-  const productState: AuroraState = routineIntent ? "S_ROUTINE_CHECK" : "S_COMPARING";
+  const productState: AuroraState = routineIntent || routineIntegrationIntent ? "S_ROUTINE_CHECK" : "S_COMPARING";
 
   const productContextData = {
     user_query: query,
