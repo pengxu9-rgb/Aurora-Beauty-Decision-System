@@ -981,6 +981,40 @@ function detectProductEvaluationIntent(query: string) {
   );
 }
 
+function detectRoutineIntegrationIntent(query: string) {
+  const q = query.toLowerCase();
+  const cn =
+    query.includes("放进") ||
+    query.includes("加入") ||
+    query.includes("放到") ||
+    query.includes("叠加") ||
+    query.includes("搭配") ||
+    query.includes("冲突") ||
+    query.includes("一起用") ||
+    query.includes("怎么用") ||
+    query.includes("顺序") ||
+    query.includes("先后") ||
+    query.includes("频率") ||
+    query.includes("每周") ||
+    query.includes("几次");
+
+  const en =
+    q.includes("how to use") ||
+    q.includes("how often") ||
+    q.includes("frequency") ||
+    q.includes("layer") ||
+    q.includes("layering") ||
+    q.includes("combine") ||
+    q.includes("mix") ||
+    q.includes("conflict") ||
+    q.includes("fit into") ||
+    q.includes("add to") ||
+    q.includes("integrate") ||
+    q.includes("routine check");
+
+  return cn || en;
+}
+
 function mapRiskFlags(rawFlags: unknown): RiskFlag[] {
   const flags = Array.isArray(rawFlags) ? rawFlags.map((f) => String(f).toLowerCase()) : [];
   const out = new Set<RiskFlag>();
@@ -2801,6 +2835,23 @@ function isBadAnswer(answer: string, mode: "routine" | "product") {
   return false;
 }
 
+function isBadRoutineCheckAnswer(answer: string) {
+  const trimmed = answer.trim();
+  if (trimmed.length < 80) return true;
+  if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
+
+  // Avoid dead-end "pick a direction" loops.
+  if (/(我可以继续|需要你先选|pick what you want next|I can continue, but)/i.test(trimmed)) return true;
+
+  const hasUsage =
+    /(频率|每周|次\/周|nights\/week|how often|frequency|start\s+\d|先从|放在|before|after|avoid|不要|叠加|冲突)/i.test(trimmed);
+  const asksRoutine =
+    /(你.*(现在|目前).*(流程|routine)|你.*在用.*(酸|A醇|维A|retinol|retinal|adapalene|acid|vitamin c|L-ascorbic|copper))/i.test(trimmed);
+  if (!hasUsage && !asksRoutine) return true;
+
+  return false;
+}
+
 function isBadScienceAnswer(answer: string) {
   const trimmed = answer.trim();
   if (trimmed.length < 80) return true;
@@ -2979,6 +3030,67 @@ function buildFallbackProductAnswer(input: {
     lines.push("目前没有检索到足够的平替候选（可能是数据库样本还不够多）。");
   }
 
+  return lines.join("\n").trim();
+}
+
+function buildFallbackRoutineCheckAnswer(input: {
+  query: string;
+  regionLabel: string;
+  language: UserLanguage;
+  detected: { sensitive_skin: boolean; barrier_impaired: boolean };
+  anchor: {
+    brand: string;
+    name: string;
+    kb_profile: Pick<KbProfile, "keyActives" | "pairingRules" | "citations">;
+    expert_knowledge: any;
+  };
+}) {
+  const lang = input.language ?? detectUserLanguage(input.query);
+  const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
+  const cite = input.anchor.kb_profile.citations?.[0] ? ` ${input.anchor.kb_profile.citations[0]}` : "";
+  const how = buildHowToUseV1({ category: null, kb_profile: input.anchor.kb_profile as any, lang }) ?? {};
+  const avoid = Array.isArray(how.avoid_with) ? how.avoid_with : [];
+  const ek = input.anchor.expert_knowledge;
+  const sensitivityNotes = (typeof ek?.sensitivity_notes === "string" && ek.sensitivity_notes.trim()) ? ek.sensitivity_notes.trim() : null;
+  const flags = (typeof ek?.sensitivity_flags === "string" && ek.sensitivity_flags.trim()) ? ek.sensitivity_flags.trim() : null;
+  const keyActives = (typeof ek?.key_actives_summary === "string" && ek.key_actives_summary.trim())
+    ? ek.key_actives_summary.trim()
+    : (typeof ek?.key_actives === "string" && ek.key_actives.trim())
+      ? ek.key_actives.trim()
+      : null;
+
+  const lines: string[] = [];
+  lines.push(t("✅ Routine integration for:", "✅ 流程整合："));
+  lines.push(`- ${input.anchor.brand} ${input.anchor.name}${cite}`);
+  lines.push(t(`- Region: ${input.regionLabel}`, `- 坐标：${input.regionLabel}`));
+
+  if (input.detected.barrier_impaired) {
+    lines.push(t("🚫 You mentioned barrier impairment (stinging/redness): start extra conservatively.", "🚫 你提到刺痛/泛红：建议更保守，从低频开始。"));
+  } else if (input.detected.sensitive_skin) {
+    lines.push(t("⚠️ Sensitive skin: patch test and titrate slowly.", "⚠️ 敏感肌：建议先局部测试，循序渐进加频。"));
+  }
+
+  if (keyActives) lines.push(t(`- Key actives (KB): ${keyActives}`, `- 关键活性（KB）：${keyActives}`));
+  if (sensitivityNotes) lines.push(t(`- Sensitivity note (KB): ${sensitivityNotes}`, `- 刺激/敏感提示（KB）：${sensitivityNotes}`));
+  else if (flags) lines.push(t(`- Sensitivity flags (KB): ${flags}`, `- 敏感标记（KB）：${flags}`));
+
+  lines.push("");
+  lines.push(t("📍 Placement & frequency (safe default):", "📍 放置与频率（安全默认）："));
+  if (how.placement) lines.push(`- ${t("Placement", "位置")}: ${how.placement}`);
+  if (how.frequency) lines.push(`- ${t("Frequency", "频率")}: ${how.frequency}`);
+  if (!how.frequency) lines.push(t("- Frequency: start 2–3 nights/week, then increase as tolerated.", "- 频率：先从每周 2–3 晚开始，耐受后再加频。"));
+
+  lines.push("");
+  lines.push(t("⚠️ Avoid mixing / conflicts:", "⚠️ 避免叠加/冲突："));
+  if (avoid.length) {
+    for (const rule of avoid.slice(0, 6)) lines.push(`- ${rule}`);
+  } else {
+    lines.push(t("- Do not stack multiple strong acids/retinoids in the same night.", "- 同一晚不要叠加强酸/高强度维A类。"));
+    lines.push(t("- If you use copper peptides, separate from direct acids / pure L-ascorbic acid.", "- 如果你同时用蓝铜肽，尽量与直酸/纯左旋维C错开（AM/PM 或隔天）。"));
+  }
+
+  lines.push("");
+  lines.push(t("To make this 100% safe, tell me your current AM/PM routine (just product types is OK).", "为了把风险降到最低，告诉我你现在 AM/PM 在用什么（写步骤/品类即可）。"));
   return lines.join("\n").trim();
 }
 
@@ -3379,8 +3491,16 @@ export async function POST(req: Request) {
   // This prevents short profile answers (e.g. "油皮") from being treated as a routine request.
   const explicitRoutineRequest =
     routineIntent || /\b(am|pm)\b/i.test(intentText) || intentText.toLowerCase().includes("skincare plan");
+  const routineIntegrationIntent = detectRoutineIntegrationIntent(intentText);
+  const routineCheckWithAnchor = routineIntegrationIntent && Boolean(explicitAnchorId || highConfidenceAlias);
   const shouldPlanRoutine =
-    explicitRoutineRequest && !wantsShortlist && !dupeIntent && !evalIntent && !forceProductPathForDeepScience && !wantsScienceOnly;
+    explicitRoutineRequest &&
+    !wantsShortlist &&
+    !dupeIntent &&
+    !evalIntent &&
+    !forceProductPathForDeepScience &&
+    !wantsScienceOnly &&
+    !routineCheckWithAnchor;
 
   const provider =
     body.llm_provider ??
@@ -4768,7 +4888,7 @@ export async function POST(req: Request) {
     };
   });
 
-  const contextText = `User request: ${query}`;
+  const contextText = `User request: ${contextualQuery}`;
 
   const anchorSkuForLlm = sanitizeSkuForLlm(anchorSku);
 
@@ -4855,28 +4975,37 @@ export async function POST(req: Request) {
 
   const systemPrompt = buildSystemPrompt(JSON.stringify(productContextData), "product");
 
-	  const fallbackAnswer = buildFallbackProductAnswer({
-	    query,
-	    detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
-	    anchor: {
-	      brand: anchor.brand,
-	      name: anchor.name,
-	      price_usd: normalizeUsdPrice(anchor.priceUsd),
-	      score: anchorScore,
-	      ingredients: anchorIngredientCtx,
-	      vetoed: anchorVetoed || anchorScore.vetoed,
-	      citations: anchorKbProfile.citations.slice(0, 1),
-	    },
-	    candidates: mappedCandidates.map((c) => ({
-	      brand: c.brand,
-	      name: c.name,
-	      price_usd: c.price_usd,
-	      similarity: c.similarity,
-	      tradeoff: c.tradeoff,
-	      ingredients: c.ingredients,
-	      citations: c.kb_profile.citations.slice(0, 1),
-	    })),
-	  });
+	  const fallbackAnswer =
+	    productState === "S_ROUTINE_CHECK"
+	      ? buildFallbackRoutineCheckAnswer({
+	          query,
+	          regionLabel,
+	          language: userLang,
+	          detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
+	          anchor: { brand: anchor.brand, name: anchor.name, kb_profile: anchorKbProfile, expert_knowledge: anchorExpertKnowledge },
+	        })
+	      : buildFallbackProductAnswer({
+	          query,
+	          detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
+	          anchor: {
+	            brand: anchor.brand,
+	            name: anchor.name,
+	            price_usd: normalizeUsdPrice(anchor.priceUsd),
+	            score: anchorScore,
+	            ingredients: anchorIngredientCtx,
+	            vetoed: anchorVetoed || anchorScore.vetoed,
+	            citations: anchorKbProfile.citations.slice(0, 1),
+	          },
+	          candidates: mappedCandidates.map((c) => ({
+	            brand: c.brand,
+	            name: c.name,
+	            price_usd: c.price_usd,
+	            similarity: c.similarity,
+	            tradeoff: c.tradeoff,
+	            ingredients: c.ingredients,
+	            citations: c.kb_profile.citations.slice(0, 1),
+	          })),
+	        });
 
   let answer = "";
   let llm_error: string | null = null;
@@ -4892,8 +5021,9 @@ export async function POST(req: Request) {
             ],
           });
 
-    if (isBadAnswer(answer, "product")) {
-      llm_error = "LLM answer too short; used fallback.";
+    const bad = productState === "S_ROUTINE_CHECK" ? isBadRoutineCheckAnswer(answer) : isBadAnswer(answer, "product");
+    if (bad) {
+      llm_error = productState === "S_ROUTINE_CHECK" ? "LLM routine-check answer too short/unactionable; used fallback." : "LLM answer too short; used fallback.";
       answer = fallbackAnswer;
     }
   } catch (e) {
