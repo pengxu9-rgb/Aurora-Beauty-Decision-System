@@ -2,11 +2,12 @@
 
 import { cn } from "@/lib/cn";
 
-export type NextActionChip = {
+export type ActionChip = {
   id: string;
   label: string;
-  text: string;
-  next_state?: string;
+  kind?: "quick_reply" | "action";
+  text?: string;
+  data?: Record<string, unknown>;
 };
 
 export function ActionChips({
@@ -15,8 +16,8 @@ export function ActionChips({
   onSelect,
 }: {
   title?: string;
-  actions: NextActionChip[];
-  onSelect: (action: NextActionChip) => void;
+  actions: ActionChip[];
+  onSelect: (action: ActionChip) => void;
 }) {
   if (!actions.length) return null;
 
@@ -43,4 +44,3 @@ export function ActionChips({
     </section>
   );
 }
-

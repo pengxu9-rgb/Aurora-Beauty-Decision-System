@@ -2,11 +2,11 @@
 
 import type { SkinIdentitySnapshot } from "@/actions/userProfile";
 import { getSkinIdentitySnapshot, setUserConcerns } from "@/actions/userProfile";
-import { ActionChips, type NextActionChip } from "@/components/chat/ActionChips";
-import { BudgetCard, type BudgetContext } from "@/components/chat/BudgetCard";
+import { ActionChips, type ActionChip } from "@/components/chat/ActionChips";
 import { RoutineTimeline, type RoutineRec } from "@/components/chat/RoutineTimeline";
 import { SkinIdentityCard } from "@/components/chat/SkinIdentityCard";
 import { cn } from "@/lib/cn";
+import { bffRequest, normalizeAuroraLang, type AuroraLang, type BffCard, type BffEnvelope, type SuggestedChip } from "@/lib/pivotaAgentBff";
 import { ChevronDown, ChevronUp, Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -19,33 +19,14 @@ type ChatMessage = {
   content: string;
 };
 
-type ClarificationQuestion = {
-  id: string;
-  question: string;
-  options?: string[];
-};
-
-type ChatApiResponse = {
-  query?: string;
-  intent?: string;
-  answer?: string;
-  current_state?: string;
-  next_actions?: NextActionChip[];
-  context?: Record<string, unknown>;
-  clarification?: {
-    questions?: ClarificationQuestion[];
-    missing_fields?: string[];
-  };
-  error?: string;
-};
-
 function makeId(prefix: string) {
   const cryptoObj = globalThis.crypto as Crypto | undefined;
   return `${prefix}_${cryptoObj?.randomUUID?.() ?? `${Date.now()}_${Math.random().toString(16).slice(2)}`}`;
 }
 
-function toApiMessages(messages: ChatMessage[]) {
-  return messages.map((m) => ({ role: m.role, content: m.content }));
+function safeUuid() {
+  const cryptoObj = globalThis.crypto as Crypto | undefined;
+  return cryptoObj?.randomUUID?.() ?? `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
 const UID_KEY = "aurora_uid";
@@ -107,13 +88,17 @@ export function AuroraChatPage() {
         "Hi — I’m Aurora.\n\nTell me what you want to solve today (acne, redness, dark spots, anti‑aging), or paste a product name/link and ask “is this right for me?”\n\nI’ll ask a quick safety profile *only when needed*.",
     },
   ]);
-  const [pendingQuestionSet, setPendingQuestionSet] = useState<ClarificationQuestion[] | null>(null);
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
 
-  const [nextActions, setNextActions] = useState<NextActionChip[]>([]);
-  const [lastContext, setLastContext] = useState<Record<string, unknown> | null>(null);
+  const [suggestedChips, setSuggestedChips] = useState<SuggestedChip[]>([]);
+  const [cardFeed, setCardFeed] = useState<BffCard[]>([]);
+  const [sessionState, setSessionState] = useState<string | null>(null);
+  const traceIdRef = useRef<string>(safeUuid());
+  const briefIdRef = useRef<string>(safeUuid());
+  const pendingGateMessageRef = useRef<string | null>(null);
+  const [lang, setLang] = useState<AuroraLang>(() => normalizeAuroraLang(typeof navigator !== "undefined" ? navigator.language : "EN"));
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const selfieInputRef = useRef<HTMLInputElement | null>(null);
@@ -195,15 +180,45 @@ export function AuroraChatPage() {
     setMessages((prev) => [...prev, message]);
   }, []);
 
+  const applyEnvelope = useCallback(
+    (envelope: BffEnvelope, { userMessage, gateMessage }: { userMessage?: string; gateMessage?: string } = {}) => {
+      if (envelope.assistant_message && typeof envelope.assistant_message.content === "string" && envelope.assistant_message.content.trim()) {
+        pushMessage({
+          id: makeId("a"),
+          role: "assistant",
+          content: envelope.assistant_message.content.trim(),
+        });
+      }
+
+      setSuggestedChips(Array.isArray(envelope.suggested_chips) ? envelope.suggested_chips : []);
+
+      const cards = Array.isArray(envelope.cards) ? envelope.cards : [];
+      if (cards.length) setCardFeed((prev) => [...prev, ...cards].slice(-60));
+
+      const nextState =
+        envelope.session_patch && typeof envelope.session_patch === "object" && typeof (envelope.session_patch as any).next_state === "string"
+          ? String((envelope.session_patch as any).next_state)
+          : null;
+      if (nextState) setSessionState(nextState);
+
+      const hasDiagnosisGate = cards.some((c) => c && typeof c === "object" && (c as any).type === "diagnosis_gate");
+      pendingGateMessageRef.current = hasDiagnosisGate ? (userMessage || gateMessage || pendingGateMessageRef.current) : null;
+    },
+    [pushMessage],
+  );
+
   const sendText = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed || isSending) return;
+      if (!userId) {
+        setSendError("Missing user id. Please refresh the page.");
+        return;
+      }
 
       setIsSending(true);
       setSendError(null);
-      setPendingQuestionSet(null);
-      setNextActions([]);
+      setSuggestedChips([]);
       // Keep "diagnosis complete" sticky once reached, so the banner doesn't re-open every message.
       setDiagnosisProgressOverride((prev) => (prev >= 100 ? 100 : 0));
 
@@ -215,49 +230,27 @@ export function AuroraChatPage() {
       setInput("");
 
       try {
-        const snapshot = [...messagesRef.current, userMessage].slice(-24);
         const controller = new AbortController();
         const timeout = window.setTimeout(() => controller.abort(), 25000);
 
-        const res = await fetch("/api/chat", {
+        const requestLang: AuroraLang = /[\u4e00-\u9fff]/.test(trimmed) ? "CN" : lang;
+        if (requestLang !== lang) setLang(requestLang);
+
+        const envelope = await bffRequest<BffEnvelope>("/v1/chat", {
+          uid: userId,
+          lang: requestLang,
+          traceId: traceIdRef.current,
+          briefId: briefIdRef.current,
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+          body: {
             message: trimmed,
-            messages: toApiMessages(snapshot),
-            stream: false,
-          }),
+            session: { state: sessionState, trace_id: traceIdRef.current, brief_id: briefIdRef.current },
+          },
           signal: controller.signal,
         });
         window.clearTimeout(timeout);
 
-        const data = (await res.json()) as ChatApiResponse;
-        if (!res.ok) {
-          const err = data?.error || `Request failed (${res.status})`;
-          setSendError(err);
-          pushMessage({ id: makeId("a"), role: "assistant", content: `Sorry — ${err}.` });
-          return;
-        }
-
-        const answer = typeof data.answer === "string" && data.answer.trim() ? data.answer.trim() : "Sorry — no response.";
-        pushMessage({ id: makeId("a"), role: "assistant", content: answer });
-
-        const questions = Array.isArray(data.clarification?.questions) ? data.clarification?.questions : null;
-        setPendingQuestionSet(questions?.length ? questions : null);
-
-        const actions = Array.isArray(data.next_actions) ? data.next_actions.filter((a) => a && typeof a.label === "string") : [];
-        setNextActions(actions);
-        setLastContext(data.context && typeof data.context === "object" ? (data.context as Record<string, unknown>) : null);
-
-        // If we're no longer in "clarify", treat this as a completed diagnostic pass.
-        // This avoids the UI being stuck at <100% after the engine has already returned an answer.
-        if (typeof data.intent === "string" && data.intent !== "clarify") {
-          setDiagnosisProgressOverride(100);
-        } else if (Array.isArray(data.clarification?.missing_fields) && data.clarification?.missing_fields?.length === 0) {
-          // Some flows return `intent=clarify` while missing_fields is empty (navigation step). Treat diagnosis as done.
-          setDiagnosisProgressOverride(100);
-        }
-
+        applyEnvelope(envelope, { userMessage: trimmed });
         if (userId) void refreshIdentity(userId);
       } catch (e) {
         const err =
@@ -265,14 +258,14 @@ export function AuroraChatPage() {
             ? "Request timed out. Please try again."
             : e instanceof Error
               ? e.message
-              : "Failed to reach /api/chat";
+              : "Failed to reach pivota-agent";
         setSendError(err);
         pushMessage({ id: makeId("a"), role: "assistant", content: `Sorry — ${err}.` });
       } finally {
         setIsSending(false);
       }
     },
-    [isSending, pushMessage, refreshIdentity, userId],
+    [applyEnvelope, isSending, lang, pushMessage, refreshIdentity, sessionState, userId],
   );
 
   const onSubmit = useCallback(
@@ -339,36 +332,222 @@ export function AuroraChatPage() {
     [userId],
   );
 
-  const routineFromContext = useMemo(() => {
-    const ctx = lastContext;
-    if (!ctx) return null;
-    const routine = (ctx as any).routine_primary ?? (ctx as any).routine;
-    if (!routine || typeof routine !== "object") return null;
-    const am = Array.isArray((routine as any).am) ? (routine as any).am : null;
-    const pm = Array.isArray((routine as any).pm) ? (routine as any).pm : null;
-    if (!am || !pm) return null;
-    return routine as unknown as RoutineRec;
-  }, [lastContext]);
+  const actionChips = useMemo<ActionChip[]>(
+    () =>
+      suggestedChips.map((c) => ({
+        id: c.chip_id,
+        label: c.label,
+        kind: c.kind,
+        text: typeof c.data?.reply_text === "string" ? c.data.reply_text : typeof c.data?.replyText === "string" ? c.data.replyText : undefined,
+        data: c.data,
+      })),
+    [suggestedChips],
+  );
 
-  const budgetFromContext = useMemo(() => {
-    const ctx = lastContext;
-    if (!ctx || typeof ctx !== "object") return null;
-    const budget = (ctx as any).budget;
-    if (!budget || typeof budget !== "object") return null;
-    return budget as BudgetContext;
-  }, [lastContext]);
+  const sendChip = useCallback(
+    async (chip: ActionChip) => {
+      if (!userId || isSending) return;
 
-  const budgetCny = useMemo(() => {
-    const ctx = lastContext;
-    const v = ctx ? (ctx as any).budget_cny : null;
-    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
-  }, [lastContext]);
+      setIsSending(true);
+      setSendError(null);
+      setSuggestedChips([]);
 
-  const budgetUsdEst = useMemo(() => {
-    const ctx = lastContext;
-    const v = ctx ? (ctx as any).budget_usd_est : null;
-    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
-  }, [lastContext]);
+      // Show the tap as a user message, but keep gating context separately.
+      pushMessage({ id: makeId("u"), role: "user", content: chip.text?.trim() || chip.label });
+
+      const isProfileChip = chip.id.startsWith("profile.") || Boolean(chip.data && typeof chip.data === "object" && "profile_patch" in chip.data);
+      const replyText = typeof chip.data?.reply_text === "string" ? chip.data.reply_text.trim() : typeof chip.data?.replyText === "string" ? chip.data.replyText.trim() : "";
+      const gateMessage = pendingGateMessageRef.current || undefined;
+      const messageForUpstream = replyText || (isProfileChip ? gateMessage : chip.text?.trim() || chip.label);
+
+      try {
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 25000);
+
+        const envelope = await bffRequest<BffEnvelope>("/v1/chat", {
+          uid: userId,
+          lang,
+          traceId: traceIdRef.current,
+          briefId: briefIdRef.current,
+          method: "POST",
+          body: {
+            ...(messageForUpstream ? { message: messageForUpstream } : {}),
+            action: { action_id: chip.id, kind: "chip", data: chip.data ?? {} },
+            session: { state: sessionState, trace_id: traceIdRef.current, brief_id: briefIdRef.current },
+          },
+          signal: controller.signal,
+        });
+        window.clearTimeout(timeout);
+
+        applyEnvelope(envelope, { userMessage: isProfileChip ? undefined : messageForUpstream, gateMessage });
+        void refreshIdentity(userId);
+      } catch (e) {
+        const err =
+          e instanceof DOMException && e.name === "AbortError"
+            ? "Request timed out. Please try again."
+            : e instanceof Error
+              ? e.message
+              : "Failed to reach pivota-agent";
+        setSendError(err);
+        pushMessage({ id: makeId("a"), role: "assistant", content: `Sorry — ${err}.` });
+      } finally {
+        setIsSending(false);
+      }
+    },
+    [applyEnvelope, isSending, lang, pushMessage, refreshIdentity, sessionState, userId],
+  );
+
+  const requestRoutine = useCallback(async () => {
+    if (!userId || isSending) return;
+
+    setIsSending(true);
+    setSendError(null);
+    setSuggestedChips([]);
+
+    pushMessage({ id: makeId("u"), role: "user", content: lang === "CN" ? "生成护肤流程（显式）" : "Generate routine (explicit)" });
+
+    try {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 30000);
+
+      const focus = skinIdentity?.concerns?.[0] ?? undefined;
+      const envelope = await bffRequest<BffEnvelope>("/v1/reco/generate", {
+        uid: userId,
+        lang,
+        traceId: traceIdRef.current,
+        briefId: briefIdRef.current,
+        method: "POST",
+        body: { ...(focus ? { focus } : {}) },
+        signal: controller.signal,
+      });
+      window.clearTimeout(timeout);
+
+      applyEnvelope(envelope, { gateMessage: "recommend" });
+      void refreshIdentity(userId);
+    } catch (e) {
+      const err =
+        e instanceof DOMException && e.name === "AbortError"
+          ? "Request timed out. Please try again."
+          : e instanceof Error
+            ? e.message
+            : "Failed to reach pivota-agent";
+      setSendError(err);
+      pushMessage({ id: makeId("a"), role: "assistant", content: `Sorry — ${err}.` });
+    } finally {
+      setIsSending(false);
+    }
+  }, [applyEnvelope, isSending, lang, pushMessage, refreshIdentity, skinIdentity?.concerns, userId]);
+
+  const renderBffCard = useCallback((card: BffCard) => {
+    const payload = card.payload ?? {};
+
+    if (card.type === "recommendations") {
+      const recs = Array.isArray((payload as any).recommendations) ? ((payload as any).recommendations as any[]) : [];
+      const am = recs
+        .filter((r) => r && typeof r === "object" && (r as any).slot === "am")
+        .map((r) => {
+          const { slot: _slot, ...rest } = r as any;
+          return rest;
+        });
+      const pm = recs
+        .filter((r) => r && typeof r === "object" && (r as any).slot === "pm")
+        .map((r) => {
+          const { slot: _slot, ...rest } = r as any;
+          return rest;
+        });
+
+      const routine: RoutineRec = { am, pm };
+      return <RoutineTimeline key={card.card_id} title="Your Routine" routine={routine} />;
+    }
+
+    if (card.type === "product_analysis") {
+      const verdict = (payload as any)?.assessment?.verdict ?? null;
+      const evidence = (payload as any)?.evidence ?? null;
+      const keyIng = Array.isArray(evidence?.science?.key_ingredients) ? evidence.science.key_ingredients : [];
+      const riskNotes = Array.isArray(evidence?.science?.risk_notes) ? evidence.science.risk_notes : [];
+
+      return (
+        <section key={card.card_id} className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm" aria-label="Product analysis">
+          <div className="text-xs font-semibold text-slate-900">Product Deep Scan</div>
+          {verdict ? <div className="mt-1 text-sm font-semibold text-slate-900">Verdict: {String(verdict)}</div> : null}
+          {keyIng.length ? (
+            <div className="mt-2 text-xs text-slate-700">
+              <span className="font-semibold">Key ingredients:</span> {keyIng.slice(0, 8).join(", ")}
+            </div>
+          ) : null}
+          {riskNotes.length ? (
+            <div className="mt-2 text-xs text-rose-700">
+              <span className="font-semibold">Risk notes:</span> {riskNotes.slice(0, 6).join(" · ")}
+            </div>
+          ) : null}
+        </section>
+      );
+    }
+
+    if (card.type === "dupe_compare") {
+      const tradeoffs = Array.isArray((payload as any).tradeoffs) ? ((payload as any).tradeoffs as any[]) : [];
+      return (
+        <section key={card.card_id} className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm" aria-label="Dupe compare">
+          <div className="text-xs font-semibold text-slate-900">Dupe Compare</div>
+          {tradeoffs.length ? (
+            <ul className="mt-2 list-disc pl-4 text-xs text-slate-700">
+              {tradeoffs.slice(0, 6).map((t, idx) => (
+                <li key={idx}>{String(t)}</li>
+              ))}
+            </ul>
+          ) : (
+            <div className="mt-2 text-xs text-slate-500">No tradeoffs returned.</div>
+          )}
+        </section>
+      );
+    }
+
+    if (card.type === "diagnosis_gate") {
+      const missing = Array.isArray((payload as any).missing_fields) ? ((payload as any).missing_fields as any[]) : [];
+      return (
+        <section key={card.card_id} className="mt-4 rounded-2xl border border-indigo-200 bg-indigo-50 p-4 shadow-sm" aria-label="Diagnosis gate">
+          <div className="text-xs font-semibold text-indigo-900">Diagnosis first</div>
+          {missing.length ? <div className="mt-1 text-xs text-indigo-800">Missing: {missing.join(", ")}</div> : null}
+        </section>
+      );
+    }
+
+    if (card.type === "gate_notice") {
+      const missing = Array.isArray((card as any).field_missing) ? ((card as any).field_missing as any[]) : [];
+      return (
+        <section key={card.card_id} className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 shadow-sm" aria-label="Gate notice">
+          <div className="text-xs font-semibold text-amber-900">Gate notice</div>
+          {missing.length ? (
+            <ul className="mt-2 list-disc pl-4 text-xs text-amber-800">
+              {missing.slice(0, 6).map((m, idx) => (
+                <li key={idx}>
+                  {String((m as any).field)}: {String((m as any).reason)}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </section>
+      );
+    }
+
+    if (card.type === "error") {
+      return (
+        <section key={card.card_id} className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 p-4 shadow-sm" aria-label="Error">
+          <div className="text-xs font-semibold text-rose-900">Error</div>
+          <div className="mt-1 text-xs text-rose-800">{String((payload as any).error ?? "unknown_error")}</div>
+        </section>
+      );
+    }
+
+    return (
+      <details key={card.card_id} className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <summary className="cursor-pointer text-xs font-semibold text-slate-900">{card.type}</summary>
+        <pre className="mt-2 overflow-x-auto rounded-xl bg-slate-50 p-3 text-[11px] text-slate-700">
+          {JSON.stringify(payload, null, 2)}
+        </pre>
+      </details>
+    );
+  }, []);
 
   return (
     <main className="min-h-screen bg-gradient-to-b from-white via-slate-50 to-slate-100">
@@ -394,7 +573,10 @@ export function AuroraChatPage() {
                       "Hi — I’m Aurora.\n\nTell me what you want to solve today (acne, redness, dark spots, anti‑aging), or paste a product name/link and ask “is this right for me?”\n\nI’ll ask a quick safety profile *only when needed*.",
                   },
                 ]);
-                setPendingQuestionSet(null);
+                setSuggestedChips([]);
+                setCardFeed([]);
+                setSessionState(null);
+                pendingGateMessageRef.current = null;
                 setSendError(null);
                 setInput("");
                 setDiagnosisProgressOverride(0);
@@ -510,8 +692,11 @@ export function AuroraChatPage() {
             ))}
           </div>
 
-          <RoutineTimeline title="Your Routine" routine={routineFromContext} />
-          <BudgetCard budgetCny={budgetCny} budgetUsdEst={budgetUsdEst} budget={budgetFromContext} />
+          {cardFeed.length ? (
+            <div className="space-y-3">
+              {cardFeed.slice(-12).map((c) => renderBffCard(c))}
+            </div>
+          ) : null}
 
           {messages.length <= 1 ? (
             <div className="mt-4 flex flex-wrap gap-2">
@@ -528,34 +713,21 @@ export function AuroraChatPage() {
             </div>
           ) : null}
 
-          {pendingQuestionSet?.length ? (
-            <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <div className="text-xs font-semibold text-slate-900">Quick questions (tap to answer)</div>
-              <div className="mt-3 space-y-3">
-                {pendingQuestionSet.map((q) => (
-                  <div key={q.id}>
-                    <div className="text-xs text-slate-600">{q.question}</div>
-                    {Array.isArray(q.options) && q.options.length ? (
-                      <div className="mt-2 flex flex-wrap gap-2">
-                        {q.options.map((opt) => (
-                          <button
-                            key={opt}
-                            type="button"
-                            onClick={() => void sendText(opt)}
-                            className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100"
-                          >
-                            {opt}
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : null}
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void requestRoutine()}
+              disabled={isSending}
+              className={cn(
+                "rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors",
+                isSending ? "border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed" : "border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100",
+              )}
+            >
+              {lang === "CN" ? "生成护肤流程" : "Generate routine"}
+            </button>
+          </div>
 
-          <ActionChips actions={nextActions} onSelect={(a) => void sendText(a.text)} />
+          <ActionChips actions={actionChips} onSelect={(a) => void sendChip(a)} />
 
           {sendError ? (
             <div className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-800">

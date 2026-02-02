@@ -1,6 +1,6 @@
 "use server";
 
-import { prisma } from "@/lib/server/prisma";
+import { bffRequest, type BffCard, type BffEnvelope, type AuroraLang, normalizeAuroraLang } from "@/lib/pivotaAgentBff";
 
 export type SkinLogInput = {
   date?: string | Date;
@@ -62,15 +62,38 @@ const coerceDate = (value: unknown) => {
   return undefined;
 };
 
-export async function getOrCreateProfile(userId: string) {
+type BffProfileSummary = {
+  skinType?: string | null;
+  barrierStatus?: string | null;
+  sensitivity?: string | null;
+  goals?: string[];
+};
+
+type BffSkinLog = {
+  date?: string | null;
+  redness?: number | null;
+  acne?: number | null;
+  hydration?: number | null;
+  notes?: string | null;
+};
+
+function normalizeUserId(userId: string) {
   const normalizedUserId = typeof userId === "string" ? userId.trim().slice(0, 128) : "";
   if (!normalizedUserId) throw new Error("userId is required");
+  return normalizedUserId;
+}
 
-  return prisma.userProfile.upsert({
-    where: { userId: normalizedUserId },
-    update: {},
-    create: { userId: normalizedUserId, concerns: [] },
-  });
+function extractCard(envelope: BffEnvelope, type: string): BffCard | null {
+  const cards = Array.isArray(envelope.cards) ? envelope.cards : [];
+  return cards.find((c) => c && typeof c === "object" && (c as any).type === type) ?? null;
+}
+
+function extractBootstrap(envelope: BffEnvelope): { profile: BffProfileSummary | null; recentLogs: BffSkinLog[] } {
+  const card = extractCard(envelope, "session_bootstrap");
+  const payload = card && card.payload && typeof card.payload === "object" ? (card.payload as any) : null;
+  const profile = payload && payload.profile && typeof payload.profile === "object" ? (payload.profile as BffProfileSummary) : null;
+  const recentLogs = Array.isArray(payload?.recent_logs) ? (payload.recent_logs as BffSkinLog[]) : [];
+  return { profile, recentLogs };
 }
 
 function inferSebum(skinType: string | null) {
@@ -91,14 +114,14 @@ function inferHydration(skinType: string | null, barrierStatus: string | null) {
   if (st.includes("normal")) base = 60;
 
   const bs = (barrierStatus ?? "").toLowerCase();
-  if (bs.includes("impaired")) base -= 8;
+  if (bs.includes("impaired") || bs.includes("irritated")) base -= 8;
   return clampPercent(base);
 }
 
 function inferSensitivity(barrierStatus: string | null, concerns: string[], rednessLatest: number) {
   const bs = (barrierStatus ?? "").toLowerCase();
   let base = 48;
-  if (bs.includes("healthy")) base = 32;
+  if (bs.includes("healthy") || bs.includes("stable")) base = 32;
   if (bs.includes("impaired")) base = 68;
 
   const joined = concerns.join(" ").toLowerCase();
@@ -113,51 +136,54 @@ function inferResilience(barrierStatus: string | null, sensitivity: number) {
   return clampPercent(100 - sensitivity + modifier);
 }
 
-async function getRecentLogs(profileId: string) {
-  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-  return prisma.skinLog.findMany({
-    where: { profileId, date: { gte: sevenDaysAgo } },
-    orderBy: { date: "desc" },
-    take: 50,
-  });
+function normalizeBffSkinLog(log: BffSkinLog) {
+  const redness = clampInt(log.redness ?? 0, 0, 5, 0);
+  return { redness };
 }
 
 export async function getSkinIdentitySnapshot(userId: string): Promise<SkinIdentitySnapshot> {
-  const profile = await getOrCreateProfile(userId);
-  const logs = await getRecentLogs(profile.id);
+  const uid = normalizeUserId(userId);
+  const lang: AuroraLang = normalizeAuroraLang(process.env.AURORA_LANG_DEFAULT);
 
-  const rednessLatest = clampInt(logs[0]?.rednessLevel ?? 0, 0, 5, 0);
-  const rednessMax = clampInt(Math.max(0, ...logs.map((l) => l.rednessLevel ?? 0)), 0, 5, 0);
+  const envelope = await bffRequest<BffEnvelope>("/v1/session/bootstrap", { uid, lang, method: "GET" });
+  const { profile, recentLogs } = extractBootstrap(envelope);
 
-  const concerns = Array.isArray(profile.concerns) ? profile.concerns.slice(0, 12) : [];
-  const sensitivity = inferSensitivity(profile.barrierStatus, concerns, rednessLatest);
+  const rednessValues = recentLogs.map((l) => normalizeBffSkinLog(l).redness);
+  const rednessLatest = clampInt(rednessValues[0] ?? 0, 0, 5, 0);
+  const rednessMax = clampInt(Math.max(0, ...rednessValues), 0, 5, 0);
+
+  const skinType = typeof profile?.skinType === "string" ? profile.skinType : null;
+  const barrierStatus = typeof profile?.barrierStatus === "string" ? profile.barrierStatus : null;
+  const concerns = Array.isArray(profile?.goals) ? profile?.goals.slice(0, 12) : [];
+  const sensitivity = inferSensitivity(barrierStatus, concerns, rednessLatest);
 
   return {
-    userId: profile.userId,
-    skinType: profile.skinType,
-    barrierStatus: profile.barrierStatus,
+    userId: uid,
+    skinType,
+    barrierStatus,
     concerns,
-    status: profile.barrierStatus === "Healthy" && rednessLatest <= 1 ? "good" : "attention",
-    resilienceScore: inferResilience(profile.barrierStatus, sensitivity),
-    hydration: inferHydration(profile.skinType, profile.barrierStatus),
-    sebum: inferSebum(profile.skinType),
+    status: (barrierStatus ?? "").toLowerCase().includes("healthy") && rednessLatest <= 1 ? "good" : "attention",
+    resilienceScore: inferResilience(barrierStatus, sensitivity),
+    hydration: inferHydration(skinType, barrierStatus),
+    sebum: inferSebum(skinType),
     sensitivity,
     last7d: { rednessMax, rednessLatest },
   };
 }
 
 export async function setUserConcerns(userId: string, concerns: string[]) {
-  const profile = await getOrCreateProfile(userId);
+  const uid = normalizeUserId(userId);
   const normalized = normalizeStringList(concerns, 12, 48);
-  await prisma.userProfile.update({ where: { id: profile.id }, data: { concerns: { set: normalized } } });
-  return getSkinIdentitySnapshot(userId);
+  const lang: AuroraLang = normalizeAuroraLang(process.env.AURORA_LANG_DEFAULT);
+  await bffRequest<BffEnvelope>("/v1/profile/update", { uid, lang, method: "POST", body: { goals: normalized } });
+  return getSkinIdentitySnapshot(uid);
 }
 
 export async function logSkinStatus(userId: string, data: SkinLogInput) {
-  const profile = await getOrCreateProfile(userId);
+  const uid = normalizeUserId(userId);
+  const lang: AuroraLang = normalizeAuroraLang(process.env.AURORA_LANG_DEFAULT);
 
   const rednessLevel = clampInt(data.rednessLevel, 0, 5, 0);
-  const acneCount = clampInt(data.acneCount ?? 0, 0, 500, 0);
   const hydration = clampInt(data.hydration ?? 0, 0, 5, 0);
 
   const date = coerceDate(data.date);
@@ -165,16 +191,19 @@ export async function logSkinStatus(userId: string, data: SkinLogInput) {
   const sensation = normalizeOptionalString(data.sensation, 80);
   const notes = normalizeOptionalString(data.notes, 2000);
 
-  return prisma.skinLog.create({
-    data: {
-      profileId: profile.id,
-      ...(date ? { date } : {}),
-      rednessLevel,
-      acneCount,
+  const isoDate = date ? date.toISOString().slice(0, 10) : undefined;
+
+  return bffRequest<BffEnvelope>("/v1/tracker/log", {
+    uid,
+    lang,
+    method: "POST",
+    body: {
+      ...(isoDate ? { date: isoDate } : {}),
+      redness: rednessLevel,
       hydration,
-      targetProduct,
-      sensation,
-      notes,
+      ...(typeof notes === "string" ? { notes } : {}),
+      ...(typeof targetProduct === "string" ? { targetProduct } : {}),
+      ...(typeof sensation === "string" ? { sensation } : {}),
     },
   });
 }
