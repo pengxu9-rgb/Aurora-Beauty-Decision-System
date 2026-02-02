@@ -2131,6 +2131,69 @@ function isAcidTreatmentCandidate(sku: SkuVector) {
   );
 }
 
+function isBrighteningCandidate(sku: SkuVector) {
+  const text = `${sku.brand} ${sku.name}`.toLowerCase();
+
+  // Prefer "obvious" brightening actives / product positioning.
+  const needles = [
+    "vitamin c",
+    "ascorb",
+    "l-ascorbic",
+    "ferulic",
+    "thiamidol",
+    "tranex",
+    "arbutin",
+    "azelaic",
+    "kojic",
+    "niacinamide",
+    "dark spot",
+    "discoloration",
+    "brighten",
+    "brightening",
+    "radiance",
+    "pigment",
+    "mela",
+    // CN keywords
+    "美白",
+    "提亮",
+    "淡斑",
+    "祛斑",
+    "烟酰胺",
+    "传明酸",
+    "壬二酸",
+    "熊果苷",
+    "曲酸",
+    "维c",
+    "vc",
+    "泰酰胺",
+    "melasyl",
+  ];
+
+  if (needles.some((n) => text.includes(n))) return true;
+
+  // If we have explicit actives metadata, trust it over the model-derived mechanism.
+  const actives = Array.isArray(sku.actives) ? sku.actives.map((a) => String(a).toLowerCase()) : [];
+  if (
+    actives.some((a) =>
+      ["niacinamide", "tranex", "vitamin c", "ascorb", "azelaic", "arbutin", "kojic", "thiamidol", "melasyl"].some((k) => a.includes(k)),
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function pickBestBrighteningActive(db: SkuVector[], user: UserVector) {
+  const candidates = db
+    .filter((s) => s.category === "serum" || s.category === "treatment" || s.category === "toner")
+    .filter(isBrighteningCandidate)
+    .map((sku) => ({ sku, score: calculateScore(sku, user) }))
+    .filter((x) => x.score.total > 0)
+    .sort((a, b) => b.score.total - a.score.total);
+  return candidates[0]?.sku ?? null;
+}
+
 function isMildAcidCandidate(sku: SkuVector) {
   const text = `${sku.brand} ${sku.name}`.toLowerCase();
   return text.includes("azelaic") || text.includes("mandelic");
@@ -2172,6 +2235,15 @@ function buildPrimaryRoutine(db: SkuVector[], user: UserVector, query: string, b
   const lowBudget = isLowBudgetCny(budgetCny);
   const skipAmMoisturizer = lowBudget && !hasDrySkin(user);
   const comedones = detectClosedComedonesOrRoughTexture(query);
+  const wantsBrightening =
+    user.goals?.some((g) => g.track === "brightening") ||
+    query.toLowerCase().includes("brighten") ||
+    query.toLowerCase().includes("dark spot") ||
+    query.includes("美白") ||
+    query.includes("提亮") ||
+    query.includes("淡斑") ||
+    query.includes("暗沉") ||
+    query.includes("痘印");
 
   const cleanser = locks?.cleanser ?? pickCheapest(db, "cleanser", user);
   const sunscreen = locks?.sunscreen ?? pickCheapest(db, "sunscreen", user);
@@ -2182,6 +2254,7 @@ function buildPrimaryRoutine(db: SkuVector[], user: UserVector, query: string, b
     treatment = locks.treatment;
   } else {
     if (comedones) treatment = pickBestAcidForComedones(db, user);
+    if (!treatment && wantsBrightening) treatment = pickBestBrighteningActive(db, user);
     if (!treatment) treatment = pickBestByScore(db, "treatment", user) ?? pickBestByScore(db, "serum", user);
   }
 
