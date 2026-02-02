@@ -3991,12 +3991,27 @@ export async function POST(req: Request) {
   const anchorBurnRate = Math.max(0, Math.min(1, anchorSku.social_stats.burn_rate ?? 0));
   const anchorVetoed = anchorScore.vetoed || (barrierImpaired && (anchorRisk.includes("high_irritation") || anchorBurnRate > 0.1));
 
+  // NOTE: `findSimilarProductsByAnchorProductId` uses `products.price_usd` for the "cheaper" filter.
+  // Many SKUs have missing/0 prices in `products`, so pushing "cheaper-than-anchor" into SQL can
+  // accidentally yield empty dupes. We overfetch without the cheaper filter, then apply a best-effort
+  // cheaper filter in JS only when we have a usable anchor price (including from price snapshots).
   const similar = await findSimilarSkusByAnchorProductId(anchorProductId, {
     limit: Math.min(10, limit),
-    cheaper_than_anchor: true,
+    cheaper_than_anchor: false,
     region: detectedRegion,
   });
+
+  const anchorPriceUsdForFiltering = normalizeUsdPrice(anchorSku.price);
+  const wantsCheaperAlternatives = dupeIntent || priceSensitive;
+
   let candidates = similar;
+  if (wantsCheaperAlternatives && anchorPriceUsdForFiltering != null) {
+    const cheaperOnly = candidates.filter((c) => {
+      const priceUsd = normalizeUsdPrice(c.sku.price);
+      return priceUsd != null && priceUsd < anchorPriceUsdForFiltering;
+    });
+    if (cheaperOnly.length) candidates = cheaperOnly;
+  }
   if (sensitive) candidates = candidates.filter((c) => !c.sku.risk_flags.includes("alcohol"));
   if (barrierImpaired) {
     candidates = candidates.filter(
