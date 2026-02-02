@@ -4769,7 +4769,11 @@ export async function POST(req: Request) {
 
   const sensitive = detectSensitiveSkin(query);
   const barrierImpaired = detectBarrierImpaired(query);
-  const user = buildUserVectorFromQuery(query);
+  // Use recent user messages + current query to infer profile (prevents "Normal skin" assumptions on follow-up actions like routine integration).
+  const user = buildUserVectorFromQuery(
+    profileText,
+    budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined,
+  );
 
   if (!anchor) {
     const answer =
