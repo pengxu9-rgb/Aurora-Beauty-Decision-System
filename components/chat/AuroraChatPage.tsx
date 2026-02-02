@@ -204,8 +204,8 @@ export function AuroraChatPage() {
       setSendError(null);
       setPendingQuestionSet(null);
       setNextActions([]);
-      // Reset "analysis progress" override for this request.
-      setDiagnosisProgressOverride(0);
+      // Keep "diagnosis complete" sticky once reached, so the banner doesn't re-open every message.
+      setDiagnosisProgressOverride((prev) => (prev >= 100 ? 100 : 0));
 
       const userMessage: ChatMessage = { id: makeId("u"), role: "user", content: trimmed };
       setMessages((prev) => {
@@ -397,6 +397,7 @@ export function AuroraChatPage() {
                 setPendingQuestionSet(null);
                 setSendError(null);
                 setInput("");
+                setDiagnosisProgressOverride(0);
                 setAvatarUrl(null);
                 if (userId) void refreshIdentity(userId);
               }}
