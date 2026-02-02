@@ -38,6 +38,110 @@ type NextActionChip = {
   next_state?: AuroraState;
 };
 
+const AURORA_CHAT_SCHEMA_VERSION = "aurora.chat.v1" as const;
+type AuroraChatSchemaVersion = typeof AURORA_CHAT_SCHEMA_VERSION;
+type AuroraLanguageTag = "en-US" | "zh-CN";
+
+type AuroraProductEntityV1 = {
+  product_id: string;
+  sku_id?: string;
+  brand: string;
+  name: string;
+  category?: string | null;
+  display_name: string;
+  availability?: string[];
+  product_url?: string | null;
+  image_url?: string | null;
+  price?: { usd: number | null; cny: number | null; unknown: boolean };
+};
+
+type AuroraParseResultV1 = {
+  normalized_query: string;
+  parse_confidence: number; // 0..1
+  normalized_query_language: AuroraLanguageTag;
+  anchor_product?: AuroraProductEntityV1 | null;
+  anchor_candidates?: Array<{
+    product: AuroraProductEntityV1;
+    confidence: number; // 0..1
+    matched_alias?: string;
+    alias_kind?: string;
+  }>;
+};
+
+type AuroraEvidenceRefV1 =
+  | { kind: "kb"; citations: string[] }
+  | { kind: "ingredients"; note?: string }
+  | { kind: "social"; note?: string }
+  | { kind: "consensus"; note?: string }
+  | { kind: "external_verification"; note?: string };
+
+type AuroraScienceEvidenceItemV1 = {
+  key: string; // ingredient or active name (string, as found in KB)
+  in_product: boolean;
+  mechanism?: string; // consensus summary (non-product-specific)
+  targets?: string[];
+  risks?: string[];
+  evidence: AuroraEvidenceRefV1[];
+};
+
+type AuroraSocialSignalsV1 = {
+  red_score: number | null;
+  reddit_score: number | null;
+  burn_rate: number | null;
+  top_keywords: string[];
+};
+
+type AuroraExpertNotesV1 = {
+  sensitivity_flags?: string | null;
+  key_actives?: string | null;
+  chemist_notes?: string | null;
+  citations: string[];
+};
+
+type AuroraHowToUseV1 = {
+  placement?: string;
+  frequency?: string;
+  avoid_with?: string[];
+  patch_test?: boolean;
+};
+
+type AuroraAnalyzeResultV1 = {
+  verdict: "Suitable" | "Risky" | "Mismatch" | "Unknown";
+  confidence: number; // 0..1
+  reasons: string[];
+  science_evidence: AuroraScienceEvidenceItemV1[];
+  social_signals: AuroraSocialSignalsV1 | null;
+  expert_notes: AuroraExpertNotesV1 | null;
+  how_to_use: AuroraHowToUseV1 | null;
+  missing_info_questions?: ClarificationQuestion[];
+};
+
+type AuroraTradeoffsV1 = {
+  missing_actives: string[];
+  added_benefits: string[];
+  texture_finish_differences: string[];
+  price_delta_usd: number | null;
+  availability_note: string | null;
+};
+
+type AuroraAlternativeV1 = {
+  product: AuroraProductEntityV1;
+  similarity_score: number; // 0..100
+  tradeoffs: AuroraTradeoffsV1;
+  evidence: { kb_citations: string[] };
+};
+
+type AuroraStructuredResultV1 = {
+  schema_version: "aurora.structured.v1";
+  parse?: AuroraParseResultV1;
+  analyze?: AuroraAnalyzeResultV1;
+  alternatives?: AuroraAlternativeV1[];
+  kb_requirements_check?: {
+    missing_fields: string[];
+    notes?: string[];
+  };
+};
+
 const USD_TO_CNY = 7.2;
 const BUDGET_TIER_THRESHOLD_MULTIPLIER = 1.2;
 
@@ -202,6 +306,10 @@ function detectUserLanguage(text: string): UserLanguage {
   // Prefer the user's input language over browser locale.
   // If any CJK characters are present, treat it as Chinese; otherwise default to English.
   return /[\u4e00-\u9fff]/.test(text) ? "zh" : "en";
+}
+
+function toAuroraLanguageTag(lang: UserLanguage): AuroraLanguageTag {
+  return lang === "zh" ? "zh-CN" : "en-US";
 }
 
 function detectPriceSensitivity(query: string) {
@@ -1456,6 +1564,263 @@ function sanitizeSkuForLlm(sku: SkuVector) {
       ...(topKeywords ? { top_keywords: topKeywords } : {}),
     },
   };
+}
+
+function toSimilarityScore(similarity01: number) {
+  // Similarities in our system are cosine-ish values in [0,1] for most paths.
+  // Convert to a stable 0..100 integer for agent consumption.
+  const n = clamp01(similarity01);
+  return Math.round(n * 100);
+}
+
+function hasText(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function buildAuroraProductEntityV1(input: {
+  product_id: string;
+  sku_id?: string;
+  brand: string;
+  name: string;
+  category?: string | null;
+  availability?: string[];
+  product_url?: string | null;
+  image_url?: string | null;
+  price_usd?: number | null;
+  price_cny?: number | null;
+}): AuroraProductEntityV1 {
+  const brand = input.brand?.trim() ? input.brand.trim() : "Unknown";
+  const name = input.name?.trim() ? input.name.trim() : "Unknown";
+  const usd = normalizeUsdPrice(input.price_usd);
+  const cnyRaw = coerceNumber(input.price_cny);
+  const cny = Number.isFinite(cnyRaw) && cnyRaw > 0 ? Math.round(cnyRaw) : null;
+  const unknown = usd == null && cny == null;
+  return {
+    product_id: input.product_id,
+    ...(input.sku_id ? { sku_id: input.sku_id } : {}),
+    brand,
+    name,
+    category: input.category ?? null,
+    display_name: `${brand} ${name}`.trim(),
+    ...(Array.isArray(input.availability) ? { availability: input.availability } : {}),
+    ...(typeof input.product_url === "string" ? { product_url: input.product_url } : {}),
+    ...(typeof input.image_url === "string" ? { image_url: input.image_url } : {}),
+    price: { usd, cny, unknown },
+  };
+}
+
+function normalizeKeyToken(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/\(.*?\)/g, " ")
+    .replace(/\bverify\b/g, " ")
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function uniqueByNormalizedKey(values: string[]) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const v of values) {
+    const n = normalizeKeyToken(v);
+    if (!n) continue;
+    if (seen.has(n)) continue;
+    seen.add(n);
+    out.push(v);
+  }
+  return out;
+}
+
+function diffKeyActives(anchor: string[], candidate: string[]) {
+  const a = anchor.map((x) => [normalizeKeyToken(x), x] as const).filter(([k]) => k);
+  const b = candidate.map((x) => [normalizeKeyToken(x), x] as const).filter(([k]) => k);
+  const aKeys = new Set(a.map(([k]) => k));
+  const bKeys = new Set(b.map(([k]) => k));
+
+  const missing = uniqueByNormalizedKey(a.filter(([k]) => !bKeys.has(k)).map(([, v]) => v));
+  const added = uniqueByNormalizedKey(b.filter(([k]) => !aKeys.has(k)).map(([, v]) => v));
+  return { missing, added };
+}
+
+function inferConsensusMechanism(active: string, lang: UserLanguage): { mechanism?: string; targets?: string[]; risks?: string[] } {
+  const key = normalizeKeyToken(active);
+  const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
+
+  if (!key) return {};
+  if (/(tranexamic|txa|传明酸)/i.test(key)) {
+    return {
+      mechanism: t(
+        "May help with discoloration by modulating inflammation-driven pigmentation pathways (consensus).",
+        "可能通过调控炎症相关的色素通路来帮助淡化色沉（通用共识）。",
+      ),
+      targets: [t("Dark spots/Brightening", "提亮/淡斑")],
+    };
+  }
+  if (/(niacinamide|烟酰胺)/i.test(key)) {
+    return {
+      mechanism: t(
+        "Supports barrier function and may help reduce blotchiness and post-acne marks (consensus).",
+        "支持屏障功能，可能帮助改善暗沉/泛红与痘印（通用共识）。",
+      ),
+      targets: [t("Brightening", "提亮"), t("Oil control", "控油")],
+      risks: [t("Some people experience flushing/tingling.", "少数人可能出现泛红/刺痛。")],
+    };
+  }
+  if (/(ascorbic|vitamin c|维c|左旋)/i.test(key)) {
+    return {
+      mechanism: t(
+        "Antioxidant; may help brighten and support collagen via redox pathways (consensus).",
+        "抗氧化；可能通过氧化还原通路帮助提亮并支持胶原相关过程（通用共识）。",
+      ),
+      targets: [t("Brightening", "提亮"), t("Anti-aging", "抗老")],
+      risks: [t("Can sting if barrier is impaired.", "屏障受损时可能刺痛。")],
+    };
+  }
+  if (/(azelaic|壬二酸)/i.test(key)) {
+    return {
+      mechanism: t(
+        "Anti-inflammatory and keratolytic; often used for redness, acne, and hyperpigmentation (consensus).",
+        "抗炎+角质调理；常用于泛红、痘痘与色沉（通用共识）。",
+      ),
+      targets: [t("Acne/Texture", "痘痘/粗糙"), t("Dark spots/Brightening", "提亮/淡斑"), t("Redness", "泛红")],
+    };
+  }
+  if (/(glycolic|aha|mandelic|lactic|pha|gluconolactone|水杨|salicylic|bha|acid|酸)/i.test(key)) {
+    return {
+      mechanism: t(
+        "Chemical exfoliation can help with rough texture and clogged pores when titrated (consensus).",
+        "化学去角质在建立耐受的前提下，可帮助改善粗糙与堵塞（通用共识）。",
+      ),
+      targets: [t("Texture/Comedones", "粗糙/闭口"), t("Brightening", "提亮")],
+      risks: [t("Overuse can irritate; start slowly.", "过度使用易刺激；建议循序渐进。")],
+    };
+  }
+  if (/(retinol|retinal|adapalene|维a|a醇|a醛|维a酸)/i.test(key)) {
+    return {
+      mechanism: t(
+        "Retinoids regulate keratinization and can improve acne and photoaging over time (consensus).",
+        "维A类调控角化与更新，长期可改善痘痘与光老化（通用共识）。",
+      ),
+      targets: [t("Acne", "痘痘"), t("Anti-aging", "抗老")],
+      risks: [t("Irritation is common; titrate frequency.", "刺激较常见；需要控频建立耐受。")],
+    };
+  }
+  if (/(ceramide|cholesterol|fatty acid|神经酰胺|胆固醇|脂肪酸|panthenol|b5|泛醇|madecassoside|积雪草|centella)/i.test(key)) {
+    return {
+      mechanism: t(
+        "Barrier-supporting ingredients can reduce dryness and improve tolerance (consensus).",
+        "屏障支持类成分可能帮助缓解干燥并提升耐受（通用共识）。",
+      ),
+      targets: [t("Barrier repair", "屏障修护"), t("Soothing", "舒缓")],
+    };
+  }
+  return {};
+}
+
+function buildScienceEvidenceFromKbProfile(input: {
+  kb_profile: Pick<KbProfile, "keyActives" | "sensitivityFlags" | "citations">;
+  ingredients: IngredientContext | null;
+  lang: UserLanguage;
+}) {
+  const keyActives = Array.isArray(input.kb_profile.keyActives) ? input.kb_profile.keyActives : [];
+  const head = input.ingredients?.head ?? [];
+  const keys = keyActives.length ? keyActives.slice(0, 8) : head.slice(0, 6);
+  const citations = Array.isArray(input.kb_profile.citations) ? input.kb_profile.citations : [];
+  const sensitivityFlags = Array.isArray(input.kb_profile.sensitivityFlags) ? input.kb_profile.sensitivityFlags : [];
+
+  const items: AuroraScienceEvidenceItemV1[] = [];
+  for (const raw of keys) {
+    if (!raw || typeof raw !== "string") continue;
+    const mech = inferConsensusMechanism(raw, input.lang);
+    const risks = uniqueByNormalizedKey([...(mech.risks ?? []), ...sensitivityFlags].filter(Boolean) as string[]);
+    items.push({
+      key: raw,
+      in_product: true,
+      ...(mech.mechanism ? { mechanism: mech.mechanism } : {}),
+      ...(mech.targets?.length ? { targets: mech.targets } : {}),
+      ...(risks.length ? { risks } : {}),
+      evidence: [
+        ...(citations.length ? [{ kind: "kb", citations }] as const : []),
+        { kind: "consensus", note: input.lang === "zh" ? "机制描述为通用共识；具体浓度/工艺以产品实物/官网为准。" : "Mechanism notes are general consensus; exact concentration/formulation depends on the SKU." },
+      ],
+    });
+  }
+  return items;
+}
+
+function buildExpertNotesV1(input: { expert_knowledge: any; kb_citations: string[] }): AuroraExpertNotesV1 | null {
+  const ek = input.expert_knowledge;
+  if (!ek || typeof ek !== "object") return null;
+  const sensitivity_flags =
+    (hasText(ek.sensitivity_flags) ? ek.sensitivity_flags : null) ??
+    (hasText(ek.sensitivity_notes) ? ek.sensitivity_notes : null) ??
+    null;
+  const key_actives =
+    (hasText(ek.key_actives) ? ek.key_actives : null) ??
+    (hasText(ek.key_actives_summary) ? ek.key_actives_summary : null) ??
+    null;
+  const chemist_notes =
+    (hasText(ek.chemist_notes) ? ek.chemist_notes : null) ??
+    (hasText(ek.comparison_notes) ? ek.comparison_notes : null) ??
+    null;
+
+  const hasAny = Boolean(sensitivity_flags || key_actives || chemist_notes);
+  if (!hasAny && input.kb_citations.length === 0) return null;
+  return {
+    sensitivity_flags,
+    key_actives,
+    chemist_notes,
+    citations: input.kb_citations,
+  };
+}
+
+function buildHowToUseV1(input: { category: string | null | undefined; kb_profile: Pick<KbProfile, "keyActives" | "pairingRules">; lang: UserLanguage }): AuroraHowToUseV1 | null {
+  const t = (en: string, zh: string) => (input.lang === "zh" ? zh : en);
+  const keyActives = Array.isArray(input.kb_profile.keyActives) ? input.kb_profile.keyActives.join(" | ") : "";
+  const isAcid = /(aha|bha|pha|acid|glycolic|salicylic|mandelic|lactic|水杨|果酸|酸)/i.test(keyActives);
+  const isRetinoid = /(retinol|retinal|adapalene|维a|a醇|a醛)/i.test(keyActives);
+
+  const avoid_with: string[] = [];
+  const rules = Array.isArray(input.kb_profile.pairingRules) ? input.kb_profile.pairingRules : [];
+  for (const r of rules) if (typeof r === "string" && r.trim()) avoid_with.push(r.trim());
+
+  if (!isAcid && !isRetinoid && avoid_with.length === 0) return null;
+
+  return {
+    placement: isRetinoid
+      ? t("PM after cleansing, before moisturizer.", "建议放在晚间洁面后、面霜前。")
+      : isAcid
+        ? t("PM after cleansing (or toner step), before moisturizer.", "建议放在晚间洁面后（或当作水/酸步骤）、面霜前。")
+        : t("After cleansing, before moisturizer.", "建议放在洁面后、面霜前。"),
+    frequency: isRetinoid || isAcid ? t("Start 2–3 nights/week, then increase as tolerated.", "先从每周 2–3 晚开始，耐受后再加频。") : undefined,
+    avoid_with: avoid_with.length ? avoid_with.slice(0, 6) : undefined,
+    patch_test: isRetinoid || isAcid ? true : undefined,
+  };
+}
+
+function buildKbRequirementsCheck(input: {
+  has_vectors: boolean;
+  has_ingredients: boolean;
+  has_social: boolean;
+  has_expert_notes: boolean;
+  has_price_hint: boolean;
+  lang: UserLanguage;
+}): AuroraStructuredResultV1["kb_requirements_check"] {
+  const missing_fields: string[] = [];
+  if (!input.has_ingredients) missing_fields.push("ingredients");
+  if (!input.has_vectors) missing_fields.push("mechanism_vector");
+  if (!input.has_social) missing_fields.push("social_stats");
+  if (!input.has_expert_notes) missing_fields.push("expert_notes");
+  if (!input.has_price_hint) missing_fields.push("price_hint");
+  const notes: string[] = [];
+  if (missing_fields.includes("price_hint")) {
+    notes.push(input.lang === "zh" ? "价格缺失会导致预算模块只能用已知小计。建议后续用 price_oracle 回填。" : "Missing prices means budget math will use known subtotal only; consider backfilling via price_oracle.");
+  }
+  if (missing_fields.includes("mechanism_vector")) {
+    notes.push(input.lang === "zh" ? "缺少向量/embedding 时无法做可靠相似检索（dupes）。" : "Missing vectors/embedding prevents reliable similarity search (dupes).");
+  }
+  return { missing_fields, ...(notes.length ? { notes } : {}) };
 }
 
 function formatUsd(amount: number) {
@@ -2904,6 +3269,9 @@ export async function POST(req: Request) {
       : query;
 
   const userLang = detectUserLanguage(profileText);
+  const languageTag = toAuroraLanguageTag(userLang);
+  const envelope = <T extends Record<string, unknown>>(payload: T) =>
+    ({ schema_version: AURORA_CHAT_SCHEMA_VERSION satisfies AuroraChatSchemaVersion, language: languageTag, ...payload }) as const;
   const intentText = contextualQuery;
 
   const budgetCny = parseBudgetCny(intentText);
@@ -2971,17 +3339,27 @@ export async function POST(req: Request) {
         ? { id: "anchor", question: "你想对比/评估的具体产品是？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] }
         : { id: "anchor", question: "Which product do you want to evaluate/compare?", options: ["Send product name", "Send a link", "Send anchor_product_id"] },
     ];
-    return jsonResponse({
-      query,
-      intent: "clarify",
-      answer,
-      current_state: "S_SKU_BROWSING" satisfies AuroraState,
-      next_actions: buildNextActionsFromClarificationQuestions(questions),
-      clarification: {
-        questions,
-        candidates: aliasCandidates,
-      },
-    });
+    return jsonResponse(
+      envelope({
+        query,
+        intent: "clarify",
+        answer,
+        current_state: "S_SKU_BROWSING" satisfies AuroraState,
+        next_actions: buildNextActionsFromClarificationQuestions(questions),
+        clarification: {
+          questions,
+          candidates: aliasCandidates,
+        },
+        structured: {
+          schema_version: "aurora.structured.v1",
+          parse: {
+            normalized_query: query,
+            parse_confidence: aliasCandidates[0]?.confidence ?? 0,
+            normalized_query_language: languageTag,
+          },
+        } satisfies AuroraStructuredResultV1,
+      }),
+    );
   }
 
   // SCIENCE-QA PATH (no anchor required):
@@ -3114,19 +3492,29 @@ export async function POST(req: Request) {
       const answer = lines.join("\n");
 
       if (wantsStream) return streamResponse(answer);
-      return jsonResponse({
-        query,
-        intent: "clarify",
-        answer,
-        current_state: "S_DIAGNOSIS" satisfies AuroraState,
-        next_actions: buildNextActionsFromClarificationQuestions(phase0Questions),
-        clarification: {
-          questions: phase0Questions,
-          missing_fields: Object.entries(missing)
-            .filter(([, v]) => v)
-            .map(([k]) => k),
-        },
-      });
+      return jsonResponse(
+        envelope({
+          query,
+          intent: "clarify",
+          answer,
+          current_state: "S_DIAGNOSIS" satisfies AuroraState,
+          next_actions: buildNextActionsFromClarificationQuestions(phase0Questions),
+          clarification: {
+            questions: phase0Questions,
+            missing_fields: Object.entries(missing)
+              .filter(([, v]) => v)
+              .map(([k]) => k),
+          },
+          structured: {
+            schema_version: "aurora.structured.v1",
+            parse: {
+              normalized_query: query,
+              parse_confidence: 0,
+              normalized_query_language: languageTag,
+            },
+          } satisfies AuroraStructuredResultV1,
+        }),
+      );
     }
 
     const answer =
@@ -3152,14 +3540,24 @@ export async function POST(req: Request) {
     ];
 
     if (wantsStream) return streamResponse(answer);
-    return jsonResponse({
-      query,
-      intent: "clarify",
-      answer,
-      current_state: "S_DIAGNOSIS" satisfies AuroraState,
-      next_actions: buildNextActionsFromClarificationQuestions(nextQuestions),
-      clarification: { questions: nextQuestions },
-    });
+    return jsonResponse(
+      envelope({
+        query,
+        intent: "clarify",
+        answer,
+        current_state: "S_DIAGNOSIS" satisfies AuroraState,
+        next_actions: buildNextActionsFromClarificationQuestions(nextQuestions),
+        clarification: { questions: nextQuestions },
+        structured: {
+          schema_version: "aurora.structured.v1",
+          parse: {
+            normalized_query: query,
+            parse_confidence: 0,
+            normalized_query_language: languageTag,
+          },
+        } satisfies AuroraStructuredResultV1,
+      }),
+    );
   }
 
   if (!wantsScienceOnly && (wantsProductHelp || looksLikeFollowUpAnswer) && !skinProfileComplete) {
@@ -3183,19 +3581,29 @@ export async function POST(req: Request) {
     const answer = lines.join("\n");
 
     if (wantsStream) return streamResponse(answer);
-    return jsonResponse({
-      query,
-      intent: "clarify",
-      answer,
-      current_state: "S_DIAGNOSIS" satisfies AuroraState,
-      next_actions: buildNextActionsFromClarificationQuestions(questions),
-      clarification: {
-        questions,
-        missing_fields: Object.entries(missing)
-          .filter(([, v]) => v)
-          .map(([k]) => k),
-      },
-    });
+    return jsonResponse(
+      envelope({
+        query,
+        intent: "clarify",
+        answer,
+        current_state: "S_DIAGNOSIS" satisfies AuroraState,
+        next_actions: buildNextActionsFromClarificationQuestions(questions),
+        clarification: {
+          questions,
+          missing_fields: Object.entries(missing)
+            .filter(([, v]) => v)
+            .map(([k]) => k),
+        },
+        structured: {
+          schema_version: "aurora.structured.v1",
+          parse: {
+            normalized_query: query,
+            parse_confidence: 0,
+            normalized_query_language: languageTag,
+          },
+        } satisfies AuroraStructuredResultV1,
+      }),
+    );
   }
 
   if (wantsScienceOnly) {
@@ -3251,24 +3659,34 @@ export async function POST(req: Request) {
 
     if (wantsStream) return streamResponse(answer);
 
-    return jsonResponse({
-      query,
-      llm_provider: provider,
-      llm_model:
-        requestedModel ??
-        (provider === "gemini"
-          ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
-          : process.env.OPENAI_MODEL ?? "gpt-4o"),
-      intent: "science",
-      answer,
-      ...(includeLlmError ? { llm_error } : {}),
-      current_state: "S_SCIENCE" satisfies AuroraState,
-      next_actions: buildNextActionsForState({ state: "S_SCIENCE", language: userLang, hasAnchor: false }),
-      context: {
-        region_preference: detectedRegion,
-        ...(external_verification ? { external_verification } : {}),
-      },
-    });
+    return jsonResponse(
+      envelope({
+        query,
+        llm_provider: provider,
+        llm_model:
+          requestedModel ??
+          (provider === "gemini"
+            ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
+            : process.env.OPENAI_MODEL ?? "gpt-4o"),
+        intent: "science",
+        answer,
+        ...(includeLlmError ? { llm_error } : {}),
+        current_state: "S_SCIENCE" satisfies AuroraState,
+        next_actions: buildNextActionsForState({ state: "S_SCIENCE", language: userLang, hasAnchor: false }),
+        context: {
+          region_preference: detectedRegion,
+          ...(external_verification ? { external_verification } : {}),
+        },
+        structured: {
+          schema_version: "aurora.structured.v1",
+          parse: {
+            normalized_query: query,
+            parse_confidence: 0,
+            normalized_query_language: languageTag,
+          },
+        } satisfies AuroraStructuredResultV1,
+      }),
+    );
   }
 
   // PRODUCT SHORTLIST / SUITABILITY PATH (no anchor required)
@@ -3531,21 +3949,56 @@ export async function POST(req: Request) {
 
     if (wantsStream) return streamResponse(answer);
 
-    return jsonResponse({
-      query,
-      llm_provider: provider,
-      llm_model:
-        requestedModel ??
-        (provider === "gemini"
-          ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
-          : process.env.OPENAI_MODEL ?? "gpt-4o"),
-      intent: "shortlist",
-      answer,
-      ...(includeLlmError ? { llm_error } : {}),
-      current_state: shortlistState,
-      next_actions: buildNextActionsForState({ state: shortlistState, language: userLang, hasAnchor: false }),
-      context: shortlistContextData,
+    const structuredAlternatives: AuroraAlternativeV1[] = candidates.slice(0, 6).map((c) => {
+      const product = buildAuroraProductEntityV1({
+        product_id: c.id,
+        sku_id: c.id,
+        brand: c.brand,
+        name: c.name,
+        category: c.category,
+        availability: c.availability,
+        price_usd: c.price_usd,
+      });
+      return {
+        product,
+        similarity_score: typeof c.similarity === "number" ? toSimilarityScore(c.similarity) : 0,
+        tradeoffs: {
+          missing_actives: [],
+          added_benefits: [],
+          texture_finish_differences: [],
+          price_delta_usd: null,
+          availability_note: null,
+        },
+        evidence: { kb_citations: c.kb_profile?.citations ?? [] },
+      };
     });
+
+    return jsonResponse(
+      envelope({
+        query,
+        llm_provider: provider,
+        llm_model:
+          requestedModel ??
+          (provider === "gemini"
+            ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
+            : process.env.OPENAI_MODEL ?? "gpt-4o"),
+        intent: "shortlist",
+        answer,
+        ...(includeLlmError ? { llm_error } : {}),
+        current_state: shortlistState,
+        next_actions: buildNextActionsForState({ state: shortlistState, language: userLang, hasAnchor: false }),
+        context: shortlistContextData,
+        structured: {
+          schema_version: "aurora.structured.v1",
+          parse: {
+            normalized_query: contextualQuery,
+            parse_confidence: 0.4,
+            normalized_query_language: languageTag,
+          },
+          alternatives: structuredAlternatives,
+        } satisfies AuroraStructuredResultV1,
+      }),
+    );
   }
 
   // ROUTINE PATH
@@ -3558,14 +4011,24 @@ export async function POST(req: Request) {
       if (clarify.questions.length) {
         const answer = formatClarificationAnswer(clarify.questions);
         if (wantsStream) return streamResponse(answer);
-        return jsonResponse({
-          query,
-          intent: "clarify",
-          answer,
-          current_state: "S_DIAGNOSIS" satisfies AuroraState,
-          next_actions: buildNextActionsFromClarificationQuestions(clarify.questions),
-          clarification: { questions: clarify.questions, missing_fields: clarify.missing, region_preference: detectedRegion },
-        });
+        return jsonResponse(
+          envelope({
+            query,
+            intent: "clarify",
+            answer,
+            current_state: "S_DIAGNOSIS" satisfies AuroraState,
+            next_actions: buildNextActionsFromClarificationQuestions(clarify.questions),
+            clarification: { questions: clarify.questions, missing_fields: clarify.missing, region_preference: detectedRegion },
+            structured: {
+              schema_version: "aurora.structured.v1",
+              parse: {
+                normalized_query: routineRequestText,
+                parse_confidence: 0.4,
+                normalized_query_language: languageTag,
+              },
+            } satisfies AuroraStructuredResultV1,
+          }),
+        );
       }
     }
 
@@ -3847,37 +4310,47 @@ export async function POST(req: Request) {
 
     if (wantsStream) return streamResponse(answer);
 
-    return jsonResponse({
-      query,
-      llm_provider: provider,
-      llm_model:
-        requestedModel ??
-      (provider === "gemini"
-        ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
-        : process.env.OPENAI_MODEL ?? "gpt-4o"),
-      answer,
-      ...(includeLlmError ? { llm_error } : {}),
-      intent: "routine",
-      current_state: "S_ROUTINE_CHECK" satisfies AuroraState,
-      next_actions: buildNextActionsForState({ state: "S_ROUTINE_CHECK", language: userLang, hasAnchor: false }),
-      context: {
-        detected: {
-          oily_acne: detectOilyAcne(routineProfileText),
-          sensitive_skin: detectSensitiveSkin(routineProfileText),
-          barrier_impaired: detectBarrierImpaired(routineProfileText),
-          region_preference: detectedRegion,
+    return jsonResponse(
+      envelope({
+        query,
+        llm_provider: provider,
+        llm_model:
+          requestedModel ??
+          (provider === "gemini"
+            ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
+            : process.env.OPENAI_MODEL ?? "gpt-4o"),
+        answer,
+        ...(includeLlmError ? { llm_error } : {}),
+        intent: "routine",
+        current_state: "S_ROUTINE_CHECK" satisfies AuroraState,
+        next_actions: buildNextActionsForState({ state: "S_ROUTINE_CHECK", language: userLang, hasAnchor: false }),
+        context: {
+          detected: {
+            oily_acne: detectOilyAcne(routineProfileText),
+            sensitive_skin: detectSensitiveSkin(routineProfileText),
+            barrier_impaired: detectBarrierImpaired(routineProfileText),
+            region_preference: detectedRegion,
+          },
+          budget_cny: budgetCny,
+          budget_usd_est: routineContextData.budget_usd_est,
+          budget: routineContextData.budget,
+          price_summary: routineContextData.price_summary,
+          routine: routine_primary_with_evidence,
+          routine_primary: routine_primary_with_evidence,
+          routine_budget: routine_budget_with_evidence,
+          over_budget,
+          ...(external_verification ? { external_verification } : {}),
         },
-        budget_cny: budgetCny,
-        budget_usd_est: routineContextData.budget_usd_est,
-        budget: routineContextData.budget,
-        price_summary: routineContextData.price_summary,
-        routine: routine_primary_with_evidence,
-        routine_primary: routine_primary_with_evidence,
-        routine_budget: routine_budget_with_evidence,
-        over_budget,
-        ...(external_verification ? { external_verification } : {}),
-      },
-    });
+        structured: {
+          schema_version: "aurora.structured.v1",
+          parse: {
+            normalized_query: routineRequestText,
+            parse_confidence: 0.6,
+            normalized_query_language: languageTag,
+          },
+        } satisfies AuroraStructuredResultV1,
+      }),
+    );
   }
 
   // PRODUCT / DUPE PATH
@@ -3894,14 +4367,22 @@ export async function POST(req: Request) {
           : { id: "anchor", question: "Which product do you want to evaluate/compare?", options: ["Send product name", "Send a link", "Send anchor_product_id"] },
       ];
       return jsonResponse(
-        {
+        envelope({
           query,
           intent: "clarify",
           answer,
           current_state: "S_SKU_BROWSING" satisfies AuroraState,
           next_actions: buildNextActionsFromClarificationQuestions(questions),
           clarification: { questions, candidates: aliasCandidates },
-        },
+          structured: {
+            schema_version: "aurora.structured.v1",
+            parse: {
+              normalized_query: query,
+              parse_confidence: aliasCandidates[0]?.confidence ?? 0,
+              normalized_query_language: languageTag,
+            },
+          } satisfies AuroraStructuredResultV1,
+        }),
         { status: 200 },
       );
     }
@@ -3924,14 +4405,24 @@ export async function POST(req: Request) {
       userLang === "zh"
         ? "我可以继续，但我需要你先选一下方向（点选即可）。"
         : "I can continue, but please pick what you want next (tap an option).";
-    return jsonResponse({
-      query,
-      intent: "clarify",
-      answer,
-      current_state: "S_DIAGNOSIS" satisfies AuroraState,
-      next_actions: buildNextActionsFromClarificationQuestions(questions),
-      clarification: { questions },
-    });
+    return jsonResponse(
+      envelope({
+        query,
+        intent: "clarify",
+        answer,
+        current_state: "S_DIAGNOSIS" satisfies AuroraState,
+        next_actions: buildNextActionsFromClarificationQuestions(questions),
+        clarification: { questions },
+        structured: {
+          schema_version: "aurora.structured.v1",
+          parse: {
+            normalized_query: query,
+            parse_confidence: 0.2,
+            normalized_query_language: languageTag,
+          },
+        } satisfies AuroraStructuredResultV1,
+      }),
+    );
   }
 
   const anchor = await prisma.product.findUnique({
@@ -3949,13 +4440,21 @@ export async function POST(req: Request) {
         ? "我没在数据库里找到这个产品（可能是别名没命中或还没入库）。你可以换一个更完整的产品名，或让我给你 2-3 个候选让你点选。"
         : "I couldn't find this product in the database (alias may not match or it's not ingested yet). Please send a more specific name, or ask me to propose 2–3 candidates to pick from.";
     return jsonResponse(
-      {
+      envelope({
         error: "Anchor product not found",
         anchor_product_id: anchorProductId,
         answer,
         current_state: "S_SKU_BROWSING" satisfies AuroraState,
         next_actions: buildNextActionsForState({ state: "S_SKU_BROWSING", language: userLang, hasAnchor: false }),
-      },
+        structured: {
+          schema_version: "aurora.structured.v1",
+          parse: {
+            normalized_query: query,
+            parse_confidence: 0.1,
+            normalized_query_language: languageTag,
+          },
+        } satisfies AuroraStructuredResultV1,
+      }),
       { status: 404 },
     );
   }
@@ -4061,22 +4560,81 @@ export async function POST(req: Request) {
 
     if (wantsStream) return streamResponse(answer);
 
-	    return jsonResponse({
-	      query,
-	      anchor_product_id: anchorProductId,
-	      llm_provider: provider,
-	      llm_model:
-        requestedModel ??
-        (provider === "gemini"
-          ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
-          : process.env.OPENAI_MODEL ?? "gpt-4o"),
-	      answer,
-	      ...(includeLlmError ? { llm_error } : {}),
-	      intent: "product",
-	      current_state: productState,
-	      next_actions: buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true }),
-	      context: kbOnlyContext,
-	    });
+    const kbOnlyAnchorEntity = buildAuroraProductEntityV1({
+      product_id: anchor.id,
+      sku_id: anchor.id,
+      brand: anchor.brand,
+      name: anchor.name,
+      availability,
+      product_url: (anchor as any).productUrl ?? null,
+      image_url: (anchor as any).imageUrl ?? null,
+      price_usd: normalizeUsdPrice((anchor as any).priceUsd),
+      price_cny: coerceNumber((anchor as any).priceCny),
+    });
+    const kbOnlyIngredients = summarizeIngredients((anchor as any).ingredients?.fullList, (anchor as any).ingredients?.heroActives);
+    const kbOnlySocial: AuroraSocialSignalsV1 | null = anchor.socialStats
+      ? {
+          red_score: Number.isFinite(anchor.socialStats.redScore) ? anchor.socialStats.redScore : null,
+          reddit_score: Number.isFinite(anchor.socialStats.redditScore) ? anchor.socialStats.redditScore : null,
+          burn_rate: Number.isFinite(coerceNumber(anchor.socialStats.burnRate)) ? clamp01(coerceNumber(anchor.socialStats.burnRate)) : null,
+          top_keywords: anchor.socialStats.topKeywords ?? [],
+        }
+      : null;
+    const kbOnlyHasExpert =
+      expert_knowledge != null &&
+      [expert_knowledge.sensitivity_flags, expert_knowledge.key_actives, expert_knowledge.chemist_notes, expert_knowledge.sensitivity_notes].some(
+        (v) => hasText(v),
+      );
+    const kbOnlyStructured: AuroraStructuredResultV1 = {
+      schema_version: "aurora.structured.v1",
+      parse: {
+        normalized_query: query,
+        parse_confidence: explicitAnchorId ? 1 : highConfidenceAlias ? bestAlias?.confidence ?? 0.7 : 0.6,
+        normalized_query_language: languageTag,
+        anchor_product: kbOnlyAnchorEntity,
+      },
+      analyze: {
+        verdict: "Unknown",
+        confidence: 0.4,
+        reasons: [
+          userLang === "zh"
+            ? "该产品仅有 KB 笔记，缺少 vectors/embedding；无法进行 Aurora 打分与相似检索。"
+            : "This product has KB notes but is missing vectors/embedding; Aurora scoring and similarity search are unavailable.",
+        ],
+        science_evidence: buildScienceEvidenceFromKbProfile({ kb_profile, ingredients: kbOnlyIngredients, lang: userLang }),
+        social_signals: kbOnlySocial,
+        expert_notes: buildExpertNotesV1({ expert_knowledge, kb_citations: kb_profile.citations }),
+        how_to_use: buildHowToUseV1({ category: null, kb_profile, lang: userLang }),
+      },
+      kb_requirements_check: buildKbRequirementsCheck({
+        has_vectors: false,
+        has_ingredients: Boolean(kbOnlyIngredients?.head?.length),
+        has_social: Boolean(kbOnlySocial),
+        has_expert_notes: kbOnlyHasExpert,
+        has_price_hint: kbOnlyAnchorEntity.price?.unknown === false,
+        lang: userLang,
+      }),
+    };
+
+    return jsonResponse(
+      envelope({
+        query,
+        anchor_product_id: anchorProductId,
+        llm_provider: provider,
+        llm_model:
+          requestedModel ??
+          (provider === "gemini"
+            ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
+            : process.env.OPENAI_MODEL ?? "gpt-4o"),
+        answer,
+        ...(includeLlmError ? { llm_error } : {}),
+        intent: "product",
+        current_state: productState,
+        next_actions: buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true }),
+        context: kbOnlyContext,
+        structured: kbOnlyStructured,
+      }),
+    );
 	  }
 
   // Use the shared DB->SkuVector normalization so scoring behaves like /v1/decision/analyze.
@@ -4345,46 +4903,161 @@ export async function POST(req: Request) {
 
   if (wantsStream) return streamResponse(answer);
 
-  return jsonResponse({
-    query,
-    anchor_product_id: anchorProductId,
-    llm_provider: provider,
-    llm_model:
-      requestedModel ??
-      (provider === "gemini"
-        ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
-        : process.env.OPENAI_MODEL ?? "gpt-4o"),
-    answer,
-    ...(includeLlmError ? { llm_error } : {}),
-    intent: "product",
-    current_state: productState,
-    next_actions: buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true }),
-    context: {
-      detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired, region_preference: detectedRegion },
-      ...(external_verification ? { external_verification } : {}),
-      anchor: {
-        id: anchor.id,
-        brand: anchor.brand,
-        name: anchor.name,
-        price_usd: normalizeUsdPrice(anchor.priceUsd),
-        availability: Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [],
-        vetoed: anchorVetoed || anchorScore.vetoed,
-        score: anchorScore,
-        risk_flags: anchor.vectors.riskFlags ?? [],
-        risk_flags_canonical: anchorRisk,
-        ingredients: anchorIngredientCtx,
-        social: anchor.socialStats
-          ? {
-              red_score: anchor.socialStats.redScore,
-              reddit_score: anchor.socialStats.redditScore,
-              burn_rate: coerceNumber(anchor.socialStats.burnRate),
-              top_keywords: anchor.socialStats.topKeywords ?? [],
-            }
-          : null,
-      },
-      similar_products: mappedCandidates,
-    },
+  const anchorEntity = buildAuroraProductEntityV1({
+    product_id: anchor.id,
+    sku_id: anchor.id,
+    brand: anchor.brand,
+    name: anchor.name,
+    category: anchorSku.category,
+    availability: Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [],
+    product_url: (anchor as any).productUrl ?? null,
+    image_url: (anchor as any).imageUrl ?? null,
+    price_usd: normalizeUsdPrice(anchor.priceUsd),
+    price_cny: (anchor as any).priceCny ?? null,
   });
+
+  const verdict = anchorVetoed || anchorScore.vetoed ? "Risky" : anchorScore.total >= 65 ? "Suitable" : "Mismatch";
+  const t = (en: string, zh: string) => (userLang === "zh" ? zh : en);
+  const reasons: string[] = [];
+  if (anchorVetoed || anchorScore.vetoed) {
+    const why =
+      anchorScore.veto_reason ??
+      (barrierImpaired ? t("Barrier is impaired; irritation risk is high.", "屏障受损时刺激风险偏高。") : t("Risk flags / burn rate indicate higher irritation risk.", "风险标记/舆情刺激率提示刺激风险偏高。"));
+    reasons.push(why);
+  } else if (anchorScore.total < 65) {
+    reasons.push(t("Overall fit score is moderate/low for your profile.", "综合适配分中等偏低（相对你的皮肤画像）。"));
+  } else {
+    reasons.push(t("Overall fit looks reasonable for your profile.", "综合适配度看起来较合理。"));
+  }
+
+  const anchorSocial: AuroraSocialSignalsV1 | null = anchor.socialStats
+    ? {
+        red_score: Number.isFinite(coerceNumber(anchor.socialStats.redScore)) ? coerceNumber(anchor.socialStats.redScore) : null,
+        reddit_score: Number.isFinite(coerceNumber(anchor.socialStats.redditScore)) ? coerceNumber(anchor.socialStats.redditScore) : null,
+        burn_rate: Number.isFinite(coerceNumber(anchor.socialStats.burnRate)) ? coerceNumber(anchor.socialStats.burnRate) : null,
+        top_keywords: Array.isArray(anchor.socialStats.topKeywords) ? anchor.socialStats.topKeywords : [],
+      }
+    : null;
+
+  const structuredAlternatives: AuroraAlternativeV1[] = mappedCandidates.slice(0, 6).map((c) => {
+    const product = buildAuroraProductEntityV1({
+      product_id: c.product_id,
+      sku_id: c.product_id,
+      brand: c.brand,
+      name: c.name,
+      category: null,
+      availability: c.availability,
+      price_usd: c.price_usd,
+    });
+
+    const anchorActives = Array.isArray(anchorKbProfile.keyActives) ? anchorKbProfile.keyActives : [];
+    const candActives = Array.isArray(c.kb_profile?.keyActives) ? c.kb_profile.keyActives : [];
+    const { missing, added } = diffKeyActives(anchorActives, candActives);
+
+    const textureDiffs: string[] = [];
+    if (typeof c.tradeoff === "string" && c.tradeoff.trim()) textureDiffs.push(c.tradeoff.trim());
+
+    const anchorPrice = anchorEntity.price?.usd ?? null;
+    const candPrice = product.price?.usd ?? null;
+    const price_delta_usd = anchorPrice != null && candPrice != null ? Math.round((candPrice - anchorPrice) * 100) / 100 : null;
+
+    const availability = Array.isArray(product.availability) ? product.availability : [];
+    const availability_note =
+      detectedRegion && availability.length && !availability.includes(detectedRegion) && !availability.includes("Global")
+        ? t(
+            `Primarily available in ${availability.join(",")}; may require cross-border purchase.`,
+            `主要在 ${availability.join(",")} 渠道更常见；可能需要海淘/跨境购买。`,
+          )
+        : null;
+
+    return {
+      product,
+      similarity_score: typeof c.similarity === "number" ? toSimilarityScore(c.similarity) : 0,
+      tradeoffs: {
+        missing_actives: missing,
+        added_benefits: added,
+        texture_finish_differences: textureDiffs,
+        price_delta_usd,
+        availability_note,
+      },
+      evidence: { kb_citations: c.kb_profile?.citations ?? [] },
+    };
+  });
+
+  const expertNotes = buildExpertNotesV1({ expert_knowledge: anchorExpertKnowledge, kb_citations: anchorKbProfile.citations ?? [] });
+  const structured: AuroraStructuredResultV1 = {
+    schema_version: "aurora.structured.v1",
+    parse: {
+      normalized_query: query,
+      parse_confidence: explicitAnchorId ? 1 : highConfidenceAlias ? bestAlias?.confidence ?? 0.6 : 0.4,
+      normalized_query_language: languageTag,
+      anchor_product: anchorEntity,
+    },
+    analyze: {
+      verdict,
+      confidence: explicitAnchorId ? 0.9 : highConfidenceAlias ? 0.8 : 0.6,
+      reasons,
+      science_evidence: buildScienceEvidenceFromKbProfile({ kb_profile: anchorKbProfile, ingredients: anchorIngredientCtx, lang: userLang }),
+      social_signals: anchorSocial,
+      expert_notes: expertNotes,
+      how_to_use: buildHowToUseV1({ category: anchorSku.category, kb_profile: anchorKbProfile, lang: userLang }),
+    },
+    alternatives: structuredAlternatives,
+    kb_requirements_check: buildKbRequirementsCheck({
+      has_vectors: true,
+      has_ingredients: Boolean(anchorIngredientCtx?.head?.length),
+      has_social: Boolean(anchorSocial),
+      has_expert_notes: Boolean(expertNotes),
+      has_price_hint: anchorEntity.price?.unknown === false,
+      lang: userLang,
+    }),
+  };
+
+  return jsonResponse(
+    envelope({
+      query,
+      anchor_product_id: anchorProductId,
+      llm_provider: provider,
+      llm_model:
+        requestedModel ??
+        (provider === "gemini"
+          ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
+          : process.env.OPENAI_MODEL ?? "gpt-4o"),
+      answer,
+      ...(includeLlmError ? { llm_error } : {}),
+      intent: "product",
+      current_state: productState,
+      next_actions: buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true }),
+      context: {
+        detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired, region_preference: detectedRegion },
+        ...(external_verification ? { external_verification } : {}),
+        anchor: {
+          id: anchor.id,
+          brand: anchor.brand,
+          name: anchor.name,
+          price_usd: normalizeUsdPrice(anchor.priceUsd),
+          availability: Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [],
+          vetoed: anchorVetoed || anchorScore.vetoed,
+          score: anchorScore,
+          risk_flags: anchor.vectors.riskFlags ?? [],
+          risk_flags_canonical: anchorRisk,
+          ingredients: anchorIngredientCtx,
+          social: anchor.socialStats
+            ? {
+                red_score: anchor.socialStats.redScore,
+                reddit_score: anchor.socialStats.redditScore,
+                burn_rate: coerceNumber(anchor.socialStats.burnRate),
+                top_keywords: anchor.socialStats.topKeywords ?? [],
+              }
+            : null,
+          kb_profile: shrinkKbProfileForLlm(anchorKbProfile),
+          expert_knowledge: anchorExpertKnowledge,
+        },
+        similar_products: mappedCandidates,
+      },
+      structured,
+    }),
+  );
 }
 
 export async function GET() {
