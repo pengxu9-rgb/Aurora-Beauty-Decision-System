@@ -3097,6 +3097,25 @@ function buildFallbackRoutineCheckAnswer(input: {
   const cite = input.anchor.kb_profile.citations?.[0] ? ` ${input.anchor.kb_profile.citations[0]}` : "";
   const how = buildHowToUseV1({ category: null, kb_profile: input.anchor.kb_profile as any, lang }) ?? {};
   const avoid = Array.isArray(how.avoid_with) ? how.avoid_with : [];
+  const localizeAvoidRule = (rule: string) => {
+    if (lang !== "zh") return rule;
+    const r = rule.trim();
+    const lower = r.toLowerCase();
+    if (!r) return r;
+    if (lower.includes("do not stack") && (lower.includes("strong acids") || lower.includes("multiple") || lower.includes("acids"))) {
+      return "同一晚不要叠加强酸/多种酸类（AHA/BHA/PHA 等）。";
+    }
+    if (
+      (lower.includes("copper peptides") || lower.includes("copper peptide")) &&
+      (lower.includes("direct acids") || lower.includes("vitamin c") || lower.includes("l-ascorbic") || lower.includes("ascorbic"))
+    ) {
+      return "蓝铜肽尽量与直酸/纯左旋维C错开（AM/PM 或隔天）。";
+    }
+    if (lower.includes("retinoid") && (lower.includes("acid") || lower.includes("acids"))) {
+      return "维A类与酸类不要同晚叠加（分开天用）。";
+    }
+    return rule;
+  };
   const ek = input.anchor.expert_knowledge;
   const sensitivityNotes = (typeof ek?.sensitivity_notes === "string" && ek.sensitivity_notes.trim()) ? ek.sensitivity_notes.trim() : null;
   const flags = (typeof ek?.sensitivity_flags === "string" && ek.sensitivity_flags.trim()) ? ek.sensitivity_flags.trim() : null;
@@ -3130,7 +3149,7 @@ function buildFallbackRoutineCheckAnswer(input: {
   lines.push("");
   lines.push(t("⚠️ Avoid mixing / conflicts:", "⚠️ 避免叠加/冲突："));
   if (avoid.length) {
-    for (const rule of avoid.slice(0, 6)) lines.push(`- ${rule}`);
+    for (const rule of avoid.slice(0, 6)) lines.push(`- ${localizeAvoidRule(rule)}`);
   } else {
     lines.push(t("- Do not stack multiple strong acids/retinoids in the same night.", "- 同一晚不要叠加强酸/高强度维A类。"));
     lines.push(t("- If you use copper peptides, separate from direct acids / pure L-ascorbic acid.", "- 如果你同时用蓝铜肽，尽量与直酸/纯左旋维C错开（AM/PM 或隔天）。"));
