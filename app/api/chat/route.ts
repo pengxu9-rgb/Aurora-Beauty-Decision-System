@@ -2502,7 +2502,11 @@ function buildFallbackProductAnswer(input: {
 
   if (top.length > 0) {
     lines.push("");
-    lines.push("推荐平替（按相似度/性价比）：");
+    const hasPriceSignal =
+      (anchor.price_usd != null && anchor.price_usd > 0 && top.some((c) => c.price_usd != null && c.price_usd > 0)) ||
+      Boolean(priceGap);
+    lines.push(hasPriceSignal ? "推荐平替（按相似度/性价比）："
+                              : "推荐替代（按相似度；价格可能不同）：");
     for (const [idx, c] of top.entries()) {
       const cLines: string[] = [];
       const cite = c.citations?.[0] ? ` ${c.citations[0]}` : "";
@@ -4068,11 +4072,12 @@ export async function POST(req: Request) {
   const mappedCandidates = candidates.map((c) => {
     const ing = ingredientByProductId.get(c.product_id);
     const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives);
+    const candidatePriceUsd = normalizeUsdPrice(c.sku.price);
     return {
       product_id: c.product_id,
       brand: c.sku.brand,
       name: c.sku.name,
-      price_usd: normalizeUsdPrice(c.sku.price),
+      price_usd: candidatePriceUsd,
       availability: c.availability,
       similarity: c.similarity,
       tradeoff: (() => {
@@ -4080,7 +4085,15 @@ export async function POST(req: Request) {
         if (ex.texture === "sticky" || (ex.stickiness ?? 0) > 0.6) return "Texture is stickier.";
         if (ex.texture === "thick") return "Texture is thicker/richer.";
         if ((ex.pilling_risk ?? 0) > 0.6) return "Higher pilling risk under layering.";
-        return "Lower-cost alternative.";
+        if (
+          wantsCheaperAlternatives &&
+          anchorPriceUsdForFiltering != null &&
+          candidatePriceUsd != null &&
+          candidatePriceUsd < anchorPriceUsdForFiltering
+        ) {
+          return "Cheaper alternative (based on available price data).";
+        }
+        return "Similar alternative (price may vary).";
       })(),
       ingredients: ingCtx,
       expert_knowledge: buildExpertKnowledgeFromKb(kbByProductId.get(c.product_id) ?? []),
@@ -4144,7 +4157,12 @@ export async function POST(req: Request) {
             ? "Texture is thicker/richer."
             : (ex.pilling_risk ?? 0) > 0.6
               ? "Higher pilling risk under layering."
-              : "Lower-cost alternative.";
+              : wantsCheaperAlternatives &&
+                  anchorSkuForLlm.price_usd != null &&
+                  skuLlm.price_usd != null &&
+                  skuLlm.price_usd < anchorSkuForLlm.price_usd
+                ? "Cheaper alternative (based on available price data)."
+                : "Similar alternative (price may vary).";
 
       return {
         id: c.product_id,
