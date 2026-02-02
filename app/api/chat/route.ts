@@ -1015,6 +1015,36 @@ function detectRoutineIntegrationIntent(query: string) {
   return cn || en;
 }
 
+function detectActiveLikeProductForRoutineCheck(input: {
+  kb_profile: Pick<KbProfile, "keyActives" | "sensitivityFlags">;
+  expert_knowledge: unknown;
+}) {
+  const parts: string[] = [];
+  if (Array.isArray(input.kb_profile.keyActives) && input.kb_profile.keyActives.length) parts.push(input.kb_profile.keyActives.join(" "));
+  if (Array.isArray(input.kb_profile.sensitivityFlags) && input.kb_profile.sensitivityFlags.length) parts.push(input.kb_profile.sensitivityFlags.join(" "));
+
+  const ek = input.expert_knowledge as Record<string, unknown> | null;
+  if (ek) {
+    for (const k of ["key_actives_summary", "key_actives", "sensitivity_flags"]) {
+      const v = ek[k];
+      if (typeof v === "string" && v.trim()) parts.push(v.trim());
+    }
+  }
+
+  const haystack = parts.join(" ").toLowerCase();
+  if (!haystack) return false;
+
+  // Only treat "strong actives" as requiring conservative titration.
+  // (Do NOT classify tranexamic acid / niacinamide as "actives" for frequency gating.)
+  const hasExfoliatingAcids =
+    /\b(aha|bha|pha|salicylic|glycolic|lactic|mandelic|gluconolactone|lactobionic)\b/i.test(haystack) ||
+    /(果酸|水杨|阿达帕林)/.test(haystack);
+  const hasRetinoids = /\b(retinol|retinal|adapalene|tretinoin|retinoic)\b/i.test(haystack) || /(维a|a醇|视黄|a酸)/.test(haystack);
+  const hasPureVitaminC = /\b(l-ascorbic|ascorbic acid)\b/i.test(haystack) || /(左旋c|纯vc)/.test(haystack);
+
+  return hasExfoliatingAcids || hasRetinoids || hasPureVitaminC;
+}
+
 function mapRiskFlags(rawFlags: unknown): RiskFlag[] {
   const flags = Array.isArray(rawFlags) ? rawFlags.map((f) => String(f).toLowerCase()) : [];
   const out = new Set<RiskFlag>();
@@ -2835,7 +2865,7 @@ function isBadAnswer(answer: string, mode: "routine" | "product") {
   return false;
 }
 
-function isBadRoutineCheckAnswer(answer: string) {
+function isBadRoutineCheckAnswer(answer: string, opts?: { activeLike?: boolean }) {
   const trimmed = answer.trim();
   if (trimmed.length < 80) return true;
   if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
@@ -2853,6 +2883,14 @@ function isBadRoutineCheckAnswer(answer: string) {
   // In routine-check mode, we need *some* actionable placement/frequency/conflict guidance.
   // Asking for the user's current routine is allowed, but not sufficient on its own.
   if (!hasPlacement && !hasFrequency && !hasExplicitConflictGuidance) return true;
+
+  // Safety-first: if the product contains strong actives (acids/retinoids/pure L-AA),
+  // do not allow "every night / twice daily" recommendations.
+  if (opts?.activeLike) {
+    const aggressive =
+      /(早晚各(一)?次|早晚都用|一天两次|每晚(使用|用)|每天晚上|every night|nightly|twice a day|morning and night)/i.test(trimmed);
+    if (aggressive) return true;
+  }
 
   return false;
 }
@@ -5026,7 +5064,11 @@ export async function POST(req: Request) {
             ],
           });
 
-    const bad = productState === "S_ROUTINE_CHECK" ? isBadRoutineCheckAnswer(answer) : isBadAnswer(answer, "product");
+    const activeLike =
+      productState === "S_ROUTINE_CHECK"
+        ? detectActiveLikeProductForRoutineCheck({ kb_profile: anchorKbProfile, expert_knowledge: anchorExpertKnowledge })
+        : false;
+    const bad = productState === "S_ROUTINE_CHECK" ? isBadRoutineCheckAnswer(answer, { activeLike }) : isBadAnswer(answer, "product");
     if (bad) {
       llm_error = productState === "S_ROUTINE_CHECK" ? "LLM routine-check answer too short/unactionable; used fallback." : "LLM answer too short; used fallback.";
       answer = fallbackAnswer;
