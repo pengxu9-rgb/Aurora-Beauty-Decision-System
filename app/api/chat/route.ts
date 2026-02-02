@@ -2950,7 +2950,7 @@ function isBadRoutineCheckAnswer(answer: string, opts?: { activeLike?: boolean }
     /((cleanser|wash|toner|serum|moisturizer|sunscreen|洁面|洗脸|清洁|爽肤水|化妆水|精华|面霜|乳液|防晒).{0,24}(→|->|＞|>))/i.test(trimmed);
   // Require actionable frequency signals (not just the word "频率"/"frequency").
   const hasFrequency =
-    /((频率|frequency|建议|推荐|不建议|可以|start|先从).{0,24}(每周|次\/周|隔天|每(晚|天)|一周|nights\/week|times per week|every other|every night|nightly|twice a day|morning and night)|(\b\d+\s*(?:-|–|~)\s*\d+\s*(?:nights|times|次|晚)\b|1-2|2-3|两到三|一到二))/i.test(
+    /((频率|frequency|建议|推荐|不建议|可以|start|先从).{0,24}(每周|次\/周|隔天|每(晚|天)|一周|早晚|每天早晚|nights\/week|times per week|every other|every night|nightly|twice a day|morning and night)|(\b\d+\s*(?:-|–|~)\s*\d+\s*(?:nights|times|次|晚)\b|1-2|2-3|两到三|一到二))/i.test(
       trimmed,
     );
   // Require specific conflict guidance (not just “避免叠加成分”).
