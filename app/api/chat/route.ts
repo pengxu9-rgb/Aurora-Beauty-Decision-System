@@ -2800,6 +2800,8 @@ export async function POST(req: Request) {
   // Use recent user messages as additional context for Phase-0 clarification and profile inference.
   // This prevents redundant questions when the user already provided skin type / barrier / goals earlier in the session.
   const profileText = [recentUserContextText, query].filter(Boolean).join("\n");
+  const sessionProfileEarly = inferSessionSkinProfileFromMessages(messages, query);
+  const profileAnswerKind = detectProfileAnswerKind(query);
   const contextualQuery =
     isShortFollowUpQuery(query) && recentUserContextText.trim() && recentUserContextText.trim() !== query
       ? `${recentUserContextText}\n\nFollow-up: ${query}`
@@ -2828,9 +2830,16 @@ export async function POST(req: Request) {
   const isBrandOnlyAlias = typeof bestAlias?.alias_kind === "string" && bestAlias.alias_kind.toLowerCase().includes("brand");
   const highConfidenceAlias = bestAlias != null && bestAlias.confidence >= 0.72 && !isBrandOnlyAlias;
 
+  const hasCompleteSessionProfile = isSessionSkinProfileComplete(sessionProfileEarly);
+
   const wantsShortlistNoAnchor =
     !routineIntent &&
-    (detectProductShortlistIntent(intentText) || similarEfficacyIntent || (evalIntent && activeMentions.length > 0));
+    (detectProductShortlistIntent(intentText) ||
+      similarEfficacyIntent ||
+      (evalIntent && activeMentions.length > 0) ||
+      // If the user has completed their profile via chips and the last chip is a goal (e.g. "提亮/淡斑"),
+      // default into the shortlist path. This avoids a dead-end "what next?" loop.
+      (profileAnswerKind === "concerns" && hasCompleteSessionProfile));
 
   // Legacy fallback (brand heuristics + loose token match).
   const legacyAnchorId = !explicitAnchorId && (dupeIntent || evalIntent) ? await findAnchorProductId(intentText) : null;
@@ -2903,7 +2912,7 @@ export async function POST(req: Request) {
   let userProfile: UserProfile | null = null;
   let recentSkinLogs: SkinLog[] = [];
   let userHistoryDbError: string | null = null;
-  const sessionProfile = inferSessionSkinProfileFromMessages(messages, query);
+  const sessionProfile = sessionProfileEarly;
   const profileAnswerOnly = looksLikeStandaloneProfileAnswer({ query, messages });
 
   try {
@@ -2979,7 +2988,8 @@ export async function POST(req: Request) {
 
   // If the user is only answering a profile chip (and there is no prior "ask"),
   // short-circuit into deterministic Phase-0 progression to avoid LLM loops.
-  if (!wantsScienceOnly && profileAnswerOnly) {
+  // Exception: if the user just completed the "goals" chip (profile complete), let it flow into shortlist.
+  if (!wantsScienceOnly && profileAnswerOnly && !(profileAnswerKind === "concerns" && hasCompleteSessionProfile)) {
     const missing = {
       skinType: !userProfile?.skinType && !sessionProfile.skinType,
       barrierStatus: !userProfile?.barrierStatus && !sessionProfile.barrierStatus,
