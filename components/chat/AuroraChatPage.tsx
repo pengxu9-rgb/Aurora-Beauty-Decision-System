@@ -203,6 +203,16 @@ export function AuroraChatPage() {
 
       const hasDiagnosisGate = cards.some((c) => c && typeof c === "object" && (c as any).type === "diagnosis_gate");
       pendingGateMessageRef.current = hasDiagnosisGate ? (userMessage || gateMessage || pendingGateMessageRef.current) : null;
+
+      // The profile snapshot is not always fully persisted during early chat turns.
+      // Treat diagnosis as "complete" once the engine proceeds past the diagnosis gate,
+      // so the sticky banner reaches 100% and collapses.
+      if (hasDiagnosisGate || nextState === "S_DIAGNOSIS") {
+        setDiagnosisProgressOverride(0);
+        setDiagnosisExpanded(true);
+      } else {
+        setDiagnosisProgressOverride(100);
+      }
     },
     [pushMessage],
   );
@@ -580,6 +590,7 @@ export function AuroraChatPage() {
                 setSendError(null);
                 setInput("");
                 setDiagnosisProgressOverride(0);
+                setDiagnosisExpanded(true);
                 setAvatarUrl(null);
                 if (userId) void refreshIdentity(userId);
               }}
