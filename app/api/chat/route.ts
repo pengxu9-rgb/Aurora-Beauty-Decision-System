@@ -1908,6 +1908,13 @@ type RoutineRec = {
   total_cny: number;
 };
 
+type RoutineLocks = Partial<{
+  cleanser: SkuVector;
+  moisturizer: SkuVector;
+  sunscreen: SkuVector;
+  treatment: SkuVector;
+}>;
+
 type RoutineEvidencePack = KbProfile;
 
 type RoutineStepWithEvidence = {
@@ -2161,22 +2168,27 @@ function sumUniqueUsd(skus: SkuVector[]) {
   return total;
 }
 
-function buildPrimaryRoutine(db: SkuVector[], user: UserVector, query: string, budgetCny: number | null): RoutineRec {
+function buildPrimaryRoutine(db: SkuVector[], user: UserVector, query: string, budgetCny: number | null, locks?: RoutineLocks): RoutineRec {
   const lowBudget = isLowBudgetCny(budgetCny);
   const skipAmMoisturizer = lowBudget && !hasDrySkin(user);
   const comedones = detectClosedComedonesOrRoughTexture(query);
 
-  const cleanser = pickCheapest(db, "cleanser", user);
-  const sunscreen = pickCheapest(db, "sunscreen", user);
+  const cleanser = locks?.cleanser ?? pickCheapest(db, "cleanser", user);
+  const sunscreen = locks?.sunscreen ?? pickCheapest(db, "sunscreen", user);
 
   // Targeted comedone logic: prioritize acids (BHA/AHA/Azelaic) in PM over Niacinamide/Retinol.
   let treatment: SkuVector | null = null;
-  if (comedones) treatment = pickBestAcidForComedones(db, user);
-  if (!treatment) treatment = pickBestByScore(db, "treatment", user) ?? pickBestByScore(db, "serum", user);
+  if (locks?.treatment) {
+    treatment = locks.treatment;
+  } else {
+    if (comedones) treatment = pickBestAcidForComedones(db, user);
+    if (!treatment) treatment = pickBestByScore(db, "treatment", user) ?? pickBestByScore(db, "serum", user);
+  }
 
   // Budget compression: if low budget and not dry, keep moisturizer simple/cheap and invest in the PM active.
-  const moisturizer: SkuVector | null =
-    lowBudget && !hasDrySkin(user)
+  const moisturizer: SkuVector | null = locks?.moisturizer
+    ? locks.moisturizer
+    : lowBudget && !hasDrySkin(user)
       ? pickCheapest(db, "moisturizer", user)
       : pickBestByScore(db, "moisturizer", user) ?? pickCheapest(db, "moisturizer", user);
 
@@ -2226,8 +2238,8 @@ function buildPrimaryRoutine(db: SkuVector[], user: UserVector, query: string, b
   return { am, pm, total_usd: totalUsd, total_cny: computeUsdToCny(totalUsd) };
 }
 
-function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string, budgetCny: number | null): RoutineRec {
-  const primary = buildPrimaryRoutine(db, user, query, budgetCny);
+function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string, budgetCny: number | null, locks?: RoutineLocks): RoutineRec {
+  const primary = buildPrimaryRoutine(db, user, query, budgetCny, locks);
   if (budgetCny == null || !Number.isFinite(budgetCny)) return primary;
 
   const budgetUsd = budgetCny / USD_TO_CNY;
@@ -2236,8 +2248,8 @@ function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string
   const lowBudget = isLowBudgetCny(budgetCny);
   const skipAmMoisturizer = lowBudget && !hasDrySkin(user);
 
-  const cleanser = pickCheapest(db, "cleanser", user);
-  const sunscreen = pickCheapest(db, "sunscreen", user);
+  const cleanser = locks?.cleanser ?? pickCheapest(db, "cleanser", user);
+  const sunscreen = locks?.sunscreen ?? pickCheapest(db, "sunscreen", user);
 
   // Start from the same treatment/moisturizer choices as primary.
   let treatment = primary.pm.find((s) => s.step === "Treatment")?.sku ?? null;
@@ -2247,14 +2259,14 @@ function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string
 
   let totalUsd = sumUniqueUsd(budgetSkus());
 
-  if (totalUsd > budgetUsd) {
+  if (totalUsd > budgetUsd && !locks?.moisturizer) {
     // First attempt: ensure moisturizer is cheapest.
     const cheapMoist = pickCheapest(db, "moisturizer", user);
     if (cheapMoist) moisturizer = cheapMoist;
     totalUsd = sumUniqueUsd(budgetSkus());
   }
 
-  if (totalUsd > budgetUsd) {
+  if (totalUsd > budgetUsd && !locks?.treatment) {
     // Second attempt: downgrade the active to a cheaper, high-scoring option (may sacrifice acids).
     const candidates = db
       .filter((s) => s.category === "treatment" || s.category === "serum")
@@ -2270,7 +2282,7 @@ function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string
     totalUsd = sumUniqueUsd(budgetSkus());
   }
 
-  if (totalUsd > budgetUsd) {
+  if (totalUsd > budgetUsd && !locks?.treatment) {
     // Last resort: drop the active.
     treatment = null;
     totalUsd = sumUniqueUsd(budgetSkus());
@@ -3571,8 +3583,24 @@ export async function POST(req: Request) {
       }
     }
 
-    const routine_primary = buildPrimaryRoutine(dbForRoutine, user, routineProfileText, budgetCny);
-    const routine_budget = buildBudgetSafeRoutine(dbForRoutine, user, routineProfileText, budgetCny);
+    const routineLocks: RoutineLocks | undefined = (() => {
+      if (!anchorProductId || !looksLikeUuid(anchorProductId)) return undefined;
+      const anchorSku = dbAll.find((s) => s.sku_id === anchorProductId) ?? null;
+      if (!anchorSku) return undefined;
+
+      // Ensure the locked SKU is in the candidate pool so routines + evidence enrichment can include it.
+      if (!dbForRoutine.some((s) => s.sku_id === anchorSku.sku_id)) {
+        dbForRoutine = mergeSkuPool([...dbForRoutine, anchorSku]);
+      }
+
+      if (anchorSku.category === "cleanser") return { cleanser: anchorSku };
+      if (anchorSku.category === "sunscreen") return { sunscreen: anchorSku };
+      if (anchorSku.category === "moisturizer") return { moisturizer: anchorSku };
+      return { treatment: anchorSku };
+    })();
+
+    const routine_primary = buildPrimaryRoutine(dbForRoutine, user, routineProfileText, budgetCny, routineLocks);
+    const routine_budget = buildBudgetSafeRoutine(dbForRoutine, user, routineProfileText, budgetCny, routineLocks);
     const over_budget = budgetCny != null && Number.isFinite(budgetCny) ? routine_primary.total_cny > budgetCny : false;
     const routine = routine_primary;
 
