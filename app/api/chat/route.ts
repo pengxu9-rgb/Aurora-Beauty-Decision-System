@@ -2847,7 +2847,9 @@ function isBadRoutineCheckAnswer(answer: string) {
     /(频率|每周|次\/周|nights\/week|how often|frequency|start\s+\d|先从|放在|before|after|avoid|不要|叠加|冲突)/i.test(trimmed);
   const asksRoutine =
     /(你.*(现在|目前).*(流程|routine)|你.*在用.*(酸|A醇|维A|retinol|retinal|adapalene|acid|vitamin c|L-ascorbic|copper))/i.test(trimmed);
-  if (!hasUsage && !asksRoutine) return true;
+  // In routine-check mode, we need *some* actionable placement/frequency/conflict guidance.
+  // Asking for the user's current routine is allowed, but not sufficient on its own.
+  if (!hasUsage) return true;
 
   return false;
 }
