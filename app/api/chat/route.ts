@@ -858,7 +858,12 @@ function detectProductEvaluationIntent(query: string) {
     q.includes("good") ||
     q.includes("ok") ||
     q.includes("works") ||
+    q.includes("review") ||
     q.includes("怎么样") ||
+    query.includes("评估") ||
+    query.includes("测评") ||
+    query.includes("评价") ||
+    query.includes("分析一下") ||
     query.includes("好用吗") ||
     query.includes("值吗") ||
     query.includes("适合吗") ||
@@ -2793,6 +2798,8 @@ export async function POST(req: Request) {
   const streamResponse = (text: string, opts?: Parameters<typeof streamTextResponse>[1]) =>
     withSetCookie(streamTextResponse(text, opts), setCookieHeader);
 
+  const includeLlmError = process.env.NODE_ENV === "development" || body.debug === true;
+
   const limit = typeof body.limit === "number" && body.limit > 0 ? Math.min(20, body.limit) : 6;
 
   const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -2823,7 +2830,14 @@ export async function POST(req: Request) {
     typeof body.anchor_product_id === "string" && body.anchor_product_id.trim() ? body.anchor_product_id.trim() : null;
   const dupeIntent = detectDupeIntent(intentText);
   const evalIntent = detectProductEvaluationIntent(intentText);
-  const routineIntent = intentText.includes("流程") || intentText.includes("早晚") || intentText.toLowerCase().includes("routine");
+  const routineIntent =
+    intentText.includes("流程") ||
+    intentText.includes("早晚") ||
+    intentText.includes("怎么用") ||
+    intentText.includes("搭配") ||
+    intentText.includes("叠加") ||
+    intentText.toLowerCase().includes("routine") ||
+    intentText.toLowerCase().includes("layer");
 
   const aliasCandidates = explicitAnchorId ? [] : await findAnchorCandidatesFromAliases(intentText);
   const bestAlias = aliasCandidates[0] ?? null;
@@ -3158,7 +3172,7 @@ export async function POST(req: Request) {
           : process.env.OPENAI_MODEL ?? "gpt-4o"),
       intent: "science",
       answer,
-      llm_error,
+      ...(includeLlmError ? { llm_error } : {}),
       current_state: "S_SCIENCE" satisfies AuroraState,
       next_actions: buildNextActionsForState({ state: "S_SCIENCE", language: userLang, hasAnchor: false }),
       context: {
@@ -3372,8 +3386,6 @@ export async function POST(req: Request) {
     // Then best-effort ask the LLM to *rewrite* the shortlist with better rationale, without changing the list.
     let answer = fallbackAnswer;
     let llm_error: string | null = null;
-
-    const includeLlmError = process.env.NODE_ENV === "development" || body.debug === true;
 
     const lockedProducts = candidates.slice(0, 5).map((c) => `${c.brand} ${c.name}`.trim()).filter(Boolean);
     const refinementPrompt = [
@@ -3735,11 +3747,11 @@ export async function POST(req: Request) {
       llm_provider: provider,
       llm_model:
         requestedModel ??
-        (provider === "gemini"
-          ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
-          : process.env.OPENAI_MODEL ?? "gpt-4o"),
+      (provider === "gemini"
+        ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
+        : process.env.OPENAI_MODEL ?? "gpt-4o"),
       answer,
-      llm_error,
+      ...(includeLlmError ? { llm_error } : {}),
       intent: "routine",
       current_state: "S_ROUTINE_CHECK" satisfies AuroraState,
       next_actions: buildNextActionsForState({ state: "S_ROUTINE_CHECK", language: userLang, hasAnchor: false }),
@@ -3884,7 +3896,7 @@ export async function POST(req: Request) {
 	      detectDeepScienceQuestion(query) && (kb_profile.citations.length === 0 || !expertHasAnyText);
 	    const external_verification = await maybeGetExternalVerification({ query, enabled: wantsExternalVerification });
 
-	    const productState: AuroraState = dupeIntent || priceSensitive ? "S_COMPARING" : "S_ROUTINE_CHECK";
+	    const productState: AuroraState = routineIntent ? "S_ROUTINE_CHECK" : "S_COMPARING";
 
 	    const kbOnlyContext = {
 	      user_query: query,
@@ -3954,7 +3966,7 @@ export async function POST(req: Request) {
           ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
           : process.env.OPENAI_MODEL ?? "gpt-4o"),
 	      answer,
-	      llm_error,
+	      ...(includeLlmError ? { llm_error } : {}),
 	      intent: "product",
 	      current_state: productState,
 	      next_actions: buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true }),
@@ -4094,7 +4106,7 @@ export async function POST(req: Request) {
     mappedCandidates.every((c) => (c.kb_profile?.citations?.length ?? 0) === 0);
   const external_verification = await maybeGetExternalVerification({ query, enabled: wantsExternalVerification });
 
-  const productState: AuroraState = dupeIntent || priceSensitive ? "S_COMPARING" : "S_ROUTINE_CHECK";
+  const productState: AuroraState = routineIntent ? "S_ROUTINE_CHECK" : "S_COMPARING";
 
   const productContextData = {
     user_query: query,
@@ -4224,7 +4236,7 @@ export async function POST(req: Request) {
         ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
         : process.env.OPENAI_MODEL ?? "gpt-4o"),
     answer,
-    llm_error,
+    ...(includeLlmError ? { llm_error } : {}),
     intent: "product",
     current_state: productState,
     next_actions: buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true }),
@@ -4235,7 +4247,7 @@ export async function POST(req: Request) {
         id: anchor.id,
         brand: anchor.brand,
         name: anchor.name,
-        price_usd: coerceNumber(anchor.priceUsd),
+        price_usd: normalizeUsdPrice(anchor.priceUsd),
         availability: Array.isArray((anchor as any).regionAvailability) ? ((anchor as any).regionAvailability as string[]) : [],
         vetoed: anchorVetoed || anchorScore.vetoed,
         score: anchorScore,
