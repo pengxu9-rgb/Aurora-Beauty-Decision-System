@@ -2875,14 +2875,18 @@ function isBadRoutineCheckAnswer(answer: string, opts?: { activeLike?: boolean }
 
   const hasPlacement =
     /(放在|放到|位置|顺序|先后|在.*之后|在.*之前|after|before|fit into|add to)/i.test(trimmed);
+  // Require actionable frequency signals (not just the word "频率"/"frequency").
   const hasFrequency =
-    /(频率|每周|次\/周|隔天|每天|nights\/week|how often|frequency|start\s+\d|先从|1-2|2-3|两到三|一到二)/i.test(trimmed);
+    /(每周|次\/周|隔天|每(晚|天)|一周|nights\/week|times per week|every other|every night|nightly|twice a day|morning and night|start\s+\d|先从|1-2|2-3|两到三|一到二)/i.test(
+      trimmed,
+    );
   const hasExplicitConflictGuidance =
     /((不要|避免|别|don’t|don't|do not|avoid).{0,24}(叠加|一起用|同用|同晚|mix|combine|with))/i.test(trimmed);
 
   // In routine-check mode, we need *some* actionable placement/frequency/conflict guidance.
   // Asking for the user's current routine is allowed, but not sufficient on its own.
-  if (!hasPlacement && !hasFrequency && !hasExplicitConflictGuidance) return true;
+  const actionableCount = Number(hasPlacement) + Number(hasFrequency) + Number(hasExplicitConflictGuidance);
+  if (actionableCount < 2) return true;
 
   // Safety-first: if the product contains strong actives (acids/retinoids/pure L-AA),
   // do not allow "every night / twice daily" recommendations.
