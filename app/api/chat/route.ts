@@ -2931,15 +2931,30 @@ function isBadRoutineCheckAnswer(answer: string, opts?: { activeLike?: boolean }
   // Avoid dead-end "pick a direction" loops.
   if (/(我可以继续|需要你先选|pick what you want next|I can continue, but)/i.test(trimmed)) return true;
 
+  // Require explicit placement guidance (not just words like “顺序/位置”).
+  // Examples:
+  // - "洁面后 / 面霜前"
+  // - "after cleansing / before moisturizer"
+  // - "Cleanser → Treatment → Moisturizer"
   const hasPlacement =
-    /(放在|放到|位置|顺序|先后|在.*之后|在.*之前|after|before|fit into|add to)/i.test(trimmed);
+    /((洁面|洗脸|清洁).{0,12}(后|之后)|爽肤水.{0,8}(后|之后)|化妆水.{0,8}(后|之后)|精华.{0,8}(后|之后)|(面霜|乳液|防晒).{0,8}(前|之前)|在.{0,20}(洁面|洗脸|清洁|爽肤水|化妆水|精华|面霜|乳液|防晒).{0,20}(后|之后|前|之前)|先.{0,24}再.{0,24})/i.test(
+      trimmed,
+    ) ||
+    /(\b(after|before)\b.{0,24}\b(cleanser|wash|toner|serum|moisturizer|sunscreen)\b|\b(use|apply|layer)\b.{0,24}\b(after|before)\b)/i.test(
+      trimmed,
+    ) ||
+    /((cleanser|wash|toner|serum|moisturizer|sunscreen|洁面|洗脸|清洁|爽肤水|化妆水|精华|面霜|乳液|防晒).{0,24}(→|->|＞|>))/i.test(trimmed);
   // Require actionable frequency signals (not just the word "频率"/"frequency").
   const hasFrequency =
-    /(每周|次\/周|隔天|每(晚|天)|一周|nights\/week|times per week|every other|every night|nightly|twice a day|morning and night|start\s+\d|先从|1-2|2-3|两到三|一到二)/i.test(
+    /((频率|frequency|建议|推荐|不建议|可以|start|先从).{0,24}(每周|次\/周|隔天|每(晚|天)|一周|nights\/week|times per week|every other|every night|nightly|twice a day|morning and night)|(\b\d+\s*(?:-|–|~)\s*\d+\s*(?:nights|times|次|晚)\b|1-2|2-3|两到三|一到二))/i.test(
       trimmed,
     );
+  // Require specific conflict guidance (not just “避免叠加成分”).
   const hasExplicitConflictGuidance =
-    /((不要|避免|别|don’t|don't|do not|avoid).{0,24}(叠加|一起用|同用|同晚|mix|combine|with))/i.test(trimmed);
+    (/(无明显冲突|没有明显冲突|generally compatible|no major conflicts)/i.test(trimmed) && !opts?.activeLike) ||
+    /((不要|避免|别|don’t|don't|do not|avoid).{0,48}(AHA|BHA|PHA|酸|果酸|水杨酸|维A|视黄|A醇|A醛|阿达帕林|retinol|retinoid|retinal|adapalene|维C|vitamin\s*c|l-ascorbic|ascorbic|蓝铜肽|铜肽|copper|过氧化苯甲酰|benzoyl|BPO))/i.test(
+      trimmed,
+    );
 
   // In routine-check mode, we need *some* actionable placement/frequency/conflict guidance.
   // Asking for the user's current routine is allowed, but not sufficient on its own.
@@ -3225,6 +3240,7 @@ function buildFallbackRoutineCheckAnswer(input: {
   anchor: {
     brand: string;
     name: string;
+    category?: string | null;
     kb_profile: Pick<KbProfile, "keyActives" | "pairingRules" | "citations">;
     expert_knowledge: any;
   };
@@ -3232,7 +3248,7 @@ function buildFallbackRoutineCheckAnswer(input: {
   const lang = input.language ?? detectUserLanguage(input.query);
   const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
   const cite = input.anchor.kb_profile.citations?.[0] ? ` ${input.anchor.kb_profile.citations[0]}` : "";
-  const how = buildHowToUseV1({ category: null, kb_profile: input.anchor.kb_profile as any, lang }) ?? {};
+  const how = buildHowToUseV1({ category: input.anchor.category ?? null, kb_profile: input.anchor.kb_profile as any, lang }) ?? {};
   const avoid = Array.isArray(how.avoid_with) ? how.avoid_with : [];
   const activeLike = detectActiveLikeProductForRoutineCheck({
     kb_profile: { keyActives: input.anchor.kb_profile.keyActives ?? [], sensitivityFlags: [] },
@@ -3268,6 +3284,30 @@ function buildFallbackRoutineCheckAnswer(input: {
       ? ek.key_actives.trim()
       : null;
 
+  const cat = (input.anchor.category ?? "").toLowerCase();
+  const isCleanser = /cleanser|cleanse/.test(cat);
+  const isSunscreen = /sunscreen|spf/.test(cat);
+  const isMoisturizer = /moisturizer|moisturiser|cream|lotion/.test(cat);
+  const isToner = /toner|essence/.test(cat);
+
+  const defaultPlacement = (() => {
+    if (how.placement) return how.placement;
+    if (isSunscreen) return t("AM as the last step (reapply if outdoors).", "建议放在早上最后一步（外出需补涂）。");
+    if (isCleanser) return t("AM/PM as the first step.", "建议早晚洁面作为第一步。");
+    if (isMoisturizer) return t("After serums, before sunscreen (AM) / last step (PM).", "建议在精华后；早上在防晒前，晚上作为收尾面霜。");
+    if (isToner) return t("After cleansing, before serums/moisturizer.", "建议放在洁面后、精华/面霜前。");
+    return t("After cleansing, before moisturizer.", "建议放在洁面后、面霜前。");
+  })();
+
+  const defaultFrequency = (() => {
+    if (how.frequency) return how.frequency;
+    if (isSunscreen) return t("Every morning; reapply if outdoors.", "每天早上用；外出需补涂。");
+    if (isCleanser) return t("AM/PM daily.", "早晚每天都可以用。");
+    // Non‑active leave‑on products (hydration/barrier) are generally safe daily.
+    if (!activeLike) return t("AM/PM daily (reduce if stinging).", "早晚每天都可以用（若刺痛/泛红就降频）。");
+    return t("Start 2–3 nights/week, then increase as tolerated.", "先从每周 2–3 晚开始，耐受后再加频。");
+  })();
+
   const lines: string[] = [];
   lines.push(t("✅ Routine integration for:", "✅ 流程整合："));
   lines.push(`- ${input.anchor.brand} ${input.anchor.name}${cite}`);
@@ -3285,9 +3325,8 @@ function buildFallbackRoutineCheckAnswer(input: {
 
   lines.push("");
   lines.push(t("📍 Placement & frequency (safe default):", "📍 放置与频率（安全默认）："));
-  if (how.placement) lines.push(`- ${t("Placement", "位置")}: ${how.placement}`);
-  if (how.frequency) lines.push(`- ${t("Frequency", "频率")}: ${how.frequency}`);
-  if (!how.frequency) lines.push(t("- Frequency: start 2–3 nights/week, then increase as tolerated.", "- 频率：先从每周 2–3 晚开始，耐受后再加频。"));
+  lines.push(`- ${t("Placement", "位置")}: ${defaultPlacement}`);
+  lines.push(`- ${t("Frequency", "频率")}: ${defaultFrequency}`);
   if (activeLike && wantsAggressiveUse) {
     lines.push(
       t(
@@ -3301,9 +3340,12 @@ function buildFallbackRoutineCheckAnswer(input: {
   lines.push(t("⚠️ Avoid mixing / conflicts:", "⚠️ 避免叠加/冲突："));
   if (avoid.length) {
     for (const rule of avoid.slice(0, 6)) lines.push(`- ${localizeAvoidRule(rule)}`);
-  } else {
+  } else if (activeLike) {
     lines.push(t("- Do not stack multiple strong acids/retinoids in the same night.", "- 同一晚不要叠加强酸/高强度维A类。"));
     lines.push(t("- If you use copper peptides, separate from direct acids / pure L-ascorbic acid.", "- 如果你同时用蓝铜肽，尽量与直酸/纯左旋维C错开（AM/PM 或隔天）。"));
+  } else {
+    lines.push(t("- Generally compatible; no major conflicts with most routines.", "- 通常兼容性很好：一般没有明显冲突，可与大多数流程搭配。"));
+    lines.push(t("- If you’re on strong acids/retinoids and you feel stinging, separate to different nights.", "- 如果你同时在用强酸/维A且出现刺痛，就把它们错开到不同晚用。"));
   }
 
   lines.push("");
@@ -5188,7 +5230,13 @@ export async function POST(req: Request) {
 	          regionLabel,
 	          language: userLang,
 	          detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
-	          anchor: { brand: anchor.brand, name: anchor.name, kb_profile: anchorKbProfile, expert_knowledge: anchorExpertKnowledge },
+	          anchor: {
+	            brand: anchor.brand,
+	            name: anchor.name,
+	            category: anchorSku.category,
+	            kb_profile: anchorKbProfile,
+	            expert_knowledge: anchorExpertKnowledge,
+	          },
 	        })
 	      : buildFallbackProductAnswer({
 	          query,
