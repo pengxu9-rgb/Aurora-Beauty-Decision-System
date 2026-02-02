@@ -308,6 +308,59 @@ function detectUserLanguage(text: string): UserLanguage {
   return /[\u4e00-\u9fff]/.test(text) ? "zh" : "en";
 }
 
+type CandidateTradeoffKind = "stickier" | "thicker" | "pilling" | "cheaper" | "similar";
+
+function formatCandidateTradeoffText(lang: UserLanguage, kind: CandidateTradeoffKind) {
+  const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
+  switch (kind) {
+    case "stickier":
+      return t("Texture is stickier.", "肤感更黏/更容易有黏腻感。");
+    case "thicker":
+      return t("Texture is thicker/richer.", "质地更厚重/更滋润。");
+    case "pilling":
+      return t("Higher pilling risk under layering.", "叠加时更容易搓泥。");
+    case "cheaper":
+      return t(
+        "Cheaper alternative (based on available price data).",
+        "更便宜（基于已知价格数据）。",
+      );
+    case "similar":
+    default:
+      return t("Similar alternative (price may vary).", "相似替代（价格可能不同）。");
+  }
+}
+
+function computeCandidateTradeoff(params: {
+  lang: UserLanguage;
+  experience: any;
+  wantsCheaperAlternatives: boolean;
+  anchorPriceUsd: number | null;
+  candidatePriceUsd: number | null;
+}) {
+  const ex = params.experience ?? {};
+  const texture = typeof ex.texture === "string" ? ex.texture : "";
+  const stickiness = typeof ex.stickiness === "number" ? ex.stickiness : 0;
+  const pillingRisk = typeof ex.pilling_risk === "number" ? ex.pilling_risk : 0;
+
+  const kind: CandidateTradeoffKind =
+    texture === "sticky" || stickiness > 0.6
+      ? "stickier"
+      : texture === "thick"
+        ? "thicker"
+        : pillingRisk > 0.6
+          ? "pilling"
+          : params.wantsCheaperAlternatives &&
+              params.anchorPriceUsd != null &&
+              params.anchorPriceUsd > 0 &&
+              params.candidatePriceUsd != null &&
+              params.candidatePriceUsd > 0 &&
+              params.candidatePriceUsd < params.anchorPriceUsd
+            ? "cheaper"
+            : "similar";
+
+  return formatCandidateTradeoffText(params.lang, kind);
+}
+
 function toAuroraLanguageTag(lang: UserLanguage): AuroraLanguageTag {
   return lang === "zh" ? "zh-CN" : "en-US";
 }
@@ -2930,21 +2983,58 @@ function isBadShortlistAnswer(answer: string) {
 function buildFallbackScienceAnswer(input: { query: string; regionLabel: string; external_verification: ExternalVerification | null }) {
   const lines: string[] = [];
   const hasCitations = Boolean(input.external_verification?.citations?.length);
+  const lang = detectUserLanguage(input.query);
+  const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
 
   if (!hasCitations) {
-    lines.push("Based on general dermatological consensus（基于一般皮肤科共识）：");
+    lines.push(t("Based on general dermatological consensus:", "基于一般皮肤科共识："));
   } else {
-    lines.push("基于目前可用的外部验证摘要：");
+    lines.push(t("Based on the currently available external verification summary:", "基于目前可用的外部验证摘要："));
   }
 
-  lines.push(`- 你问的是“多肽 XYZ 是否有效 / 是否有临床证据”。但“XYZ”并不是标准 INCI 名称，我无法确认你具体指哪一种多肽。`);
-  lines.push(`- 护肤品“多肽”整体证据强弱差异很大：一些多肽/复配在小样本、短周期的人体研究里可能看到“细纹/保湿/弹性”的轻度改善，但很多宣传来自体外/机理推断，不能等同于强临床证据。`);
-  lines.push(`- 如果你告诉我具体 INCI（例如 Copper Tripeptide-1 / Palmitoyl Tripeptide-1 / Acetyl Hexapeptide-8 等），我可以再基于 KB + 外部验证摘要给更精确的证据分级。`);
-  lines.push(`- 安全性上，多肽本身通常刺激性不高，但真实刺激更多来自配方中的酒精、香精/精油、防腐体系或与强酸/高浓度维A同用的叠加。`);
+  lines.push(
+    t(
+      `- You asked whether “Peptide XYZ” works and if there is clinical evidence. But “XYZ” is not a standard INCI name, so I can’t confirm which peptide you mean.`,
+      `- 你问的是“多肽 XYZ 是否有效 / 是否有临床证据”。但“XYZ”并不是标准 INCI 名称，我无法确认你具体指哪一种多肽。`,
+    ),
+  );
+  lines.push(
+    t(
+      `- Evidence for cosmetic peptides varies widely. Some peptides/blends show mild improvements (fine lines/hydration/elasticity) in small, short-term human studies, but many claims are extrapolated from in‑vitro or mechanistic reasoning and aren’t “strong clinical evidence”.`,
+      `- 护肤品“多肽”整体证据强弱差异很大：一些多肽/复配在小样本、短周期的人体研究里可能看到“细纹/保湿/弹性”的轻度改善，但很多宣传来自体外/机理推断，不能等同于强临床证据。`,
+    ),
+  );
+  lines.push(
+    t(
+      `- If you share the exact INCI (e.g., Copper Tripeptide‑1 / Palmitoyl Tripeptide‑1 / Acetyl Hexapeptide‑8), I can grade evidence more precisely using KB + external verification.`,
+      `- 如果你告诉我具体 INCI（例如 Copper Tripeptide-1 / Palmitoyl Tripeptide-1 / Acetyl Hexapeptide-8 等），我可以再基于 KB + 外部验证摘要给更精确的证据分级。`,
+    ),
+  );
+  lines.push(
+    t(
+      `- Safety: peptides themselves are often low‑irritant, but irritation more commonly comes from alcohol, fragrance/essential oils, preservatives, or stacking with strong acids/high‑strength retinoids.`,
+      `- 安全性上，多肽本身通常刺激性不高，但真实刺激更多来自配方中的酒精、香精/精油、防腐体系或与强酸/高浓度维A同用的叠加。`,
+    ),
+  );
   lines.push("");
-  lines.push("如果你愿意补充 2 个信息，我可以把答案从“共识级”提升为“可审计的证据级”：");
-  lines.push("1) 你说的“XYZ”具体是哪种多肽/哪个产品里的成分名？");
-  lines.push(`2) 你坐标 ${input.regionLabel}，主要想解决什么问题（闭口/暗沉/泛红/抗老）以及是否敏感/屏障受损？`);
+  lines.push(
+    t(
+      "If you share 2 pieces of info, I can upgrade this from a “consensus-level” answer to an auditable evidence-level answer:",
+      "如果你愿意补充 2 个信息，我可以把答案从“共识级”提升为“可审计的证据级”：",
+    ),
+  );
+  lines.push(
+    t(
+      "1) Which exact peptide/INCI is “XYZ”, or which product’s ingredient list?",
+      "1) 你说的“XYZ”具体是哪种多肽/哪个产品里的成分名？",
+    ),
+  );
+  lines.push(
+    t(
+      `2) You’re in ${input.regionLabel}. What’s your goal (comedones/dullness/redness/anti-aging) and are you sensitive or barrier-impaired?`,
+      `2) 你坐标 ${input.regionLabel}，主要想解决什么问题（闭口/暗沉/泛红/抗老）以及是否敏感/屏障受损？`,
+    ),
+  );
 
   return lines.join("\n");
 }
@@ -2967,37 +3057,50 @@ function buildFallbackShortlistAnswer(input: {
     sensitivity_flags?: string;
   }>;
 }) {
-  const priceLabel = (usd: number | null) => (usd != null && Number.isFinite(usd) && usd > 0 ? formatUsd(usd) : "价格未知");
+  const lang = detectUserLanguage(input.query);
+  const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
+  const priceLabel = (usd: number | null) =>
+    usd != null && Number.isFinite(usd) && usd > 0 ? formatUsd(usd) : t("Price unknown", "价格未知");
   const region = input.regionLabel?.trim() ? input.regionLabel.trim() : "Global";
 
   const lines: string[] = [];
-  lines.push(`我理解你的需求：${input.query.trim()}`);
-  lines.push(`- 推荐范围：优先 ${region} 可买（或 Global 通用）的产品。`);
-  if (input.activeMentions.length) lines.push(`- 关注活性/方向：${input.activeMentions.join(" / ")}。`);
-  if (input.desiredCategories.length) lines.push(`- 品类：${input.desiredCategories.join(" / ")}。`);
-  if (input.detected.barrier_impaired) lines.push("🚫 当前可能屏障受损（刺痛/泛红/爆皮）：会更严格避开刺激性强的方案。");
-  else if (input.detected.sensitive_skin) lines.push("⚠️ 你提到敏感：会优先选择更温和/低刺激的配方。");
+  lines.push(t(`I understand your request: ${input.query.trim()}`, `我理解你的需求：${input.query.trim()}`));
+  lines.push(t(`- Region: prioritize products available in ${region} (or Global).`, `- 推荐范围：优先 ${region} 可买（或 Global 通用）的产品。`));
+  if (input.activeMentions.length) lines.push(t(`- Focus actives: ${input.activeMentions.join(" / ")}.`, `- 关注活性/方向：${input.activeMentions.join(" / ")}。`));
+  if (input.desiredCategories.length) lines.push(t(`- Categories: ${input.desiredCategories.join(" / ")}.`, `- 品类：${input.desiredCategories.join(" / ")}。`));
+  if (input.detected.barrier_impaired) lines.push(t("🚫 Possible barrier impairment: avoid high-irritation options.", "🚫 当前可能屏障受损（刺痛/泛红/爆皮）：会更严格避开刺激性强的方案。"));
+  else if (input.detected.sensitive_skin) lines.push(t("⚠️ Sensitive skin mentioned: prefer gentler, low-irritant formulas.", "⚠️ 你提到敏感：会优先选择更温和/低刺激的配方。"));
 
   if (!input.candidates.length) {
     lines.push("");
-    lines.push("目前数据库里没有检索到足够的候选。你可以补充：你更偏油皮/干皮？是否在用酸/A醇？预算区间？我可以再筛一次。");
+    lines.push(
+      t(
+        "Not enough candidates found in the database. Share: skin type, whether you use acids/retinoids, and budget range — I can rerank.",
+        "目前数据库里没有检索到足够的候选。你可以补充：你更偏油皮/干皮？是否在用酸/A醇？预算区间？我可以再筛一次。",
+      ),
+    );
     return lines.join("\n").trim();
   }
 
   lines.push("");
-  lines.push("候选清单（按 Aurora 评分/适配排序）：");
+  lines.push(t("Shortlist (ranked by Aurora score/fit):", "候选清单（按 Aurora 评分/适配排序）："));
   for (const [idx, c] of input.candidates.slice(0, 5).entries()) {
     const cite = c.citations?.[0] ? ` ${c.citations[0]}` : "";
     const verdict = c.score.vetoed ? `❌ VETO（${c.score.veto_reason ?? "风险过高"}）` : `✅ Total ${Math.round(c.score.total)}/100`;
     lines.push(`${idx + 1}) ${c.brand} ${c.name}（${priceLabel(c.price_usd)}） ${verdict}${cite}`);
-    if (c.key_actives && c.key_actives.trim()) lines.push(`   - Key actives: ${c.key_actives.trim()}`);
-    if (c.sensitivity_flags && c.sensitivity_flags.trim()) lines.push(`   - Sensitivity: ${c.sensitivity_flags.trim()}`);
+    if (c.key_actives && c.key_actives.trim()) lines.push(`   - ${t("Key actives", "关键活性")}: ${c.key_actives.trim()}`);
+    if (c.sensitivity_flags && c.sensitivity_flags.trim()) lines.push(`   - ${t("Sensitivity", "敏感提示")}: ${c.sensitivity_flags.trim()}`);
     const avail = Array.isArray(c.availability) && c.availability.length ? c.availability.join(",") : "";
-    if (avail) lines.push(`   - Availability: ${avail}`);
+    if (avail) lines.push(`   - ${t("Availability", "可买区域")}: ${avail}`);
   }
 
   lines.push("");
-  lines.push("如果你愿意，我可以在你确认「肤质/是否敏感/预算」后，把清单压缩到 1-2 个最稳的选择。");
+  lines.push(
+    t(
+      "If you confirm your skin type / sensitivity / budget, I can compress this to the safest 1–2 picks.",
+      "如果你愿意，我可以在你确认「肤质/是否敏感/预算」后，把清单压缩到 1-2 个最稳的选择。",
+    ),
+  );
   return lines.join("\n").trim();
 }
 
@@ -3024,17 +3127,23 @@ function buildFallbackProductAnswer(input: {
   }>;
 }) {
   const { anchor, candidates, detected } = input;
-  const priceLabel = (usd: number | null) => (usd != null && Number.isFinite(usd) && usd > 0 ? formatUsd(usd) : "价格未知");
+  const lang = detectUserLanguage(input.query);
+  const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
+  const priceLabel = (usd: number | null) =>
+    usd != null && Number.isFinite(usd) && usd > 0 ? formatUsd(usd) : t("Price unknown", "价格未知");
 
   const header =
     detected.barrier_impaired && anchor.vetoed
-      ? "🚫 严重警告 (WARNING)：当前屏障受损，不推荐这款产品。"
-      : `针对「${anchor.brand} ${anchor.name}」的分析与平替建议如下：`;
+      ? t("🚫 WARNING: barrier impaired — not recommended.", "🚫 严重警告：当前屏障受损，不推荐这款产品。")
+      : t(`Analysis + alternatives for: ${anchor.brand} ${anchor.name}`, `针对「${anchor.brand} ${anchor.name}」的分析与平替建议如下：`);
 
   const scoreLine = anchor.score
-    ? `Aurora 评分：Total ${Math.round(anchor.score.total)}/100（Science ${Math.round(anchor.score.science)}, Social ${Math.round(anchor.score.social)}, Eng ${Math.round(anchor.score.engineering)}）${
-        anchor.score.vetoed ? `；${anchor.score.veto_reason ?? "VETO"}` : ""
-      }`
+    ? t(
+        `Aurora score: Total ${Math.round(anchor.score.total)}/100 (Science ${Math.round(anchor.score.science)}, Social ${Math.round(anchor.score.social)}, Eng ${Math.round(anchor.score.engineering)})${anchor.score.vetoed ? `; ${anchor.score.veto_reason ?? "VETO"}` : ""}`,
+        `Aurora 评分：Total ${Math.round(anchor.score.total)}/100（Science ${Math.round(anchor.score.science)}, Social ${Math.round(anchor.score.social)}, Eng ${Math.round(anchor.score.engineering)}）${
+          anchor.score.vetoed ? `；${anchor.score.veto_reason ?? "VETO"}` : ""
+        }`,
+      )
     : null;
 
   const top = candidates.slice(0, 3);
@@ -3042,15 +3151,19 @@ function buildFallbackProductAnswer(input: {
   const topPrice = top[0]?.price_usd ?? null;
   const priceGap =
     top[0] && anchorPrice != null && anchorPrice > 0 && topPrice != null && topPrice > 0
-      ? `价格对比：${anchor.brand} ${formatUsd(anchorPrice)} vs ${top[0].brand} ${formatUsd(topPrice)}（约 ${Math.round(anchorPrice / Math.max(1, topPrice))}x 差异）。`
+      ? t(
+          `Price: ${anchor.brand} ${formatUsd(anchorPrice)} vs ${top[0].brand} ${formatUsd(topPrice)} (~${Math.round(anchorPrice / Math.max(1, topPrice))}x).`,
+          `价格对比：${anchor.brand} ${formatUsd(anchorPrice)} vs ${top[0].brand} ${formatUsd(topPrice)}（约 ${Math.round(anchorPrice / Math.max(1, topPrice))}x 差异）。`,
+        )
       : null;
 
   const lines: string[] = [];
   lines.push(header);
   const anchorCite = anchor.citations?.[0] ? ` ${anchor.citations[0]}` : "";
-  lines.push(`- Anchor：${anchor.brand} ${anchor.name}（${priceLabel(anchor.price_usd)}）${anchorCite}`);
+  lines.push(t(`- Anchor: ${anchor.brand} ${anchor.name} (${priceLabel(anchor.price_usd)})${anchorCite}`, `- Anchor：${anchor.brand} ${anchor.name}（${priceLabel(anchor.price_usd)}）${anchorCite}`));
   if (scoreLine) lines.push(`- ${scoreLine}`);
-  if (anchor.ingredients?.highlights?.length) lines.push(`- 关键成分/结构：${anchor.ingredients.highlights.join("；")}`);
+  if (anchor.ingredients?.highlights?.length)
+    lines.push(t(`- Key structure: ${anchor.ingredients.highlights.join("; ")}`, `- 关键成分/结构：${anchor.ingredients.highlights.join("；")}`));
   if (priceGap) lines.push(`- ${priceGap}`);
 
   if (top.length > 0) {
@@ -3058,28 +3171,47 @@ function buildFallbackProductAnswer(input: {
     const hasPriceSignal =
       (anchor.price_usd != null && anchor.price_usd > 0 && top.some((c) => c.price_usd != null && c.price_usd > 0)) ||
       Boolean(priceGap);
-    lines.push(hasPriceSignal ? "推荐平替（按相似度/性价比）："
-                              : "推荐替代（按相似度；价格可能不同）：");
+    lines.push(
+      hasPriceSignal
+        ? t("Alternatives (ranked by similarity/value):", "推荐平替（按相似度/性价比）：")
+        : t("Alternatives (ranked by similarity; price may differ):", "推荐替代（按相似度；价格可能不同）："),
+    );
     for (const [idx, c] of top.entries()) {
       const cLines: string[] = [];
       const cite = c.citations?.[0] ? ` ${c.citations[0]}` : "";
-      cLines.push(`${idx + 1}) ${c.brand} ${c.name}（${priceLabel(c.price_usd)}，相似度≈${c.similarity.toFixed(2)}）`);
-      cLines.push(`   - Trade-off：${c.tradeoff}`);
-      if (c.ingredients?.highlights?.length) cLines.push(`   - 成分/结构要点：${c.ingredients.highlights.join("；")}`);
-      if (cite) cLines.push(`   - Evidence: ${cite}`);
+      cLines.push(
+        t(
+          `${idx + 1}) ${c.brand} ${c.name} (${priceLabel(c.price_usd)}, similarity≈${Math.round(c.similarity * 100)}/100)`,
+          `${idx + 1}) ${c.brand} ${c.name}（${priceLabel(c.price_usd)}，相似度≈${Math.round(c.similarity * 100)}/100）`,
+        ),
+      );
+      cLines.push(`   - ${t("Trade-off", "取舍")}：${c.tradeoff}`);
+      if (c.ingredients?.highlights?.length)
+        cLines.push(t(`   - Key structure: ${c.ingredients.highlights.join("; ")}`, `   - 成分/结构要点：${c.ingredients.highlights.join("；")}`));
+      if (cite) cLines.push(`   - ${t("Evidence", "证据")}: ${cite}`);
 
       // Honesty: if anchor has algae and candidate doesn't, call out.
       const anchorHasAlgae = anchor.ingredients?.highlights?.some((h) => h.toLowerCase().includes("algae")) ?? false;
       const candHasAlgae = c.ingredients?.highlights?.some((h) => h.toLowerCase().includes("algae")) ?? false;
       if (anchorHasAlgae && !candHasAlgae) {
-        cLines.push("   - 诚实提醒：平替更偏基础封闭保湿，缺少/更少海藻类提取物等品牌“核心修护”卖点。");
+        cLines.push(
+          t(
+            "   - Honest note: the alternative is more basic occlusive/hydration-focused, with less of the brand’s signature extracts (e.g., algae).",
+            "   - 诚实提醒：平替更偏基础封闭保湿，缺少/更少海藻类提取物等品牌“核心修护”卖点。",
+          ),
+        );
       }
 
       lines.push(cLines.join("\n"));
     }
   } else {
     lines.push("");
-    lines.push("目前没有检索到足够的平替候选（可能是数据库样本还不够多）。");
+    lines.push(
+      t(
+        "Not enough alternative candidates were retrieved (the DB may still be sparse).",
+        "目前没有检索到足够的平替候选（可能是数据库样本还不够多）。",
+      ),
+    );
   }
 
   return lines.join("\n").trim();
@@ -4944,21 +5076,13 @@ export async function POST(req: Request) {
       price_usd: candidatePriceUsd,
       availability: c.availability,
       similarity: c.similarity,
-      tradeoff: (() => {
-        const ex = c.sku.experience;
-        if (ex.texture === "sticky" || (ex.stickiness ?? 0) > 0.6) return "Texture is stickier.";
-        if (ex.texture === "thick") return "Texture is thicker/richer.";
-        if ((ex.pilling_risk ?? 0) > 0.6) return "Higher pilling risk under layering.";
-        if (
-          wantsCheaperAlternatives &&
-          anchorPriceUsdForFiltering != null &&
-          candidatePriceUsd != null &&
-          candidatePriceUsd < anchorPriceUsdForFiltering
-        ) {
-          return "Cheaper alternative (based on available price data).";
-        }
-        return "Similar alternative (price may vary).";
-      })(),
+      tradeoff: computeCandidateTradeoff({
+        lang: userLang,
+        experience: c.sku.experience,
+        wantsCheaperAlternatives,
+        anchorPriceUsd: anchorPriceUsdForFiltering,
+        candidatePriceUsd,
+      }),
       ingredients: ingCtx,
       expert_knowledge: buildExpertKnowledgeFromKb(kbByProductId.get(c.product_id) ?? []),
       kb_profile: buildKbProfile({
@@ -5013,20 +5137,13 @@ export async function POST(req: Request) {
       const ing = ingredientByProductId.get(c.product_id);
       const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives);
       const skuLlm = sanitizeSkuForLlm(c.sku);
-      const ex = c.sku.experience;
-      const tradeoff =
-        ex.texture === "sticky" || (ex.stickiness ?? 0) > 0.6
-          ? "Texture is stickier."
-          : ex.texture === "thick"
-            ? "Texture is thicker/richer."
-            : (ex.pilling_risk ?? 0) > 0.6
-              ? "Higher pilling risk under layering."
-              : wantsCheaperAlternatives &&
-                  anchorSkuForLlm.price_usd != null &&
-                  skuLlm.price_usd != null &&
-                  skuLlm.price_usd < anchorSkuForLlm.price_usd
-                ? "Cheaper alternative (based on available price data)."
-                : "Similar alternative (price may vary).";
+      const tradeoff = computeCandidateTradeoff({
+        lang: userLang,
+        experience: c.sku.experience,
+        wantsCheaperAlternatives,
+        anchorPriceUsd: anchorSkuForLlm.price_usd,
+        candidatePriceUsd: skuLlm.price_usd,
+      });
 
       return {
         id: c.product_id,
