@@ -1900,7 +1900,11 @@ function buildExpertNotesV1(input: { expert_knowledge: any; kb_citations: string
 function buildHowToUseV1(input: { category: string | null | undefined; kb_profile: Pick<KbProfile, "keyActives" | "pairingRules">; lang: UserLanguage }): AuroraHowToUseV1 | null {
   const t = (en: string, zh: string) => (input.lang === "zh" ? zh : en);
   const keyActives = Array.isArray(input.kb_profile.keyActives) ? input.kb_profile.keyActives.join(" | ") : "";
-  const isAcid = /(aha|bha|pha|acid|glycolic|salicylic|mandelic|lactic|水杨|果酸|酸)/i.test(keyActives);
+  // NOTE: do NOT match the generic word "acid" because it would incorrectly classify
+  // non-exfoliating acids (e.g. Hyaluronic Acid / Tranexamic Acid) as exfoliating acids.
+  const isAcid =
+    /(aha|bha|pha|glycolic|salicylic|mandelic|lactic|gluconolactone|lactobionic|water\s*exfoliant)/i.test(keyActives) ||
+    /(水杨|果酸|杏仁酸|乳酸|葡萄糖酸内酯|乳糖酸)/.test(keyActives);
   const isRetinoid = /(retinol|retinal|adapalene|维a|a醇|a醛)/i.test(keyActives);
 
   const avoid_with: string[] = [];
