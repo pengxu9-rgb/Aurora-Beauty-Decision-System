@@ -6,8 +6,11 @@ import { Prisma } from "@prisma/client";
 import type { SkinLog, UserProfile } from "@prisma/client";
 
 import { getSkuById, getSkuDatabase, resolveProductIdForSkuId } from "@/app/v1/decision/_lib";
+import { buildScienceFallbackAnswerV1 } from "@/lib/aurora/science-fallback";
 import { calculateScore } from "@/lib/engine";
 import { calculateStressScore } from "@/lib/env-stress";
+import { ingredientSearchV1 } from "@/lib/ingredient-search";
+import type { IngredientSearchOutputV1 } from "@/lib/ingredient-search-core";
 import { buildKbProfile, type KbProfile, type KbSnippet, inferKbCanonicalKey } from "@/lib/kb-profile";
 import { prisma } from "@/lib/server/prisma";
 import { findSimilarSkus, findSimilarSkusByAnchorProductId, type RegionPreference } from "@/lib/vector-service";
@@ -137,6 +140,7 @@ type AuroraStructuredResultV1 = {
   parse?: AuroraParseResultV1;
   analyze?: AuroraAnalyzeResultV1;
   alternatives?: AuroraAlternativeV1[];
+  ingredient_search?: IngredientSearchOutputV1;
   kb_requirements_check?: {
     missing_fields: string[];
     notes?: string[];
@@ -1227,6 +1231,34 @@ function extractActiveMentions(query: string): string[] {
   if (has("gluconolactone") || has("pha") || hasCn("pha") || hasCn("葡糖酸内酯")) out.add("PHA");
 
   return Array.from(out);
+}
+
+function pickIngredientSearchQueryFromActiveMentions(activeMentions: string[]): string | null {
+  const map: Record<string, string> = {
+    Peptides: "peptide",
+    Niacinamide: "niacinamide",
+    "Tranexamic Acid": "tranexamic",
+    Arbutin: "arbutin",
+    "Kojic Acid": "kojic",
+    "Azelaic Acid": "azelaic",
+    "Vitamin C": "ascorbic",
+    Retinoid: "retinol",
+    "BHA (Salicylic Acid)": "salicylic",
+    AHA: "glycolic",
+    "Mandelic Acid": "mandelic",
+    PHA: "gluconolactone",
+  };
+
+  for (const m of activeMentions) {
+    const normalized = String(m ?? "").trim();
+    if (!normalized) continue;
+    const mapped = map[normalized];
+    if (mapped) return mapped;
+    // Fallback: use the mention itself if it's likely to be a usable token (ASCII-ish).
+    if (/^[a-z0-9 .%+-]+$/i.test(normalized)) return normalized;
+  }
+
+  return null;
 }
 
 function inferDesiredCategories(query: string): Array<SkuVector["category"]> {
@@ -3000,65 +3032,6 @@ function isBadShortlistAnswer(answer: string) {
   return false;
 }
 
-function buildFallbackScienceAnswer(input: { query: string; regionLabel: string; external_verification: ExternalVerification | null }) {
-  const lines: string[] = [];
-  const hasCitations = Boolean(input.external_verification?.citations?.length);
-  const lang = detectUserLanguage(input.query);
-  const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
-
-  if (!hasCitations) {
-    lines.push(t("Based on general dermatological consensus:", "基于一般皮肤科共识："));
-  } else {
-    lines.push(t("Based on the currently available external verification summary:", "基于目前可用的外部验证摘要："));
-  }
-
-  lines.push(
-    t(
-      `- You asked whether “Peptide XYZ” works and if there is clinical evidence. But “XYZ” is not a standard INCI name, so I can’t confirm which peptide you mean.`,
-      `- 你问的是“多肽 XYZ 是否有效 / 是否有临床证据”。但“XYZ”并不是标准 INCI 名称，我无法确认你具体指哪一种多肽。`,
-    ),
-  );
-  lines.push(
-    t(
-      `- Evidence for cosmetic peptides varies widely. Some peptides/blends show mild improvements (fine lines/hydration/elasticity) in small, short-term human studies, but many claims are extrapolated from in‑vitro or mechanistic reasoning and aren’t “strong clinical evidence”.`,
-      `- 护肤品“多肽”整体证据强弱差异很大：一些多肽/复配在小样本、短周期的人体研究里可能看到“细纹/保湿/弹性”的轻度改善，但很多宣传来自体外/机理推断，不能等同于强临床证据。`,
-    ),
-  );
-  lines.push(
-    t(
-      `- If you share the exact INCI (e.g., Copper Tripeptide‑1 / Palmitoyl Tripeptide‑1 / Acetyl Hexapeptide‑8), I can grade evidence more precisely using KB + external verification.`,
-      `- 如果你告诉我具体 INCI（例如 Copper Tripeptide-1 / Palmitoyl Tripeptide-1 / Acetyl Hexapeptide-8 等），我可以再基于 KB + 外部验证摘要给更精确的证据分级。`,
-    ),
-  );
-  lines.push(
-    t(
-      `- Safety: peptides themselves are often low‑irritant, but irritation more commonly comes from alcohol, fragrance/essential oils, preservatives, or stacking with strong acids/high‑strength retinoids.`,
-      `- 安全性上，多肽本身通常刺激性不高，但真实刺激更多来自配方中的酒精、香精/精油、防腐体系或与强酸/高浓度维A同用的叠加。`,
-    ),
-  );
-  lines.push("");
-  lines.push(
-    t(
-      "If you share 2 pieces of info, I can upgrade this from a “consensus-level” answer to an auditable evidence-level answer:",
-      "如果你愿意补充 2 个信息，我可以把答案从“共识级”提升为“可审计的证据级”：",
-    ),
-  );
-  lines.push(
-    t(
-      "1) Which exact peptide/INCI is “XYZ”, or which product’s ingredient list?",
-      "1) 你说的“XYZ”具体是哪种多肽/哪个产品里的成分名？",
-    ),
-  );
-  lines.push(
-    t(
-      `2) You’re in ${input.regionLabel}. What’s your goal (comedones/dullness/redness/anti-aging) and are you sensitive or barrier-impaired?`,
-      `2) 你坐标 ${input.regionLabel}，主要想解决什么问题（闭口/暗沉/泛红/抗老）以及是否敏感/屏障受损？`,
-    ),
-  );
-
-  return lines.join("\n");
-}
-
 function buildFallbackShortlistAnswer(input: {
   query: string;
   regionLabel: string;
@@ -4011,23 +3984,48 @@ export async function POST(req: Request) {
 
   if (wantsScienceOnly) {
     const external_verification = await maybeGetExternalVerification({ query, enabled: true });
+    const ingredientSearchQuery = pickIngredientSearchQueryFromActiveMentions(activeMentions);
+    let ingredient_search: IngredientSearchOutputV1 | null = null;
+    let ingredient_search_error: string | null = null;
+    if (ingredientSearchQuery) {
+      try {
+        ingredient_search = await ingredientSearchV1({
+          schema_version: "aurora.ingredient_search.v1",
+          query: ingredientSearchQuery,
+          region: detectedRegion,
+          limit: 8,
+          filters: { include_kb_snippets: true },
+        });
+      } catch (e) {
+        ingredient_search_error = e instanceof Error ? e.message : String(e);
+      }
+    }
 
     const scienceContextData = {
       user_query: query,
       region_preference: detectedRegion,
       env_stress: envStress,
+      active_mentions: activeMentions,
       detected: {
         sensitive_skin: detectSensitiveSkin(query),
         barrier_impaired: detectBarrierImpaired(query),
       },
       navigation: { current_state: "S_SCIENCE" satisfies AuroraState },
       ...(external_verification ? { external_verification } : {}),
+      ...(ingredient_search ? { ingredient_search } : {}),
+      ...(ingredient_search_error ? { ingredient_search_error } : {}),
       note: "Science-only question detected; no anchor product identified.",
     };
 
     const systemPrompt = buildSystemPrompt(JSON.stringify(scienceContextData), "product");
 
-    const fallbackAnswer = buildFallbackScienceAnswer({ query, regionLabel, external_verification });
+    const fallbackAnswer = buildScienceFallbackAnswerV1({
+      user_query: query,
+      regionLabel,
+      external_verification,
+      active_mentions: activeMentions,
+      ingredient_search,
+    });
 
     let answer = "";
     let llm_error: string | null = null;
@@ -4080,6 +4078,8 @@ export async function POST(req: Request) {
         context: {
           region_preference: detectedRegion,
           ...(external_verification ? { external_verification } : {}),
+          ...(ingredient_search ? { ingredient_search } : {}),
+          ...(ingredient_search_error ? { ingredient_search_error } : {}),
         },
         structured: {
           schema_version: "aurora.structured.v1",
@@ -4088,6 +4088,7 @@ export async function POST(req: Request) {
             parse_confidence: 0,
             normalized_query_language: languageTag,
           },
+          ...(ingredient_search ? { ingredient_search } : {}),
         } satisfies AuroraStructuredResultV1,
       }),
     );
@@ -4191,6 +4192,23 @@ export async function POST(req: Request) {
 
     const candidateIds = uniqueStrings(top.map((c) => c.product_id)).filter((id) => looksLikeUuid(id));
 
+    const ingredientSearchQuery = activeMentions.length ? pickIngredientSearchQueryFromActiveMentions(activeMentions) : null;
+    let ingredient_search: IngredientSearchOutputV1 | null = null;
+    let ingredient_search_error: string | null = null;
+    if (ingredientSearchQuery && candidateIds.length) {
+      try {
+        ingredient_search = await ingredientSearchV1({
+          schema_version: "aurora.ingredient_search.v1",
+          query: ingredientSearchQuery,
+          region: detectedRegion,
+          limit: 20,
+          filters: { product_ids: candidateIds, include_kb_snippets: true },
+        });
+      } catch (e) {
+        ingredient_search_error = e instanceof Error ? e.message : String(e);
+      }
+    }
+
     const ingredientRows = candidateIds.length
       ? await prisma.ingredientData.findMany({
           where: { productId: { in: candidateIds } },
@@ -4269,6 +4287,8 @@ export async function POST(req: Request) {
       user_profile_inferred: sanitizeUserForLlm(user),
       navigation: { current_state: shortlistState },
       ...(external_verification ? { external_verification } : {}),
+      ...(ingredient_search ? { ingredient_search } : {}),
+      ...(ingredient_search_error ? { ingredient_search_error } : {}),
       retrieval,
       shortlist_evidence_summary: evidenceSummary,
       candidates,
@@ -4402,6 +4422,7 @@ export async function POST(req: Request) {
             normalized_query_language: languageTag,
           },
           alternatives: structuredAlternatives,
+          ...(ingredient_search ? { ingredient_search } : {}),
         } satisfies AuroraStructuredResultV1,
       }),
     );
