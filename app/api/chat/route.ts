@@ -3791,6 +3791,16 @@ export async function POST(req: Request) {
     const routineHasAcids = routineActives.some((a) => ["aha", "bha", "pha", "acid"].includes(String(a).toLowerCase()));
     const routineHasBpo = routineActives.some((a) => String(a).toLowerCase().includes("benzoyl peroxide"));
 
+    const itineraryRaw =
+      (profile as any).itinerary ?? (profile as any).upcomingPlan ?? (profile as any).upcoming_plan ?? null;
+    const itineraryText =
+      typeof itineraryRaw === "string"
+        ? itineraryRaw.trim()
+        : itineraryRaw && typeof itineraryRaw === "object"
+          ? JSON.stringify(itineraryRaw)
+          : "";
+    const hasItinerary = Boolean(itineraryText);
+
     const pushGoal = (out: UserGoal[], track: MechanismKey, priority: number) => {
       if (out.some((g) => g.track === track)) return;
       out.push({ track, priority });
@@ -4154,6 +4164,11 @@ export async function POST(req: Request) {
           reasons.push(analysisSummaryLine);
         }
 
+        if (idx === 0 && hasItinerary) {
+          const short = itineraryText.length > 120 ? `${itineraryText.slice(0, 120)}…` : itineraryText;
+          reasons.push(userLang === "zh" ? `行程/环境：${short}` : `Upcoming plan: ${short}`);
+        }
+
         if (budgetTier) {
           if (priceUsd != null && budgetTierCny != null) {
             const estCny = Math.round(priceUsd * USD_TO_CNY);
@@ -4197,7 +4212,7 @@ export async function POST(req: Request) {
     const missing_info: string[] = [];
     const warnings: string[] = [];
     if (!recentLogs.length) warnings.push("recent_logs_missing");
-    warnings.push("itinerary_unknown");
+    if (!hasItinerary) warnings.push("itinerary_unknown");
     if (!analysisSummary) warnings.push("analysis_missing");
     if (recommendations.length < 5) warnings.push("insufficient_candidates");
 
