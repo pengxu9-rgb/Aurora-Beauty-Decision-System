@@ -150,6 +150,41 @@ type AuroraStructuredResultV1 = {
   };
 };
 
+function inferRoutineActivesFromFreeText(text: string): string[] {
+  const raw = String(text || "");
+  const t = raw.toLowerCase();
+  const out: string[] = [];
+
+  const add = (v: string) => {
+    const key = v.toLowerCase();
+    if (out.some((x) => x.toLowerCase() === key)) return;
+    out.push(v);
+  };
+
+  // Retinoids (retinol/retinal/adapalene/etc.)
+  if (/(阿达帕林|adapalene)/i.test(raw)) add("adapalene");
+  if (/(维a|维甲酸|视黄|a醇|a醛|retinoid|retinol|retinal|retinaldehyde|tretinoin|tazarotene)/i.test(raw)) add("retinol");
+
+  // Exfoliating acids
+  if (/(aha|glycolic|lactic|mandelic|果酸|乙醇酸|甘醇酸|乳酸|杏仁酸)/i.test(raw)) add("AHA");
+  if (/(bha|salicylic|水杨酸)/i.test(raw)) add("BHA");
+  if (/(pha|gluconolactone|lactobionic|葡萄糖酸内酯|乳糖酸)/i.test(raw)) add("PHA");
+
+  // Benzoyl peroxide
+  if (/(benzoyl peroxide|bpo|过氧化苯甲酰)/i.test(raw)) add("benzoyl peroxide");
+
+  // Vitamin C
+  if (/(vitamin\s*c|l-ascorbic|ascorbic|ascorbate|抗坏血酸|维c|左旋维c)/i.test(raw)) add("vitamin c");
+
+  // Copper peptides
+  if (/(copper peptide|copper peptides|ghk-cu|蓝铜肽|铜肽)/i.test(raw)) add("copper peptides");
+
+  // If user says "酸" but doesn't specify which kind, keep it conservative.
+  if (!out.includes("AHA") && !out.includes("BHA") && !out.includes("PHA") && /(^|[^a-z])酸([^a-z]|$)/i.test(t)) add("acid");
+
+  return out;
+}
+
 const USD_TO_CNY = 7.2;
 const BUDGET_TIER_THRESHOLD_MULTIPLIER = 1.2;
 
@@ -5895,12 +5930,37 @@ export async function POST(req: Request) {
 
   const productState: AuroraState = routineIntent || routineIntegrationIntent ? "S_ROUTINE_CHECK" : "S_COMPARING";
 
+  const conflict_detector =
+    productState === "S_ROUTINE_CHECK"
+      ? simulateConflictsV1(
+          {
+            schema_version: "aurora.conflicts.v1",
+            routine: {
+              pm: [
+                {
+                  name: "user_routine",
+                  key_actives: inferRoutineActivesFromFreeText(profileText),
+                },
+              ],
+            },
+            test_product: {
+              name: `${anchor.brand} ${anchor.name}`.trim(),
+              ingredients: anchorIngredientCtx,
+              evidence_pack: { keyActives: Array.isArray(anchorKbProfile.keyActives) ? anchorKbProfile.keyActives : [] },
+              key_actives: Array.isArray(anchorKbProfile.keyActives) ? anchorKbProfile.keyActives : [],
+            },
+          },
+          { lang: languageTag },
+        )
+      : null;
+
   const productContextData = {
     user_query: query,
     region_preference: detectedRegion,
     env_stress: envStress,
     detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
     user_profile_inferred: sanitizeUserForLlm(user),
+    ...(conflict_detector ? { conflict_detector } : {}),
     navigation: { current_state: productState },
     ...(external_verification ? { external_verification } : {}),
     anchor: {
@@ -6132,6 +6192,7 @@ export async function POST(req: Request) {
       how_to_use: buildHowToUseV1({ category: anchorSku.category, kb_profile: anchorKbProfile, lang: userLang }),
     },
     alternatives: structuredAlternatives,
+    ...(conflict_detector ? { conflicts: conflict_detector } : {}),
     kb_requirements_check: buildKbRequirementsCheck({
       has_vectors: true,
       has_ingredients: Boolean(anchorIngredientCtx?.head?.length),
@@ -6160,6 +6221,7 @@ export async function POST(req: Request) {
       context: {
         detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired, region_preference: detectedRegion },
         ...(external_verification ? { external_verification } : {}),
+        ...(conflict_detector ? { conflict_detector } : {}),
         anchor: {
           id: anchor.id,
           brand: anchor.brand,
