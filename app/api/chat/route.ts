@@ -4719,7 +4719,9 @@ export async function POST(req: Request) {
     }
 
     const categoryFiltered = retrieved.filter((r) => desiredCategories.includes(r.sku.category));
-    const poolForScoring = categoryFiltered.length >= 4 ? categoryFiltered : retrieved;
+    // If the user explicitly asks for a specific active (activeMentions), keep category strict
+    // to avoid recommending the "wrong kind" (e.g., cleanser) when they asked for a serum.
+    const poolForScoring = activeMentions.length ? categoryFiltered : categoryFiltered.length >= 4 ? categoryFiltered : retrieved;
 
     let scored = poolForScoring
       .map((r) => ({ ...r, score: calculateScore(r.sku, user) }))

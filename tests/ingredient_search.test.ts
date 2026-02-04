@@ -87,3 +87,50 @@ test("ING-003: region filter excludes non-region products (consistent with vecto
   assert.equal(out.hits.some((h) => h.product_id === "p_us"), false);
   assert.equal(out.hits.some((h) => h.product_id === "p_cn"), true);
 });
+
+test("ING-004: EN query should match CN terms via synonyms (kb_snippets)", () => {
+  const out = searchIngredientDocsV1(
+    [
+      {
+        product_id: "p1",
+        display_name: "Brand CN Snippet",
+        region_availability: ["GLOBAL"],
+        ingredients_full_list: ["Water", "Glycerin"],
+        kb_snippets: ["成分亮点：烟酰胺 + 泛醇。"],
+      },
+    ],
+    {
+      schema_version: "aurora.ingredient_search.v1",
+      query: "niacinamide",
+      limit: 5,
+      filters: { include_kb_snippets: true },
+    },
+  );
+
+  assert.equal(out.hits.length, 1);
+  assert.equal(out.hits[0]?.product_id, "p1");
+  assert.ok(out.hits[0]?.match_source.includes("kb_snippets"));
+});
+
+test("ING-005: CN query should match EN terms via synonyms (ingredients_full_list)", () => {
+  const out = searchIngredientDocsV1(
+    [
+      {
+        product_id: "p1",
+        display_name: "Brand EN INCI",
+        region_availability: ["GLOBAL"],
+        ingredients_full_list: ["Water", "Niacinamide", "Zinc PCA"],
+      },
+    ],
+    {
+      schema_version: "aurora.ingredient_search.v1",
+      query: "烟酰胺",
+      limit: 5,
+      filters: { include_kb_snippets: false },
+    },
+  );
+
+  assert.equal(out.hits.length, 1);
+  assert.equal(out.hits[0]?.product_id, "p1");
+  assert.ok(out.hits[0]?.match_source.includes("ingredients"));
+});

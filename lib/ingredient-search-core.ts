@@ -63,11 +63,17 @@ function normalizeQuery(raw: string): { normalized: string; tokens: string[] } {
     .replace(/\s+/g, " ")
     .toLowerCase();
 
-  const tokens = normalized
+  // ASCII-ish tokens (common INCI / english queries).
+  const asciiTokens = normalized
     .split(/[^a-z0-9%+]+/g)
     .map((t) => t.trim())
     .filter((t) => t.length >= 2)
     .slice(0, 12);
+
+  // CJK tokens (common CN queries / KB snippets).
+  const cjkTokens = (normalized.match(/[\u4e00-\u9fff]{2,}/g) ?? []).slice(0, 8);
+
+  const tokens = [...asciiTokens, ...cjkTokens];
 
   // De-dup while preserving order.
   const seen = new Set<string>();
@@ -81,6 +87,14 @@ function normalizeQuery(raw: string): { normalized: string; tokens: string[] } {
   return { normalized, tokens: uniq };
 }
 
+function isUsableToken(tok: string): boolean {
+  const t = String(tok ?? "").trim();
+  if (!t) return false;
+  const hasCjk = /[\u4e00-\u9fff]/.test(t);
+  // EN tokens: avoid overly short noisy matches; CJK tokens: 2 chars are often meaningful.
+  return hasCjk ? t.length >= 2 : t.length >= 3;
+}
+
 function normalizeSynonyms(tokens: string[]): string[] {
   const out = new Set(tokens);
   // Minimal synonyms (safe, small). TODO(report): expand via a governed vocab.
@@ -88,6 +102,33 @@ function normalizeSynonyms(tokens: string[]): string[] {
   if (out.has("fragrance")) out.add("parfum");
   if (out.has("vitc")) out.add("vitamin");
   if (out.has("vitamin")) out.add("vitamin c");
+
+  // Cross-language ingredient synonyms (very small + high-signal only).
+  // Goal: enable EN query to match CN KB snippets and vice versa.
+  const synonymGroups: Array<readonly string[]> = [
+    ["niacinamide", "nicotinamide", "烟酰胺", "维生素b3", "维b3", "vb3"],
+    ["tranexamic", "tranexamic acid", "txa", "传明酸"],
+    ["panthenol", "vitamin b5", "vb5", "泛醇", "维生素b5"],
+    ["salicylic", "salicylic acid", "bha", "水杨酸"],
+    ["glycolic", "glycolic acid", "aha", "乙醇酸", "甘醇酸", "果酸", "α羟基酸"],
+    ["azelaic", "azelaic acid", "壬二酸"],
+    ["arbutin", "alpha arbutin", "熊果苷", "α熊果苷"],
+    ["kojic", "kojic acid", "曲酸"],
+    ["retinol", "a醇", "视黄醇"],
+    ["retinal", "a醛", "视黄醛"],
+    ["adapalene", "阿达帕林"],
+    ["tretinoin", "维a酸"],
+    ["hyaluronic", "hyaluronic acid", "sodium hyaluronate", "玻尿酸", "透明质酸", "透明质酸钠"],
+    ["vitamin c", "vc", "维c", "维生素c"],
+    ["ascorbic", "ascorbic acid", "抗坏血酸"],
+  ];
+
+  // Expand within groups (1-hop is enough because groups contain all members).
+  for (const group of synonymGroups) {
+    if (!group.some((g) => out.has(g))) continue;
+    for (const g of group) out.add(g);
+  }
+
   return Array.from(out);
 }
 
@@ -130,7 +171,7 @@ function matchTermsInList(list: string[], query: { normalized: string; tokens: s
     const t = term.toLowerCase();
 
     const phraseHit = normalizedQuery.length >= 2 && t.includes(normalizedQuery);
-    const tokenHit = tokens.some((tok) => tok.length >= 3 && t.includes(tok));
+    const tokenHit = tokens.some((tok) => isUsableToken(tok) && t.includes(tok));
 
     if (phraseHit || tokenHit) hits.push(term);
     if (hits.length >= 12) break;
@@ -155,7 +196,7 @@ function matchInTextBlobs(blobs: string[], query: { normalized: string; tokens: 
     const t = String(raw ?? "").toLowerCase();
     if (!t) continue;
     if (normalizedQuery && t.includes(normalizedQuery)) return true;
-    if (tokens.some((tok) => tok.length >= 3 && t.includes(tok))) return true;
+    if (tokens.some((tok) => isUsableToken(tok) && t.includes(tok))) return true;
   }
   return false;
 }
@@ -250,4 +291,3 @@ export function searchIngredientDocsV1(docs: IngredientSearchDocV1[], input: Ing
     missing_inputs: [],
   };
 }
-
