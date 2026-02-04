@@ -3232,7 +3232,10 @@ function isBadRoutineCheckAnswer(answer: string, opts?: { activeLike?: boolean }
   return false;
 }
 
-function isBadScienceAnswer(answer: string) {
+function isBadScienceAnswer(
+  answer: string,
+  opts?: { requireCitations?: boolean; citations?: ScientificCitation[] },
+) {
   const trimmed = answer.trim();
   if (trimmed.length < 80) return true;
   if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
@@ -3243,6 +3246,20 @@ function isBadScienceAnswer(answer: string) {
     trimmed.includes("📋 Recommended Routine") ||
     (trimmed.includes("🌞") && trimmed.includes("🌙"));
   if (looksLikeRoutineTemplate) return true;
+
+  if (opts?.requireCitations) {
+    const pmids = (opts.citations ?? [])
+      .map((c) => String(c?.note ?? "").match(/\bPMID:\s*(\d{5,10})\b/i)?.[1] ?? null)
+      .filter((x): x is string => Boolean(x));
+
+    const hasCitationMarker =
+      /\bPMID\b/i.test(trimmed) ||
+      /pubmed\.ncbi\.nlm\.nih\.gov/i.test(trimmed) ||
+      /(^|\n)\s*(citations|references|参考文献|引用)\b/i.test(trimmed) ||
+      pmids.some((id) => trimmed.includes(id));
+
+    if (!hasCitationMarker) return true;
+  }
 
   return false;
 }
@@ -4944,7 +4961,8 @@ export async function POST(req: Request) {
               ],
             });
 
-      if (isBadScienceAnswer(answer)) {
+      const requireCitations = Boolean(external_verification?.citations?.length);
+      if (isBadScienceAnswer(answer, { requireCitations, citations: external_verification?.citations ?? [] })) {
         llm_error = "LLM answer unsuitable for science-only; used fallback.";
         answer = fallbackAnswer;
       }
