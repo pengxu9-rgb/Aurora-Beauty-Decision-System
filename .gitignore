@@ -29,3 +29,6 @@ __pycache__/
 
 # Generated batch files (data exports)
 batch_final.json
+
+# Worker generated reports
+worker/reports/
