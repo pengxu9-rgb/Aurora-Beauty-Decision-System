@@ -71,6 +71,9 @@ export type EnvProviderResultV1 = {
   cache_status: EnvSnapshotV1["cache"]["status"] | "unavailable";
   snapshot: EnvSnapshotV1 | null;
   provider_error_code?: EnvProviderErrorCodeV1;
+  provider_http_status?: number | null;
+  provider_error_message?: string | null;
+  provider_error_issues?: string[] | null;
   missing_inputs: string[];
 };
 
@@ -141,6 +144,38 @@ function percentile(values: number[], p: number): number | null {
 
 function isoFromUnixSeconds(dt: number) {
   return new Date(dt * 1000).toISOString();
+}
+
+function pickNearestUnixSeconds(map: Map<number, unknown>, target: number, maxDeltaS: number): number | null {
+  if (!Number.isFinite(target)) return null;
+  if (!Number.isFinite(maxDeltaS) || maxDeltaS <= 0) return null;
+
+  let bestDt: number | null = null;
+  let bestAbs = Infinity;
+
+  for (const dt of map.keys()) {
+    if (!Number.isFinite(dt)) continue;
+    const abs = Math.abs(dt - target);
+    if (abs < bestAbs) {
+      bestAbs = abs;
+      bestDt = dt;
+      continue;
+    }
+
+    if (abs === bestAbs && bestDt != null) {
+      // Tie-breaker: prefer the past (<= target) over the future; otherwise prefer smaller dt for stability.
+      const dtIsPast = dt <= target;
+      const bestIsPast = bestDt <= target;
+      if (dtIsPast && !bestIsPast) {
+        bestDt = dt;
+      } else if (dtIsPast === bestIsPast && dt < bestDt) {
+        bestDt = dt;
+      }
+    }
+  }
+
+  if (bestDt == null) return null;
+  return bestAbs <= maxDeltaS ? bestDt : null;
 }
 
 export function scalePm25LogScore(pm2_5_ug_m3: number, threshold = 25, rangeAbove = 100): number {
@@ -268,8 +303,11 @@ async function fetchJson(fetchImpl: typeof fetch, url: string, init: NextFetchIn
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    const err = new Error(`HTTP ${res.status}: ${text}`);
+    const bodyPreview = text.slice(0, 500);
+    const err = new Error(`HTTP ${res.status}: ${bodyPreview}`);
     (err as any).code = "http_error";
+    (err as any).http_status = res.status;
+    (err as any).http_body_preview = bodyPreview;
     throw err;
   }
 
@@ -344,7 +382,9 @@ async function fetchOpenWeatherSnapshotV1(input: {
   }
 
   const currentDt = coerceNumber(oneCall.current.dt) ?? Math.floor(nowMs(input.now) / 1000);
-  const currentAir = airByDt.get(currentDt) ?? null;
+  const currentAirExact = airByDt.get(currentDt) ?? null;
+  const nearestAirDt = currentAirExact ? null : pickNearestUnixSeconds(airByDt, currentDt, 3600);
+  const currentAir = currentAirExact ?? (nearestAirDt != null ? airByDt.get(nearestAirDt) ?? null : null);
 
   const currentTemp = coerceNumber((oneCall.current as any).temp);
   const currentHumidity = coerceNumber((oneCall.current as any).humidity);
@@ -535,6 +575,11 @@ export function createEnvProviderRuntimeV1() {
       bumpCounter(metrics.provider_error_codes, provider_error_code);
 
       const missing_inputs = [`env_snapshot.${provider}.${provider_error_code}`];
+      const provider_http_status = typeof (err as any)?.http_status === "number" ? ((err as any).http_status as number) : null;
+      const provider_error_message = err instanceof Error ? err.message : (err == null ? null : String(err));
+      const provider_error_issues = Array.isArray((err as any)?.issues)
+        ? ((err as any).issues as unknown[]).filter((i): i is string => typeof i === "string")
+        : null;
 
       if (entry && entry.snapshot) {
         metrics.lkg_fallbacks += 1;
@@ -544,10 +589,10 @@ export function createEnvProviderRuntimeV1() {
           snapshot: { ...fallback, missing_inputs: mergedMissing },
           cache: { status: "lkg_fallback", revalidate_s, age_s },
         });
-        return { ok: true, provider, cache_status: "lkg_fallback", snapshot, provider_error_code, missing_inputs };
+        return { ok: true, provider, cache_status: "lkg_fallback", snapshot, provider_error_code, provider_http_status, provider_error_message, provider_error_issues, missing_inputs };
       }
 
-      return { ok: false, provider, cache_status: "unavailable", snapshot: null, provider_error_code, missing_inputs };
+      return { ok: false, provider, cache_status: "unavailable", snapshot: null, provider_error_code, provider_http_status, provider_error_message, provider_error_issues, missing_inputs };
     }
   }
 

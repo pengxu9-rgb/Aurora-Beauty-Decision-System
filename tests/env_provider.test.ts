@@ -54,6 +54,33 @@ test("EnvProvider: pm2_5 log score is bounded 0..100 and increases above thresho
   assert.ok(mid <= high);
 });
 
+test("EnvProvider: current air uses nearest forecast dt (no air.current missing)", async () => {
+  const prev = process.env.OPENWEATHER_API_KEY;
+  process.env.OPENWEATHER_API_KEY = "test";
+
+  try {
+    const runtime = createEnvProviderRuntimeV1();
+    const dt0 = 1700000000;
+    const oneCall = buildOneCall48h(dt0);
+    oneCall.current.dt = dt0 + 1234; // not aligned to air forecast hour buckets
+
+    const fetchImpl = async (url: any) => {
+      const u = String(url);
+      if (u.includes("onecall")) return jsonResponse(oneCall);
+      if (u.includes("air_pollution")) return jsonResponse(buildAir48h(dt0, 30));
+      return jsonResponse({ error: "unknown" }, 404);
+    };
+
+    const res = await runtime.getEnvSnapshot({ lat: 1, lon: 2, fetchImpl, revalidate_s: 0, timeout_ms: 50, now: new Date("2026-02-03T00:00:00.000Z") });
+    assert.equal(res.ok, true);
+    assert.ok(res.snapshot);
+    assert.equal(res.snapshot?.current.air_quality.aqi, 2);
+    assert.ok(!(res.snapshot?.missing_inputs ?? []).includes("air.current"));
+  } finally {
+    process.env.OPENWEATHER_API_KEY = prev;
+  }
+});
+
 test("EnvProvider: schema invalid => ok=false + provider_error_code=schema_invalid", async () => {
   const prev = process.env.OPENWEATHER_API_KEY;
   process.env.OPENWEATHER_API_KEY = "test";
@@ -142,6 +169,7 @@ test("EnvProvider: LKG fallback on upstream http_error", async () => {
     assert.equal(second.cache_status, "lkg_fallback");
     assert.equal(second.snapshot?.cache.status, "lkg_fallback");
     assert.equal(second.provider_error_code, "http_error");
+    assert.equal(second.provider_http_status, 502);
     assert.ok((second.snapshot?.missing_inputs ?? []).some((s) => s.includes("http_error")));
 
     const metrics = runtime.getMetrics();

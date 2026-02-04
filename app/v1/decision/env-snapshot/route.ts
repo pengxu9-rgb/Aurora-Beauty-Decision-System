@@ -39,6 +39,9 @@ export async function POST(req: Request) {
         {
           error: "EnvSnapshot unavailable",
           provider_error_code: res.provider_error_code ?? null,
+          provider_http_status: res.provider_http_status ?? null,
+          provider_error_message: res.provider_error_message ?? null,
+          provider_error_issues: res.provider_error_issues ?? null,
           missing_inputs: res.missing_inputs ?? [],
         },
         { status: 503 },
@@ -52,4 +55,3 @@ export async function POST(req: Request) {
 export function OPTIONS() {
   return corsPreflight();
 }
-
