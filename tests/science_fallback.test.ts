@@ -68,3 +68,27 @@ test("SCI-FB-003: English query yields English fallback lead", () => {
   assert.ok(out.startsWith("Based on"));
   assert.ok(out.includes("Topic"));
 });
+
+test("SCI-FB-004: includes citations when available", () => {
+  const out = buildScienceFallbackAnswerV1({
+    user_query: "烟酰胺有没有临床证据？",
+    regionLabel: "CN",
+    external_verification: {
+      query: "niacinamide",
+      citations: [
+        {
+          title: "Niacinamide - mechanisms of action and its topical use in dermatology.",
+          source: "Skin pharmacology and physiology",
+          year: 2014,
+          url: "https://pubmed.ncbi.nlm.nih.gov/24993939/",
+          note: "PMID:24993939",
+        },
+      ],
+    },
+    active_mentions: ["Niacinamide"],
+    ingredient_search: null,
+  });
+
+  assert.ok(out.includes("参考文献") || out.includes("Selected citations"));
+  assert.ok(out.includes("PMID:24993939"));
+});

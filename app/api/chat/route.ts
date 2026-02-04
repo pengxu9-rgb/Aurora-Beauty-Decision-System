@@ -4929,6 +4929,7 @@ export async function POST(req: Request) {
         "",
         "You must answer ONLY this scientific evidence question.",
         "Do NOT generate an AM/PM routine or product picks unless the user explicitly asked for a routine.",
+        "If Context Data includes external_verification.citations and it is non-empty, you MUST reference at least 2 citations from that list (by title or PMID) and end your answer with a short 'Citations' list (max 5 items) using ONLY the provided citation fields (title/year/source/url/note). Do NOT fabricate citations.",
         "If Context Data includes external_verification but citations array is empty, start your answer with: 'Based on general dermatological consensus…' and explain without fabricating citations.",
       ].join("\n");
 

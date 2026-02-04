@@ -66,6 +66,24 @@ export function buildScienceFallbackAnswerV1(input: {
     ),
   );
 
+  if (hasCitations) {
+    const citations = input.external_verification?.citations ?? [];
+    const top = citations.slice(0, 5);
+    lines.push("");
+    lines.push(t("Selected citations (PubMed):", "参考文献（PubMed，节选）："));
+    for (const c of top) {
+      const title = String(c?.title ?? "").trim();
+      if (!title) continue;
+      const year = typeof c?.year === "number" ? c.year : null;
+      const source = typeof c?.source === "string" && c.source.trim() ? c.source.trim() : "";
+      const url = typeof c?.url === "string" && c.url.trim() ? c.url.trim() : "";
+      const note = typeof c?.note === "string" && c.note.trim() ? c.note.trim() : "";
+      const meta = [year ? String(year) : "", source].filter(Boolean).join(", ");
+      const tail = [url, note].filter(Boolean).join(" · ");
+      lines.push(`- ${title}${meta ? ` (${meta})` : ""}${tail ? ` — ${tail}` : ""}`);
+    }
+  }
+
   const hits = input.ingredient_search?.hits ?? [];
   if (askForProducts) {
     if (hits.length) {
@@ -87,4 +105,3 @@ export function buildScienceFallbackAnswerV1(input: {
 
   return lines.join("\n");
 }
-
