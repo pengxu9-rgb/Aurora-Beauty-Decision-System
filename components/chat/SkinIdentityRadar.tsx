@@ -10,36 +10,40 @@ import {
   Tooltip,
 } from "recharts";
 
-type RadarDatum = { axis: string; value: number };
-
-function clamp0to100(value: number) {
-  if (!Number.isFinite(value)) return 0;
-  return Math.max(0, Math.min(100, value));
-}
+import { normalizeRadarSeriesV1 } from "@/lib/ui-contracts";
 
 export const SkinIdentityRadar = React.memo(function SkinIdentityRadar({
-  hydration,
-  sebum,
-  sensitivity,
-  resilienceScore,
-}: {
-  hydration: number;
-  sebum: number;
-  sensitivity: number;
-  resilienceScore: number;
+  ariaLabel,
+  ...props
+}: (
+  | { hydration: number; sebum: number; sensitivity: number; resilienceScore: number; radar?: undefined }
+  | { radar: Array<{ axis: string; value: unknown }>; hydration?: undefined; sebum?: undefined; sensitivity?: undefined; resilienceScore?: undefined }
+) & {
+  ariaLabel?: string;
 }) {
-  const data: RadarDatum[] = React.useMemo(() => {
-    const values = { Hydration: hydration, Sebum: sebum, Sensitivity: sensitivity, Resilience: resilienceScore };
-    const out = Object.entries(values).map(([axis, v]) => ({ axis, value: clamp0to100(v) }));
-    if (out.some((d) => !Number.isFinite(d.value))) {
-      // eslint-disable-next-line no-console
-      console.warn("[Aurora] SkinIdentityRadar: non-finite value detected; using 0 fallback.");
-    }
-    return out;
-  }, [hydration, sebum, sensitivity, resilienceScore]);
+  const rawRadar =
+    "radar" in props
+      ? props.radar
+      : [
+          { axis: "Hydration", value: props.hydration },
+          { axis: "Sebum", value: props.sebum },
+          { axis: "Sensitivity", value: props.sensitivity },
+          { axis: "Resilience", value: props.resilienceScore },
+        ];
+  const { radar: data, didWarn } = normalizeRadarSeriesV1(rawRadar);
+
+  React.useEffect(() => {
+    if (!didWarn) return;
+    // eslint-disable-next-line no-console
+    console.warn("[Aurora] Radar: non-finite value detected; clamped to 0.");
+  }, [didWarn]);
+
+  if (data.length === 0) {
+    return <div className="h-44 w-full rounded-xl border border-slate-200 bg-slate-50" aria-label={ariaLabel ?? "Radar chart placeholder"} />;
+  }
 
   return (
-    <div className="h-44 w-full" aria-label="Skin radar chart">
+    <div className="h-44 w-full" role="img" aria-label={ariaLabel ?? "Skin radar chart"}>
       <ResponsiveContainer width="100%" height="100%">
         <RadarChart data={data} outerRadius="70%">
           <PolarGrid stroke="rgba(148,163,184,0.35)" />
@@ -58,4 +62,3 @@ export const SkinIdentityRadar = React.memo(function SkinIdentityRadar({
     </div>
   );
 });
-

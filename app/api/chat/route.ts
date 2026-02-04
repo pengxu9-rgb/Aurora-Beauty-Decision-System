@@ -7,10 +7,11 @@ import type { SkinLog, UserProfile } from "@prisma/client";
 
 import { getSkuById, getSkuDatabase, resolveProductIdForSkuId } from "@/app/v1/decision/_lib";
 import { calculateScore } from "@/lib/engine";
+import { calculateStressScore } from "@/lib/env-stress";
 import { buildKbProfile, type KbProfile, type KbSnippet, inferKbCanonicalKey } from "@/lib/kb-profile";
 import { prisma } from "@/lib/server/prisma";
 import { findSimilarSkus, findSimilarSkusByAnchorProductId, type RegionPreference } from "@/lib/vector-service";
-import type { Budget, MechanismKey, RiskFlag, SkinType, SkuScoreBreakdown, SkuVector, UserGoal, UserVector } from "@/types";
+import type { Budget, EnvStressInputV1, MechanismKey, RiskFlag, SkinType, SkuScoreBreakdown, SkuVector, UserGoal, UserVector } from "@/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -3816,6 +3817,25 @@ export async function POST(req: Request) {
     dbError: userHistoryDbError,
   });
 
+  const envStress = calculateStressScore(
+    {
+      schema_version: "aurora.env_stress.v1",
+      profile: {
+        skin_type: userProfile?.skinType ?? sessionProfile.skinType ?? null,
+        barrier_status: userProfile?.barrierStatus ?? sessionProfile.barrierStatus ?? null,
+        sensitivity: null,
+        goals: (userProfile?.concerns?.length ?? 0) > 0 ? userProfile?.concerns ?? [] : sessionProfile.concerns,
+        region: detectedRegion ?? null,
+      },
+      recent_logs: recentSkinLogs.map((l) => ({
+        date: l.date.toISOString().slice(0, 10),
+        redness: l.rednessLevel,
+        hydration: l.hydration,
+        acne: l.acneCount,
+      })),
+    } satisfies EnvStressInputV1,
+  );
+
   const phase0Enforcement = skinProfileComplete || wantsScienceOnly
     ? undefined
     : [
@@ -3995,6 +4015,7 @@ export async function POST(req: Request) {
     const scienceContextData = {
       user_query: query,
       region_preference: detectedRegion,
+      env_stress: envStress,
       detected: {
         sensitive_skin: detectSensitiveSkin(query),
         barrier_impaired: detectBarrierImpaired(query),
@@ -4078,6 +4099,7 @@ export async function POST(req: Request) {
       contextualQuery,
       budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined,
     );
+    user.env_stress = envStress;
     const desiredCategories = inferDesiredCategories(query);
     const sensitive = detectSensitiveSkin(contextualQuery);
     const barrierImpaired = detectBarrierImpaired(contextualQuery);
@@ -4240,6 +4262,7 @@ export async function POST(req: Request) {
     const shortlistContextData = {
       user_query: query,
       region_preference: detectedRegion,
+      env_stress: envStress,
       desired_categories: desiredCategories,
       active_mentions: activeMentions,
       detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
@@ -4417,6 +4440,7 @@ export async function POST(req: Request) {
 
     // Build a lightweight user vector from query text.
     const user = buildUserVectorFromQuery(routineProfileText, budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined);
+    user.env_stress = envStress;
     const dbAll = await getSkuDatabase();
 
     const mergeSkuPool = (items: Array<SkuVector | null | undefined>) => {
@@ -4582,6 +4606,7 @@ export async function POST(req: Request) {
       user_query: query,
       request_text: routineRequestText,
       region_preference: detectedRegion,
+      env_stress: envStress,
       budget_cny: budgetCny,
       budget_usd_est: budgetCny != null ? budgetCny / USD_TO_CNY : null,
       budget: (() => {
@@ -4820,6 +4845,7 @@ export async function POST(req: Request) {
     profileText,
     budgetCny != null ? { total_monthly: budgetCny, strategy: "balanced" } : undefined,
   );
+  user.env_stress = envStress;
 
   if (!anchor) {
     const answer =
@@ -4892,6 +4918,7 @@ export async function POST(req: Request) {
 	    const kbOnlyContext = {
 	      user_query: query,
 	      region_preference: detectedRegion,
+	      env_stress: envStress,
 	      detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
 	      user_profile_inferred: sanitizeUserForLlm(user),
 	      navigation: { current_state: productState },
@@ -5162,6 +5189,7 @@ export async function POST(req: Request) {
   const productContextData = {
     user_query: query,
     region_preference: detectedRegion,
+    env_stress: envStress,
     detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
     user_profile_inferred: sanitizeUserForLlm(user),
     navigation: { current_state: productState },

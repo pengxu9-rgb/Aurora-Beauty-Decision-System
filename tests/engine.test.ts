@@ -26,3 +26,38 @@ test("VETO: 泛红敏感肌 + Tom Ford(含酒精/高刺激) => total score = 0",
   assert.equal(score.vetoed, true);
   assert.equal(score.total, 0);
 });
+
+test("EnvStress: ESS applies a bounded score penalty (max 10 points)", () => {
+  const sku = AURORA_SKU_DB.find((s) => s.sku_id === "to_copper_peptides");
+  assert.ok(sku, "Expected to_copper_peptides in mock DB");
+
+  const base = calculateScore(sku, DEFAULT_USER_VECTOR);
+  assert.equal(base.vetoed, false);
+
+  const stressed = calculateScore(sku, {
+    ...DEFAULT_USER_VECTOR,
+    env_stress: {
+      schema_version: "aurora.env_stress.v1",
+      ess: 100,
+      tier: "High",
+      contributors: [{ key: "test" }],
+      missing_inputs: [],
+      generated_at: "2026-02-03T00:00:00.000Z",
+    },
+  });
+
+  assert.equal(stressed.vetoed, false);
+  assert.ok(base.total - stressed.total > 9.5 && base.total - stressed.total < 10.5);
+});
+
+test("Decision Integration: EnvStress missing does not change base score", () => {
+  const sku = AURORA_SKU_DB.find((s) => s.sku_id === "to_copper_peptides");
+  assert.ok(sku, "Expected to_copper_peptides in mock DB");
+
+  const base = calculateScore(sku, DEFAULT_USER_VECTOR);
+  const missing = calculateScore(sku, { ...DEFAULT_USER_VECTOR, env_stress: null });
+
+  assert.equal(base.vetoed, false);
+  assert.equal(missing.vetoed, false);
+  assert.equal(missing.total, base.total);
+});

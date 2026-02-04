@@ -1,6 +1,9 @@
 "use server";
 
 import { bffRequest, type BffCard, type BffEnvelope, type AuroraLang, normalizeAuroraLang } from "@/lib/pivotaAgentBff";
+import { calculateStressScore } from "@/lib/env-stress";
+import { normalizeNotesV1, normalizeRadarSeriesV1 } from "@/lib/ui-contracts";
+import type { EnvStressInputV1, EnvStressUiModelV1 } from "@/types";
 
 export type SkinLogInput = {
   date?: string | Date;
@@ -67,6 +70,7 @@ type BffProfileSummary = {
   barrierStatus?: string | null;
   sensitivity?: string | null;
   goals?: string[];
+  region?: string | null;
 };
 
 type BffSkinLog = {
@@ -141,6 +145,109 @@ function normalizeBffSkinLog(log: BffSkinLog) {
   return { redness };
 }
 
+function normalizeScale05(value: unknown): number | null {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isFinite(n)) return null;
+  const v = n > 5 ? n / 20 : n;
+  return Math.max(0, Math.min(5, v));
+}
+
+function mapBarrierTo0to100(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const v = value.trim().toLowerCase();
+  if (!v) return null;
+  if (v.includes("impaired") || v.includes("irrit") || v.includes("unstable") || v.includes("刺痛") || v.includes("泛红")) return 70;
+  if (v.includes("healthy") || v.includes("stable") || v.includes("ok") || v.includes("稳定")) return 20;
+  return 45;
+}
+
+function mapSensitivityTo0to100(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const v = value.trim().toLowerCase();
+  if (!v) return null;
+  if (v === "low" || v.includes("低")) return 20;
+  if (v === "medium" || v === "mid" || v.includes("中")) return 45;
+  if (v === "high" || v.includes("高")) return 70;
+  return 50;
+}
+
+function buildEnvStressUiModel({ profile, recentLogs, lang }: { profile: BffProfileSummary | null; recentLogs: BffSkinLog[]; lang: AuroraLang }): EnvStressUiModelV1 {
+  const normalizedProfile: EnvStressInputV1["profile"] = {
+    ...(typeof profile?.skinType === "string" ? { skin_type: profile.skinType } : {}),
+    ...(typeof profile?.barrierStatus === "string" ? { barrier_status: profile.barrierStatus } : {}),
+    ...(typeof profile?.sensitivity === "string" ? { sensitivity: profile.sensitivity } : {}),
+    ...(Array.isArray(profile?.goals) ? { goals: profile.goals.slice(0, 12) } : {}),
+    ...(typeof profile?.region === "string" ? { region: profile.region } : {}),
+  };
+
+  const normalizedLogs: NonNullable<EnvStressInputV1["recent_logs"]> = [];
+  for (const l of Array.isArray(recentLogs) ? recentLogs.slice(0, 30) : []) {
+    const date = typeof l?.date === "string" ? l.date.trim().slice(0, 10) : "";
+    if (!date) continue;
+    normalizedLogs.push({
+      date,
+      ...(l.redness != null ? { redness: l.redness } : {}),
+      ...(l.hydration != null ? { hydration: l.hydration } : {}),
+      ...(l.acne != null ? { acne: l.acne } : {}),
+    });
+  }
+
+  const envStress = calculateStressScore(
+    { schema_version: "aurora.env_stress.v1", profile: normalizedProfile, ...(normalizedLogs.length ? { recent_logs: normalizedLogs } : {}) },
+    {},
+  );
+
+  const latest = normalizedLogs.length ? [...normalizedLogs].sort((a, b) => String(b.date).localeCompare(String(a.date)))[0] : null;
+  const hydration05 = latest ? normalizeScale05(latest.hydration) : null;
+  const redness05 = latest ? normalizeScale05(latest.redness) : null;
+  const acne05 = latest ? normalizeScale05(latest.acne) : null;
+
+  const radarRaw: Array<{ axis: string; value: unknown }> = [];
+  if (envStress.ess != null) radarRaw.push({ axis: "ESS", value: envStress.ess });
+  const barrier = mapBarrierTo0to100(normalizedProfile.barrier_status);
+  if (barrier != null) radarRaw.push({ axis: "Barrier", value: barrier });
+  const sensitivity = mapSensitivityTo0to100(normalizedProfile.sensitivity);
+  if (sensitivity != null) radarRaw.push({ axis: "Sensitivity", value: sensitivity });
+  if (hydration05 != null) radarRaw.push({ axis: "Hydration", value: Math.round((hydration05 / 5) * 100) });
+  if (redness05 != null) radarRaw.push({ axis: "Redness", value: Math.round((redness05 / 5) * 100) });
+  if (acne05 != null) radarRaw.push({ axis: "Acne", value: Math.round((acne05 / 5) * 100) });
+
+  const summaryLine =
+    envStress.ess == null
+      ? lang === "CN"
+        ? "ESS 暂不可用（输入不足）。"
+        : "ESS unavailable (insufficient inputs)."
+      : lang === "CN"
+        ? `ESS ${envStress.ess}/100（${envStress.tier ?? "—"}）`
+        : `ESS ${envStress.ess}/100 (${envStress.tier ?? "—"})`;
+
+  const contributorNotes = envStress.contributors
+    .map((c) => (typeof c.note === "string" ? c.note : ""))
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 3);
+
+  const missingLine =
+    envStress.missing_inputs.length > 0
+      ? lang === "CN"
+        ? `缺失：${envStress.missing_inputs.slice(0, 3).join("、")}`
+        : `Missing: ${envStress.missing_inputs.slice(0, 3).join(", ")}`
+      : null;
+
+  const notesRaw = [summaryLine, ...contributorNotes, ...(missingLine ? [missingLine] : [])];
+
+  const { radar } = normalizeRadarSeriesV1(radarRaw);
+  const notes = normalizeNotesV1(notesRaw);
+
+  return {
+    schema_version: "aurora.ui.env_stress.v1",
+    ess: envStress.ess,
+    tier: envStress.tier,
+    radar,
+    notes,
+  };
+}
+
 export async function getSkinIdentitySnapshot(userId: string): Promise<SkinIdentitySnapshot> {
   const uid = normalizeUserId(userId);
   const lang: AuroraLang = normalizeAuroraLang(process.env.AURORA_LANG_DEFAULT);
@@ -169,6 +276,16 @@ export async function getSkinIdentitySnapshot(userId: string): Promise<SkinIdent
     sensitivity,
     last7d: { rednessMax, rednessLatest },
   };
+}
+
+export async function getEnvStressUiModel(userId: string): Promise<EnvStressUiModelV1> {
+  const uid = normalizeUserId(userId);
+  const lang: AuroraLang = normalizeAuroraLang(process.env.AURORA_LANG_DEFAULT);
+
+  const envelope = await bffRequest<BffEnvelope>("/v1/session/bootstrap", { uid, lang, method: "GET" });
+  const { profile, recentLogs } = extractBootstrap(envelope);
+
+  return buildEnvStressUiModel({ profile, recentLogs, lang });
 }
 
 export async function setUserConcerns(userId: string, concerns: string[]) {

@@ -55,6 +55,62 @@ export type Budget = {
   strategy: BudgetStrategy;
 };
 
+export type EnvStressContributorV1 = {
+  key: string;
+  weight?: number; // 0..1 (optional)
+  note?: string;
+};
+
+export type EnvStressInputV1 = {
+  schema_version: "aurora.env_stress.v1";
+  profile: {
+    skin_type?: string | null;
+    barrier_status?: string | null;
+    sensitivity?: string | null; // e.g. "low" | "medium" | "high"
+    goals?: string[];
+    region?: string | null; // e.g. "CN" | "US" | "EU" | null
+  };
+  recent_logs?: Array<{
+    date: string; // YYYY-MM-DD
+    redness?: number | null; // 0..5 or 0..100
+    hydration?: number | null; // 0..5 or 0..100
+    acne?: number | null; // 0..5 or 0..100
+  }>;
+  env?: Record<string, unknown>;
+};
+
+export type EnvStressOutputV1 = {
+  schema_version: "aurora.env_stress.v1";
+  ess: number | null; // 0..100; null if insufficient inputs
+  tier: string | null; // "Low" | "Moderate" | "High" (report may refine)
+  contributors: EnvStressContributorV1[];
+  missing_inputs: string[];
+  generated_at: string; // ISO timestamp
+};
+
+export type RadarDatumV1 = { axis: string; value: number }; // value: 0..100
+
+export type EnvStressUiModelV1 = {
+  schema_version: "aurora.ui.env_stress.v1";
+  ess: number | null;
+  tier: string | null;
+  radar: RadarDatumV1[];
+  notes: string[];
+};
+
+export type ConflictHeatmapUiModelV1 = {
+  schema_version: "aurora.ui.conflict_heatmap.v1";
+  // TODO(report): heatmap matrix definition (axes, buckets, and color rules)
+};
+
+export type UiRenderingConstraintsV1 = {
+  schema_version: "aurora.ui.constraints.v1";
+  value_range: "0..100";
+  nan_policy: "clamp_to_0_and_warn";
+  max_axes: 8;
+  max_notes: 4;
+};
+
 export type UserVector = {
   skin_type: SkinType | SkinType[];
   barrier_status: BarrierStatus;
@@ -62,6 +118,7 @@ export type UserVector = {
   goals: UserGoal[];
   platform_weights: PlatformWeights;
   constraints?: string[];
+  env_stress?: EnvStressOutputV1 | null;
 };
 
 export type SkuVector = {
@@ -109,4 +166,3 @@ export type RoutinePlan = {
   estimated_total: number;
   conflicts: string[];
 };
-

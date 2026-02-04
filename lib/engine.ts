@@ -90,9 +90,30 @@ function calculateEngineeringScore(sku: SkuVector) {
   return clamp100((1 - 0.5 * penalty) * 100);
 }
 
+function normalizeEnvStressEss(user: UserVector): number | null {
+  let ess: unknown;
+  try {
+    ess = (user as any).env_stress?.ess;
+  } catch {
+    return null;
+  }
+
+  if (ess == null || typeof ess !== "number" || !Number.isFinite(ess)) return null;
+  return clamp100(ess);
+}
+
+function computeEnvStressPenalty(user: UserVector) {
+  const ess = normalizeEnvStressEss(user);
+  if (ess == null) return 0;
+  // Bounded penalty: 0..10 points. Keeps the original weight model intact while allowing
+  // a conservative "stress-aware" score adjustment.
+  return clamp100((ess / 100) * 10);
+}
+
 /**
  * calculateScore (Scoring Engine)
  * Total = 0.3 * ScienceScore + 0.6 * SocialScore + 0.1 * EngineeringScore
+ * Total = Total - EnvStressPenalty (optional; max 10 points)
  *
  * VETO (Critical):
  * If user.barrier_status === 'impaired' AND (risk_flags includes 'high_irritation' OR burn_rate > 0.1),
@@ -102,6 +123,7 @@ export function calculateScore(sku: SkuVector, user: UserVector): SkuScoreBreakd
   const science = calculateScienceScore(sku, user);
   const social = calculateSocialScore(sku, user);
   const engineering = calculateEngineeringScore(sku);
+  const envPenalty = computeEnvStressPenalty(user);
 
   const vetoed =
     user.barrier_status === "impaired" &&
@@ -122,7 +144,7 @@ export function calculateScore(sku: SkuVector, user: UserVector): SkuScoreBreakd
   }
 
   const total = 0.3 * science + 0.6 * social + 0.1 * engineering;
-  return { science, social, engineering, total: clamp100(total), vetoed: false };
+  return { science, social, engineering, total: clamp100(total - envPenalty), vetoed: false };
 }
 
 function toDenseMechanismVector(vector: MechanismVector) {
@@ -212,4 +234,3 @@ export function validateRoutine(plan: RoutinePlan): RoutineValidation {
 
   return { ok: conflicts.length === 0, conflicts };
 }
-

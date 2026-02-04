@@ -1,12 +1,13 @@
 "use client";
 
 import type { SkinIdentitySnapshot } from "@/actions/userProfile";
-import { getSkinIdentitySnapshot, setUserConcerns } from "@/actions/userProfile";
+import { getEnvStressUiModel, getSkinIdentitySnapshot, setUserConcerns } from "@/actions/userProfile";
 import { ActionChips, type ActionChip } from "@/components/chat/ActionChips";
-import { RoutineTimeline, type RoutineRec } from "@/components/chat/RoutineTimeline";
+import { RoutineTimeline, type ConflictDetectorOutputV1, type RoutineRec } from "@/components/chat/RoutineTimeline";
 import { SkinIdentityCard } from "@/components/chat/SkinIdentityCard";
 import { cn } from "@/lib/cn";
 import { bffRequest, normalizeAuroraLang, type AuroraLang, type BffCard, type BffEnvelope, type SuggestedChip } from "@/lib/pivotaAgentBff";
+import type { EnvStressUiModelV1 } from "@/types";
 import { ChevronDown, ChevronUp, Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -18,6 +19,47 @@ type ChatMessage = {
   role: ChatRole;
   content: string;
 };
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseConflictDetectorOutputV1(value: unknown): ConflictDetectorOutputV1 | null {
+  if (!isPlainObject(value)) return null;
+  const schemaVersion = typeof value.schema_version === "string" ? value.schema_version : null;
+  if (schemaVersion && schemaVersion !== "aurora.conflicts.v1") return null;
+
+  const conflictsRaw = Array.isArray(value.conflicts) ? value.conflicts : [];
+  const conflicts = conflictsRaw
+    .filter(isPlainObject)
+    .map((c) => {
+      const severity = c.severity === "block" ? "block" : c.severity === "warn" ? "warn" : null;
+      const message = typeof c.message === "string" ? c.message.trim() : "";
+      if (!severity || !message) return null;
+      return {
+        severity,
+        ...(typeof c.rule_id === "string" ? { rule_id: c.rule_id } : {}),
+        message,
+        ...(typeof c.step_index === "number" ? { step_index: c.step_index } : {}),
+      };
+    })
+    .filter(Boolean) as ConflictDetectorOutputV1["conflicts"];
+
+  const safe = typeof value.safe === "boolean" ? value.safe : conflicts.length === 0;
+  const summary =
+    typeof value.summary === "string" && value.summary.trim()
+      ? value.summary.trim()
+      : safe
+        ? "Looks compatible with your routine order."
+        : "Some potential conflicts detected.";
+
+  return {
+    schema_version: "aurora.conflicts.v1",
+    safe,
+    conflicts,
+    summary,
+  };
+}
 
 function makeId(prefix: string) {
   const cryptoObj = globalThis.crypto as Crypto | undefined;
@@ -108,6 +150,9 @@ export function AuroraChatPage() {
   const [skinIdentity, setSkinIdentity] = useState<SkinIdentitySnapshot | null>(null);
   const [isIdentityLoading, setIsIdentityLoading] = useState(false);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  const [envStress, setEnvStress] = useState<EnvStressUiModelV1 | null>(null);
+  const [envStressLoading, setEnvStressLoading] = useState(false);
+  const [envStressError, setEnvStressError] = useState<string | null>(null);
 
   const [diagnosisExpanded, setDiagnosisExpanded] = useState(true);
   const [diagnosisProgressOverride, setDiagnosisProgressOverride] = useState<number>(0);
@@ -162,13 +207,28 @@ export function AuroraChatPage() {
     }
   }, []);
 
+  const refreshEnvStress = useCallback(async (uid: string) => {
+    setEnvStressLoading(true);
+    setEnvStressError(null);
+    try {
+      const model = await getEnvStressUiModel(uid);
+      setEnvStress(model);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to load env stress";
+      setEnvStressError(msg);
+    } finally {
+      setEnvStressLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     const uid = getOrCreateAuroraUid();
     if (!uid) return;
     setAuroraUidCookie(uid);
     setUserId(uid);
     void refreshIdentity(uid);
-  }, [refreshIdentity]);
+    void refreshEnvStress(uid);
+  }, [refreshEnvStress, refreshIdentity]);
 
   useEffect(() => {
     return () => {
@@ -261,7 +321,10 @@ export function AuroraChatPage() {
         window.clearTimeout(timeout);
 
         applyEnvelope(envelope, { userMessage: trimmed });
-        if (userId) void refreshIdentity(userId);
+        if (userId) {
+          void refreshIdentity(userId);
+          void refreshEnvStress(userId);
+        }
       } catch (e) {
         const err =
           e instanceof DOMException && e.name === "AbortError"
@@ -275,7 +338,7 @@ export function AuroraChatPage() {
         setIsSending(false);
       }
     },
-    [applyEnvelope, isSending, lang, pushMessage, refreshIdentity, sessionState, userId],
+    [applyEnvelope, isSending, lang, pushMessage, refreshEnvStress, refreshIdentity, sessionState, userId],
   );
 
   const onSubmit = useCallback(
@@ -298,14 +361,14 @@ export function AuroraChatPage() {
 
   const handleConfirmProfile = useCallback(async () => {
     if (!userId) return;
-    await refreshIdentity(userId);
+    await Promise.all([refreshIdentity(userId), refreshEnvStress(userId)]);
     pushMessage({
       id: makeId("a"),
       role: "assistant",
       content:
         "Profile confirmed. Next: paste a product name/link for a safety+fit check, or tell me your main goal (acne / redness / dark spots / anti‑aging).",
     });
-  }, [pushMessage, refreshIdentity, userId]);
+  }, [pushMessage, refreshEnvStress, refreshIdentity, userId]);
 
   const handleUploadSelfie = useCallback(() => {
     selfieInputRef.current?.click();
@@ -334,12 +397,13 @@ export function AuroraChatPage() {
       try {
         const updated = await setUserConcerns(userId, next);
         setSkinIdentity(updated);
+        void refreshEnvStress(userId);
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Failed to update concerns";
         setSendError(msg);
       }
     },
-    [userId],
+    [refreshEnvStress, userId],
   );
 
   const actionChips = useMemo<ActionChip[]>(
@@ -391,6 +455,7 @@ export function AuroraChatPage() {
 
         applyEnvelope(envelope, { userMessage: isProfileChip ? undefined : messageForUpstream, gateMessage });
         void refreshIdentity(userId);
+        void refreshEnvStress(userId);
       } catch (e) {
         const err =
           e instanceof DOMException && e.name === "AbortError"
@@ -404,7 +469,7 @@ export function AuroraChatPage() {
         setIsSending(false);
       }
     },
-    [applyEnvelope, isSending, lang, pushMessage, refreshIdentity, sessionState, userId],
+    [applyEnvelope, isSending, lang, pushMessage, refreshEnvStress, refreshIdentity, sessionState, userId],
   );
 
   const requestRoutine = useCallback(async () => {
@@ -434,6 +499,7 @@ export function AuroraChatPage() {
 
       applyEnvelope(envelope, { gateMessage: "recommend" });
       void refreshIdentity(userId);
+      void refreshEnvStress(userId);
     } catch (e) {
       const err =
         e instanceof DOMException && e.name === "AbortError"
@@ -446,7 +512,7 @@ export function AuroraChatPage() {
     } finally {
       setIsSending(false);
     }
-  }, [applyEnvelope, isSending, lang, pushMessage, refreshIdentity, skinIdentity?.concerns, userId]);
+  }, [applyEnvelope, isSending, lang, pushMessage, refreshEnvStress, refreshIdentity, skinIdentity?.concerns, userId]);
 
   const renderBffCard = useCallback((card: BffCard) => {
     const payload = card.payload ?? {};
@@ -467,7 +533,8 @@ export function AuroraChatPage() {
         });
 
       const routine: RoutineRec = { am, pm };
-      return <RoutineTimeline key={card.card_id} title="Your Routine" routine={routine} />;
+      const conflictDetector = parseConflictDetectorOutputV1((payload as any).conflict_detector ?? (payload as any).conflictDetector);
+      return <RoutineTimeline key={card.card_id} title="Your Routine" routine={routine} conflictDetector={conflictDetector} />;
     }
 
     if (card.type === "product_analysis") {
@@ -653,6 +720,9 @@ export function AuroraChatPage() {
                     onConcernsChange={handleConcernsChange}
                     onConfirmProfile={handleConfirmProfile}
                     onUploadSelfie={handleUploadSelfie}
+                    envStress={envStress}
+                    envStressLoading={envStressLoading}
+                    envStressError={envStressError}
                   />
                   {isIdentityLoading ? <div className="mt-2 text-[11px] text-slate-500">Updating profile…</div> : null}
                 </div>
