@@ -3783,6 +3783,14 @@ export async function POST(req: Request) {
     const goalsRaw = Array.isArray(profile.goals) ? profile.goals : [];
     const goalStrings = goalsRaw.map((g) => (typeof g === "string" ? g.trim() : "")).filter(Boolean);
 
+    const routineRaw = (profile as any).currentRoutine ?? (profile as any).current_routine ?? null;
+    const routineText =
+      typeof routineRaw === "string" ? routineRaw : routineRaw && typeof routineRaw === "object" ? JSON.stringify(routineRaw) : "";
+    const routineActives = routineText ? inferRoutineActivesFromFreeText(routineText) : [];
+    const routineHasRetinoid = routineActives.some((a) => String(a).toLowerCase().includes("retinol") || String(a).toLowerCase().includes("adapalene"));
+    const routineHasAcids = routineActives.some((a) => ["aha", "bha", "pha", "acid"].includes(String(a).toLowerCase()));
+    const routineHasBpo = routineActives.some((a) => String(a).toLowerCase().includes("benzoyl peroxide"));
+
     const pushGoal = (out: UserGoal[], track: MechanismKey, priority: number) => {
       if (out.some((g) => g.track === track)) return;
       out.push({ track, priority });
@@ -4128,6 +4136,14 @@ export async function POST(req: Request) {
               ? "屏障受损：优先低刺激路线（已避开高刺激/强酸候选），建议低频起步。"
               : "Barrier impaired: prioritize low irritation (filtered out high-irritation/strong-acid options); start low and slow.",
           );
+        }
+
+        if (idx === 0 && routineText && (routineHasRetinoid || routineHasAcids || routineHasBpo)) {
+          const line =
+            userLang === "zh"
+              ? "与你现有流程兼容：如在用维A/酸/过氧化苯甲酰，避免同晚叠加；建议错开使用并从低频开始。"
+              : "Routine compatibility: if you're already using retinoids/acids/BPO, avoid stacking on the same night—alternate and start low-frequency.";
+          reasons.push(line);
         }
 
         if (idx === 0 && logsSummary) {
