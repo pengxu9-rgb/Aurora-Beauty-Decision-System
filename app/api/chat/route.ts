@@ -6,6 +6,7 @@ import { Prisma } from "@prisma/client";
 import type { SkinLog, UserProfile } from "@prisma/client";
 
 import { getSkuById, getSkuDatabase, resolveProductIdForSkuId } from "@/app/v1/decision/_lib";
+import { buildActiveMatchTokens, matchesAnyToken } from "@/lib/aurora/active-matches";
 import { buildScienceFallbackAnswerV1 } from "@/lib/aurora/science-fallback";
 import { calculateScore } from "@/lib/engine";
 import { calculateStressScore } from "@/lib/env-stress";
@@ -814,6 +815,97 @@ function normalizeQuery(body: ChatRequest): string {
   }
 
   return "";
+}
+
+function safeJsonParse(value: string): unknown | null {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+type BffContextPrefix = {
+  profile: Record<string, unknown> | null;
+  recent_logs: Array<Record<string, unknown>>;
+  meta: Record<string, unknown> | null;
+  stripped_query: string;
+};
+
+function parseBffContextPrefix(rawQuery: string): BffContextPrefix | null {
+  const raw = String(rawQuery || "").replace(/\r\n/g, "\n");
+  const lines = raw.split("\n");
+
+  let profile: Record<string, unknown> | null = null;
+  let meta: Record<string, unknown> | null = null;
+  let recent_logs: Array<Record<string, unknown>> = [];
+
+  let cursor = 0;
+  let sawAny = false;
+  for (; cursor < lines.length; cursor += 1) {
+    const line = String(lines[cursor] || "").trim();
+    if (!line) {
+      cursor += 1;
+      break;
+    }
+
+    const m = line.match(/^(profile|recent_logs|meta)\s*=\s*(.+)$/i);
+    if (!m) break;
+    sawAny = true;
+    const key = String(m[1] || "").toLowerCase();
+    const jsonText = String(m[2] || "").trim();
+    const parsed = safeJsonParse(jsonText);
+
+    if (key === "profile") {
+      profile = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+      continue;
+    }
+    if (key === "meta") {
+      meta = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+      continue;
+    }
+    if (key === "recent_logs") {
+      recent_logs = Array.isArray(parsed)
+        ? parsed
+            .map((v) => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null))
+            .filter(Boolean) as Array<Record<string, unknown>>
+        : [];
+      continue;
+    }
+  }
+
+  if (!sawAny) return null;
+
+  const stripped_query = lines.slice(cursor).join("\n").trim();
+  return { profile, recent_logs, meta, stripped_query };
+}
+
+function readMetaString(meta: Record<string, unknown> | null, ...keys: string[]): string | null {
+  if (!meta) return null;
+  for (const k of keys) {
+    const raw = meta[k];
+    if (typeof raw !== "string") continue;
+    const v = raw.trim();
+    if (v) return v;
+  }
+  return null;
+}
+
+function isBffRecoProductsRequest(meta: Record<string, unknown> | null): boolean {
+  const actionId = readMetaString(meta, "action_id", "actionId");
+  if (actionId === "chip.start.reco_products") return true;
+  const intent = readMetaString(meta, "intent");
+  if (intent && intent.toLowerCase() === "reco_products") return true;
+  return false;
+}
+
+function coerceBffLanguage(meta: Record<string, unknown> | null): UserLanguage | null {
+  const lang = readMetaString(meta, "lang", "language");
+  if (!lang) return null;
+  const upper = lang.trim().toUpperCase();
+  if (upper === "CN" || upper === "ZH" || upper === "ZH-CN") return "zh";
+  if (upper === "EN" || upper === "EN-US") return "en";
+  return null;
 }
 
 function detectSensitiveSkin(query: string) {
@@ -3617,6 +3709,415 @@ export async function POST(req: Request) {
       ? `${recentUserContextText}\n\nFollow-up: ${query}`
       : query;
 
+  const bffContext = parseBffContextPrefix(query);
+  if (bffContext && isBffRecoProductsRequest(bffContext.meta)) {
+    const userLang = coerceBffLanguage(bffContext.meta) ?? detectUserLanguage(bffContext.stripped_query || query);
+    const languageTag = toAuroraLanguageTag(userLang);
+    const envelope = <T extends Record<string, unknown>>(payload: T) =>
+      ({ schema_version: AURORA_CHAT_SCHEMA_VERSION satisfies AuroraChatSchemaVersion, language: languageTag, ...payload }) as const;
+
+    const profile = bffContext.profile || {};
+    const recentLogs = bffContext.recent_logs || [];
+
+    const profileSkinType = typeof profile.skinType === "string" ? profile.skinType.trim().toLowerCase() : "";
+    const skinType: SkinType =
+      profileSkinType === "oily" || profileSkinType === "dry" || profileSkinType === "combination" || profileSkinType === "normal"
+        ? (profileSkinType as SkinType)
+        : "normal";
+
+    const profileBarrier = typeof profile.barrierStatus === "string" ? profile.barrierStatus.trim().toLowerCase() : "";
+    const barrierImpaired = profileBarrier === "impaired" || profileBarrier === "reactive" || profileBarrier === "sensitive";
+
+    const profileSensitivity = typeof profile.sensitivity === "string" ? profile.sensitivity.trim().toLowerCase() : "";
+    const sensitiveSkin = profileSensitivity === "high" || profileSensitivity === "medium" || barrierImpaired;
+
+    const goalsRaw = Array.isArray(profile.goals) ? profile.goals : [];
+    const goalStrings = goalsRaw.map((g) => (typeof g === "string" ? g.trim() : "")).filter(Boolean);
+
+    const pushGoal = (out: UserGoal[], track: MechanismKey, priority: number) => {
+      if (out.some((g) => g.track === track)) return;
+      out.push({ track, priority });
+    };
+
+    const userGoals: UserGoal[] = [];
+    for (const g of goalStrings) {
+      const key = g.toLowerCase();
+      if (key === "acne" || key === "pores") {
+        pushGoal(userGoals, "acne_comedonal", 1);
+        pushGoal(userGoals, "oil_control", 2);
+        continue;
+      }
+      if (key === "dark_spots" || key === "dullness") {
+        pushGoal(userGoals, "brightening", 1);
+        continue;
+      }
+      if (key === "redness") {
+        pushGoal(userGoals, "soothing", 1);
+        pushGoal(userGoals, "redness", 2);
+        pushGoal(userGoals, "repair", 3);
+        continue;
+      }
+      if (key === "repair" || key === "barrier" || key === "dehydration") {
+        pushGoal(userGoals, "repair", 1);
+        pushGoal(userGoals, "soothing", 2);
+        continue;
+      }
+      if (key === "wrinkles" || key === "aging") {
+        pushGoal(userGoals, "brightening", 1);
+        pushGoal(userGoals, "repair", 2);
+        continue;
+      }
+    }
+    if (userGoals.length === 0) {
+      pushGoal(userGoals, "repair", 1);
+      pushGoal(userGoals, "soothing", 2);
+      pushGoal(userGoals, "brightening", 3);
+    }
+
+    const budgetTier = typeof profile.budgetTier === "string" ? profile.budgetTier.trim() : "";
+    const budgetTierCny = (() => {
+      if (!budgetTier) return null;
+      const normalized = budgetTier.replace(/，/g, ",");
+      const m = normalized.match(/[¥￥]\s*(\d+)/);
+      if (m?.[1]) return Number(m[1]);
+      const m2 = normalized.match(/\b(\d{2,6})\b/);
+      if (m2?.[1]) return Number(m2[1]);
+      if (/1000\+/.test(normalized) || /¥\s*1000\+/.test(normalized)) return 1000;
+      return null;
+    })();
+
+    const detectedRegion = typeof profile.region === "string" && profile.region.trim() ? (profile.region.trim() as RegionPreference) : null;
+    const regionLabel = detectedRegion ?? "Global";
+    const desiredCategories = inferDesiredCategories(bffContext.stripped_query || "");
+
+    const normalizeLogDate = (value: unknown): string | null => {
+      if (typeof value !== "string") return null;
+      const normalized = value.trim();
+      if (!normalized) return null;
+      const m = normalized.match(/^(\d{4}-\d{2}-\d{2})/);
+      return m?.[1] ?? normalized;
+    };
+
+    const envStressRecentLogs: NonNullable<EnvStressInputV1["recent_logs"]> = Array.isArray(recentLogs)
+      ? recentLogs.flatMap((l) => {
+          const date = normalizeLogDate((l as any)?.date);
+          if (!date) return [];
+          return [
+            {
+              date,
+              redness: typeof (l as any).redness === "number" ? (l as any).redness : typeof (l as any).redness === "string" ? Number((l as any).redness) : null,
+              hydration:
+                typeof (l as any).hydration === "number" ? (l as any).hydration : typeof (l as any).hydration === "string" ? Number((l as any).hydration) : null,
+              acne: typeof (l as any).acne === "number" ? (l as any).acne : typeof (l as any).acne === "string" ? Number((l as any).acne) : null,
+            },
+          ];
+        })
+      : [];
+
+    const envStress = calculateStressScore(
+      {
+        schema_version: "aurora.env_stress.v1",
+        profile: {
+          skin_type: (profileSkinType || null) as any,
+          barrier_status: (profileBarrier || null) as any,
+          sensitivity: (profileSensitivity || null) as any,
+          goals: goalStrings,
+          region: detectedRegion ?? null,
+        },
+        recent_logs: envStressRecentLogs,
+      } satisfies EnvStressInputV1,
+    );
+
+    const user: UserVector = {
+      skin_type: skinType,
+      barrier_status: barrierImpaired ? "impaired" : "healthy",
+      budget: {
+        total_monthly: Number.isFinite(Number(budgetTierCny ?? NaN)) ? Number(budgetTierCny) : 2000,
+        strategy: "balanced",
+      },
+      goals: userGoals,
+      platform_weights: { RED: 0.5, Reddit: 0.5, Ecommerce: 0, DermSources: 0 },
+    };
+    (user as any).env_stress = envStress;
+
+    const summarizeRecentLogs = () => {
+      const list = Array.isArray(recentLogs) ? recentLogs : [];
+      const values = (key: "redness" | "acne" | "hydration") =>
+        list
+          .map((l) => (typeof l[key] === "number" ? l[key] : typeof l[key] === "string" ? Number(l[key]) : null))
+          .filter((n) => typeof n === "number" && Number.isFinite(n)) as number[];
+      const avg = (nums: number[]) => (nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null);
+      const r = avg(values("redness"));
+      const a = avg(values("acne"));
+      const h = avg(values("hydration"));
+      const parts: string[] = [];
+      if (r != null) parts.push(`redness ~${Math.round(r * 10) / 10}/5`);
+      if (a != null) parts.push(`acne ~${Math.round(a * 10) / 10}/5`);
+      if (h != null) parts.push(`hydration ~${Math.round(h * 10) / 10}/5`);
+      if (!parts.length) return null;
+      return userLang === "zh" ? `近7天：${parts.join("，")}` : `Last 7d: ${parts.join(", ")}`;
+    };
+    const logsSummary = summarizeRecentLogs();
+
+    const pickHeadlineActive = (actives: string[]) => {
+      const items = actives.map((a) => a.trim()).filter(Boolean);
+      if (!items.length) return null;
+      const lower = items.map((a) => a.toLowerCase());
+      const has = (s: string) => lower.some((a) => a.includes(s));
+      if (goalStrings.some((g) => g.toLowerCase().includes("dark") || g.toLowerCase().includes("spot"))) {
+        if (has("tranex")) return items[lower.findIndex((a) => a.includes("tranex"))] ?? "Tranexamic Acid";
+        if (has("niacinamide")) return items[lower.findIndex((a) => a.includes("niacinamide"))] ?? "Niacinamide";
+        if (has("vitamin c") || has("ascorb")) return items[lower.findIndex((a) => a.includes("vitamin c") || a.includes("ascorb"))] ?? "Vitamin C";
+      }
+      if (goalStrings.some((g) => g.toLowerCase().includes("acne") || g.toLowerCase().includes("pores"))) {
+        if (has("salicy")) return items[lower.findIndex((a) => a.includes("salicy"))] ?? "Salicylic Acid";
+        if (has("azelaic")) return items[lower.findIndex((a) => a.includes("azelaic"))] ?? "Azelaic Acid";
+        if (has("niacinamide")) return items[lower.findIndex((a) => a.includes("niacinamide"))] ?? "Niacinamide";
+      }
+      if (barrierImpaired) {
+        if (has("panthenol") || has("b5")) return items[lower.findIndex((a) => a.includes("panthenol") || /\bb5\b/.test(a))] ?? "B5 (Panthenol)";
+        if (has("ceramide")) return items[lower.findIndex((a) => a.includes("ceramide"))] ?? "Ceramides";
+        if (has("hyal")) return items[lower.findIndex((a) => a.includes("hyal"))] ?? "Hyaluronic Acid";
+      }
+      return items[0] ?? null;
+    };
+
+    const makeNotes = (input: { productName: string; actives: string[]; risk_flags: RiskFlag[]; priceUsd: number | null; idx: number }) => {
+      const notes: string[] = [];
+      const active = pickHeadlineActive(input.actives);
+      const goalsLabel = goalStrings.length
+        ? userLang === "zh"
+          ? `目标：${goalStrings.slice(0, 3).join(" / ")}`
+          : `Goals: ${goalStrings.slice(0, 3).join(" / ")}`
+        : null;
+
+      const profileLine = (() => {
+        const skin = userLang === "zh" ? `肤质：${skinType}` : `Skin: ${skinType}`;
+        const barrier = userLang === "zh" ? `屏障：${barrierImpaired ? "受损/易刺激" : "稳定"}` : `Barrier: ${barrierImpaired ? "impaired/reactive" : "stable"}`;
+        const activeHint = active ? (userLang === "zh" ? `关键成分：${active}` : `Key active: ${active}`) : null;
+        return [skin, barrier, activeHint].filter(Boolean).join(userLang === "zh" ? "；" : " · ");
+      })();
+      notes.push(profileLine);
+
+      if (goalsLabel && notes.length < 4) notes.push(goalsLabel);
+
+      if (input.idx === 0 && logsSummary && notes.length < 4) {
+        notes.push(logsSummary);
+      }
+
+      if (budgetTier && notes.length < 4) {
+        if (input.priceUsd != null && budgetTierCny != null) {
+          const estCny = Math.round(input.priceUsd * USD_TO_CNY);
+          if (estCny > budgetTierCny) {
+            notes.push(userLang === "zh" ? `可能超出预算（约¥${estCny}）` : `May exceed budget (≈¥${estCny})`);
+          } else {
+            notes.push(userLang === "zh" ? `大概率在预算内（约¥${estCny}）` : `Likely within budget (≈¥${estCny})`);
+          }
+        } else {
+          notes.push(userLang === "zh" ? `预算参考：${budgetTier}` : `Budget: ${budgetTier}`);
+        }
+      }
+
+      if (barrierImpaired && notes.length < 4) {
+        if (input.risk_flags.includes("acid")) notes.push(userLang === "zh" ? "屏障受损时慎用酸类，建议低频/隔天" : "Barrier impaired: acids can sting—start low and slow.");
+        if (input.risk_flags.includes("alcohol")) notes.push(userLang === "zh" ? "敏感/屏障受损时含酒精可能更刺激" : "Sensitive/barrier-impaired: alcohol may sting for some.");
+      }
+
+      return notes.slice(0, 4);
+    };
+
+    const dbAll = await getSkuDatabase();
+    const poolByCategory = dbAll.filter((s) => desiredCategories.includes(s.category));
+    const pool = poolByCategory.length ? poolByCategory : dbAll;
+
+    let scored = pool
+      .map((sku) => ({ sku, score: calculateScore(sku, user) }))
+      .filter((r) => r.score.total > 0);
+
+    if (sensitiveSkin) scored = scored.filter((r) => !r.sku.risk_flags.includes("alcohol"));
+    if (barrierImpaired) scored = scored.filter((r) => !r.sku.risk_flags.includes("high_irritation") && !r.sku.risk_flags.includes("acid") && (r.sku.social_stats.burn_rate ?? 0) <= 0.1);
+
+    scored.sort((a, b) => b.score.total - a.score.total);
+    const top = scored.slice(0, 8);
+
+    const candidateIds = uniqueStrings(top.map((c) => c.sku.sku_id)).filter((id) => looksLikeUuid(id));
+
+    const ingredientByProductId = new Map<string, { fullList: unknown; heroActives: unknown }>();
+    const kbByProductId = new Map<string, KbSnippetForEvidence[]>();
+    try {
+      if (candidateIds.length) {
+        const ingredientRows = await prisma.ingredientData.findMany({
+          where: { productId: { in: candidateIds } },
+          select: { productId: true, fullList: true, heroActives: true },
+        });
+        for (const row of ingredientRows) ingredientByProductId.set(row.productId, { fullList: row.fullList, heroActives: row.heroActives });
+
+        const kbRows = await prisma.productKbSnippet.findMany({
+          where: { productId: { in: candidateIds } },
+          orderBy: [{ sourceSheet: "asc" }, { field: "asc" }, { updatedAt: "desc" }],
+          select: { id: true, productId: true, sourceSheet: true, field: true, content: true, metadata: true },
+        });
+        for (const row of kbRows) {
+          const list = kbByProductId.get(row.productId) ?? [];
+          list.push({ id: row.id, source_sheet: row.sourceSheet, field: row.field, content: row.content, metadata: row.metadata });
+          kbByProductId.set(row.productId, list);
+        }
+      }
+    } catch {
+      // DB unavailable: keep empty KB/ingredient context.
+    }
+
+    const recommendations = top.slice(0, 5).map((c, idx) => {
+      const productId = c.sku.sku_id;
+      const product = buildAuroraProductEntityV1({
+        product_id: productId,
+        sku_id: productId,
+        brand: c.sku.brand,
+        name: c.sku.name,
+        category: c.sku.category,
+        availability: [],
+        price_usd: normalizeUsdPrice(c.sku.price),
+      });
+
+      const ing = ingredientByProductId.get(productId);
+      const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives);
+      const snippets = kbByProductId.get(productId) ?? [];
+      const kbProfile = buildKbProfile({
+        product_id: productId,
+        display_name: `${c.sku.brand} ${c.sku.name}`.trim(),
+        region: detectedRegion,
+        availability: [],
+        sku_risk_flags: c.sku.risk_flags,
+        sku_experience: c.sku.experience as any,
+        snippets,
+      });
+
+      const kbProfileCompact = shrinkKbProfileForLlm(kbProfile);
+      const expert = buildExpertKnowledgeFromKb(snippets);
+
+      const keyActives = uniqueStrings([
+        ...(Array.isArray(kbProfileCompact?.keyActives) ? kbProfileCompact?.keyActives : []),
+        ...(expert?.key_actives ? String(expert.key_actives).split("|").map((s) => s.trim()) : []),
+        ...(Array.isArray((ingCtx as any)?.hero_actives) ? ((ingCtx as any).hero_actives as unknown[]).map((v) => String(v)) : []),
+      ]).slice(0, 8);
+
+      const sensitivityFlags = uniqueStrings([
+        ...(Array.isArray(kbProfileCompact?.sensitivityFlags) ? kbProfileCompact?.sensitivityFlags : []),
+        ...(expert?.sensitivity_flags ? String(expert.sensitivity_flags).split("|").map((s) => s.trim()) : []),
+        ...(c.sku.risk_flags || []),
+      ]).slice(0, 10);
+
+      const priceUsd = normalizeUsdPrice(c.sku.price);
+      const notes = makeNotes({ productName: product.display_name, actives: keyActives, risk_flags: c.sku.risk_flags, priceUsd, idx });
+
+      return {
+        slot: "other",
+        step: c.sku.category,
+        score: Math.max(0, Math.min(100, Math.round(c.score.total))),
+        sku: {
+          brand: product.brand,
+          name: product.name,
+          display_name: product.display_name,
+          sku_id: productId,
+          product_id: productId,
+          category: product.category,
+          availability: [],
+          price: product.price,
+        },
+        notes,
+        evidence_pack: {
+          ...(keyActives.length ? { keyActives } : {}),
+          ...(sensitivityFlags.length ? { sensitivityFlags } : {}),
+          ...(kbProfileCompact?.pairingRules?.length ? { pairingRules: kbProfileCompact.pairingRules } : {}),
+          ...(kbProfileCompact?.comparisonNotes?.length ? { comparisonNotes: kbProfileCompact.comparisonNotes } : {}),
+          ...(kbProfileCompact?.citations?.length ? { citations: kbProfileCompact.citations } : {}),
+        },
+        missing_info: [] as string[],
+      };
+    });
+
+    const missing_info: string[] = [];
+    if (!recentLogs.length) missing_info.push("recent_logs_missing");
+    missing_info.push("itinerary_unknown");
+    missing_info.push("analysis_missing");
+    if (recommendations.length < 5) missing_info.push("insufficient_candidates");
+
+    const evidence = {
+      science: {
+        key_ingredients: uniqueStrings(
+          recommendations.flatMap((r) => {
+            const pack = r.evidence_pack as any;
+            return Array.isArray(pack?.keyActives) ? pack.keyActives : [];
+          }),
+        ).slice(0, 10),
+        mechanisms: [],
+        fit_notes: [
+          userLang === "zh"
+            ? `基于画像：${skinType} / ${barrierImpaired ? "屏障受损" : "屏障稳定"} / ${profileSensitivity || "unknown"}`
+            : `Profile: ${skinType} / ${barrierImpaired ? "barrier impaired" : "barrier stable"} / ${profileSensitivity || "unknown"}`,
+        ],
+        risk_notes: barrierImpaired ? [userLang === "zh" ? "屏障受损时优先低刺激，逐步加量/加频。" : "Barrier-impaired: prioritize low irritation and ramp slowly."] : [],
+      },
+      social_signals: {
+        platform_scores: {},
+        typical_positive: [],
+        typical_negative: [],
+        risk_for_groups: [],
+      },
+      expert_notes: [],
+      confidence: recommendations.length >= 4 ? 0.72 : 0.6,
+      missing_info: [],
+    };
+
+    const answerJson = {
+      recommendations,
+      evidence,
+      confidence: evidence.confidence,
+      missing_info: uniqueStrings(missing_info),
+    };
+
+    const answer = JSON.stringify(answerJson);
+
+    return jsonResponse(
+      envelope({
+        query,
+        intent: "reco_products",
+        answer,
+        current_state: "S_SKU_BROWSING" satisfies AuroraState,
+        next_actions: buildNextActionsForState({ state: "S_SKU_BROWSING", language: userLang, hasAnchor: false }),
+        context: {
+          region_preference: detectedRegion,
+          desired_categories: desiredCategories,
+          env_stress: envStress,
+        },
+        structured: {
+          schema_version: "aurora.structured.v1",
+          parse: {
+            normalized_query: contextualQuery,
+            parse_confidence: 0.6,
+            normalized_query_language: languageTag,
+          },
+          alternatives: recommendations
+            .map((r) => r.sku)
+            .filter(Boolean)
+            .slice(0, 6)
+            .map((p: any) => ({
+              product: p,
+              similarity_score: 0,
+              tradeoffs: {
+                missing_actives: [],
+                added_benefits: [],
+                texture_finish_differences: [],
+                price_delta_usd: null,
+                availability_note: null,
+              },
+              evidence: { kb_citations: Array.isArray(p?.evidence_pack?.citations) ? p.evidence_pack.citations : [] },
+            })),
+        } satisfies AuroraStructuredResultV1,
+      }),
+    );
+  }
+
   const userLang = detectUserLanguage(profileText);
   const languageTag = toAuroraLanguageTag(userLang);
   const envelope = <T extends Record<string, unknown>>(payload: T) =>
@@ -4169,6 +4670,47 @@ export async function POST(req: Request) {
     }
 
     const dbAll = await getSkuDatabase();
+
+    const ingredientSearchQuery = activeMentions.length ? pickIngredientSearchQueryFromActiveMentions(activeMentions) : null;
+    const activeNameTokens = activeMentions.length ? buildActiveMatchTokens(activeMentions) : [];
+    let ingredient_seed: IngredientSearchOutputV1 | null = null;
+    let ingredient_seed_error: string | null = null;
+
+    // If the user explicitly asks for an active (e.g., niacinamide), seed the pool from a deterministic ingredient search.
+    // This prevents the shortlist from drifting to unrelated "high scoring" products that don't contain the requested active.
+    if (ingredientSearchQuery && process.env.DATABASE_URL && !process.env.DATABASE_URL.includes("${{")) {
+      try {
+        ingredient_seed = await ingredientSearchV1({
+          schema_version: "aurora.ingredient_search.v1",
+          query: ingredientSearchQuery,
+          region: detectedRegion,
+          limit: 40,
+          filters: { include_kb_snippets: true },
+        });
+      } catch (e) {
+        ingredient_seed_error = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    const ingredientSeedIds = new Set<string>((ingredient_seed?.hits ?? []).map((h) => h.product_id));
+    if (ingredientSeedIds.size) {
+      const skuById = new Map<string, SkuVector>();
+      for (const sku of dbAll) skuById.set(sku.sku_id, sku);
+
+      const bestById = new Map<string, RetrievedSku>();
+      for (const r of retrieved) bestById.set(r.product_id, r);
+
+      for (const hit of ingredient_seed?.hits ?? []) {
+        const sku = skuById.get(hit.product_id);
+        if (!sku) continue;
+        const prev = bestById.get(hit.product_id);
+        const availability = prev?.availability?.length ? prev.availability : [];
+        const similarity = Math.max(prev?.similarity ?? 0, clamp01(hit.score));
+        bestById.set(hit.product_id, { product_id: hit.product_id, sku, similarity, availability });
+      }
+
+      retrieved = Array.from(bestById.values());
+    }
     if (retrieved.length === 0) {
       retrieved = dbAll
         .filter((s) => desiredCategories.includes(s.category))
@@ -4186,13 +4728,77 @@ export async function POST(req: Request) {
     if (sensitive) scored = scored.filter((r) => !r.sku.risk_flags.includes("alcohol"));
     if (barrierImpaired) scored = scored.filter((r) => !r.sku.risk_flags.includes("high_irritation") && (r.sku.social_stats.burn_rate ?? 0) <= 0.1);
 
+    let activeCoverageMissing = false;
+    if (activeMentions.length) {
+      const activeOnly = scored.filter((r) => {
+        if (ingredientSeedIds.has(r.product_id)) return true;
+        if (!activeNameTokens.length) return false;
+        return matchesAnyToken(`${r.sku.brand} ${r.sku.name}`, activeNameTokens);
+      });
+
+      // If we have *any* plausible active-matching candidates, only recommend from those.
+      // (If we don't, we'll fall back to the full pool, but we should be explicit about missing coverage.)
+      if (activeOnly.length) scored = activeOnly;
+      else activeCoverageMissing = true;
+    }
+
+    if (activeCoverageMissing) {
+      const questions: ClarificationQuestion[] =
+        userLang === "zh"
+          ? [
+              {
+                id: "active_strict",
+                question: `我在当前数据库里没找到足够的「含 ${activeMentions.join(" / ")}」的候选（按你当前的品类偏好：${desiredCategories.join(" / ")}）。你希望我怎么继续？`,
+                options: ["不一定要这个成分（给我更温和的提亮替代）", `一定要含 ${activeMentions.join(" / ")}（我可以放宽品类）`],
+              },
+            ]
+          : [
+              {
+                id: "active_strict",
+                question: `I couldn't find enough candidates that clearly contain ${activeMentions.join(" / ")} (given your current category preference: ${desiredCategories.join(" / ")}). How should I proceed?`,
+                options: ["Not strict (recommend gentler brightening alternatives)", `Strict (must contain ${activeMentions.join(" / ")}, I can broaden categories)`],
+              },
+            ];
+
+      const answer =
+        userLang === "zh"
+          ? ["为了避免推荐到不含该成分的产品，我需要你先选一个方向：", ...questions.map((q, i) => `${i + 1}) ${q.question}`), "你直接点选/回复选项即可。"].join("\n")
+          : ["To avoid recommending products that don't contain the requested active, please pick one direction:", ...questions.map((q, i) => `${i + 1}) ${q.question}`), "Reply with an option and I'll continue."].join("\n");
+
+      if (wantsStream) return streamResponse(answer);
+      return jsonResponse(
+        envelope({
+          query,
+          intent: "clarify",
+          answer,
+          current_state: "S_DIAGNOSIS" satisfies AuroraState,
+          next_actions: buildNextActionsFromClarificationQuestions(questions),
+          clarification: { questions, missing_fields: ["requested_actives_coverage"], region_preference: detectedRegion },
+          structured: {
+            schema_version: "aurora.structured.v1",
+            parse: {
+              normalized_query: contextualQuery,
+              parse_confidence: 0.4,
+              normalized_query_language: languageTag,
+            },
+          } satisfies AuroraStructuredResultV1,
+          context: {
+            user_query: query,
+            region_preference: detectedRegion,
+            desired_categories: desiredCategories,
+            active_mentions: activeMentions,
+            ...(ingredient_seed_error ? { ingredient_seed_error } : {}),
+          },
+        }),
+      );
+    }
+
     scored.sort((a, b) => b.score.total - a.score.total || b.similarity - a.similarity);
     const shortlistLimit = Math.min(8, Math.max(3, limit));
     const top = scored.slice(0, shortlistLimit);
 
     const candidateIds = uniqueStrings(top.map((c) => c.product_id)).filter((id) => looksLikeUuid(id));
 
-    const ingredientSearchQuery = activeMentions.length ? pickIngredientSearchQueryFromActiveMentions(activeMentions) : null;
     let ingredient_search: IngredientSearchOutputV1 | null = null;
     let ingredient_search_error: string | null = null;
     if (ingredientSearchQuery && candidateIds.length) {
