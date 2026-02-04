@@ -11,6 +11,9 @@ def _as_list(value: Any) -> List[Any]:
 def _as_dict(value: Any) -> Dict[str, Any]:
   return value if isinstance(value, dict) else {}
 
+def _non_empty_str(value: Any) -> str:
+  return str(value or "").strip()
+
 
 def _normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
   # Keep keys aligned with worker/ingest.py::load_input_skus_from_json
@@ -40,15 +43,59 @@ def split_pack(pack: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[st
   ingest_ready = _as_dict(pack.get("ingest_ready"))
   needs_research = _as_dict(pack.get("needs_research"))
 
-  ready_items = [_normalize_item(i) for i in _as_list(ingest_ready.get("items")) if isinstance(i, dict)]
-  research_items = [_normalize_item(i) for i in _as_list(needs_research.get("items")) if isinstance(i, dict)]
+  ready_items_raw = [_normalize_item(i) for i in _as_list(ingest_ready.get("items")) if isinstance(i, dict)]
+  research_items_raw = [_normalize_item(i) for i in _as_list(needs_research.get("items")) if isinstance(i, dict)]
 
-  # Keep only items with ingredients_text for the ready list.
-  ready_items = [i for i in ready_items if str(i.get("brand") or "").strip() and str(i.get("name") or "").strip() and str(i.get("ingredients_text") or "").strip()]
+  # Merge duplicates across sections by (brand,name). Prefer ingest_ready, then fill missing values from needs_research.
+  merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+  order: List[Tuple[str, str]] = []
 
-  # For the research list, ensure the required fields exist (blank placeholders are fine).
+  def key_for(i: Dict[str, Any]) -> Tuple[str, str]:
+    return (_non_empty_str(i.get("brand")).lower(), _non_empty_str(i.get("name")).lower())
+
+  def merge_into(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for k, v in other.items():
+      if k not in out or out.get(k) in (None, "", 0, [], {}):
+        out[k] = v
+      elif k in ("missing_fields",) and isinstance(out.get(k), list) and isinstance(v, list):
+        # merge unique
+        seen = set(str(x) for x in out[k])
+        for x in v:
+          sx = str(x)
+          if sx not in seen:
+            seen.add(sx)
+            out[k].append(x)
+    return out
+
+  for item in ready_items_raw + research_items_raw:
+    b = _non_empty_str(item.get("brand"))
+    n = _non_empty_str(item.get("name"))
+    if not b or not n:
+      continue
+    k = key_for(item)
+    if k not in merged:
+      merged[k] = item
+      order.append(k)
+    else:
+      merged[k] = merge_into(merged[k], item)
+
+  all_items = [merged[k] for k in order]
+
+  # Ready list: any item (from either section) with ingredients_text.
+  ready_items = [
+    i
+    for i in all_items
+    if _non_empty_str(i.get("brand")) and _non_empty_str(i.get("name")) and _non_empty_str(i.get("ingredients_text"))
+  ]
+
+  # Research list: items still missing ingredients_text; ensure required fields exist (blank placeholders are fine).
   normalized_research: List[Dict[str, Any]] = []
-  for i in research_items:
+  for i in all_items:
+    if not _non_empty_str(i.get("brand")) or not _non_empty_str(i.get("name")):
+      continue
+    if _non_empty_str(i.get("ingredients_text")):
+      continue
     i.setdefault("ingredients_text", "")
     i.setdefault("price_usd", 0)
     i.setdefault("price_cny", 0)
@@ -86,4 +133,3 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-
