@@ -3755,6 +3755,18 @@ export async function POST(req: Request) {
 
     const profile = bffContext.profile || {};
     const recentLogs = bffContext.recent_logs || [];
+    const analysisSummaryRaw =
+      (bffContext.meta && (bffContext.meta as any).analysis_summary) ||
+      (bffContext.meta && (bffContext.meta as any).analysisSummary) ||
+      (profile as any).analysis_summary ||
+      (profile as any).analysisSummary ||
+      (profile as any).last_analysis ||
+      (profile as any).lastAnalysis ||
+      null;
+    const analysisSummary =
+      analysisSummaryRaw && typeof analysisSummaryRaw === "object" && !Array.isArray(analysisSummaryRaw)
+        ? (analysisSummaryRaw as Record<string, unknown>)
+        : null;
 
     const profileSkinType = typeof profile.skinType === "string" ? profile.skinType.trim().toLowerCase() : "";
     const skinType: SkinType =
@@ -3898,6 +3910,27 @@ export async function POST(req: Request) {
     };
     const logsSummary = summarizeRecentLogs();
 
+    const summarizeAnalysis = () => {
+      if (!analysisSummary) return null;
+      const features = Array.isArray((analysisSummary as any).features) ? ((analysisSummary as any).features as unknown[]) : [];
+      const candidates = features
+        .map((f) => (f && typeof f === "object" && !Array.isArray(f) ? (f as any) : null))
+        .filter(Boolean)
+        .map((f) => ({
+          observation: typeof f.observation === "string" ? f.observation.trim() : "",
+          confidence: typeof f.confidence === "string" ? f.confidence.trim() : "",
+        }))
+        .filter((f) => Boolean(f.observation));
+
+      const confRank: Record<string, number> = { pretty_sure: 0, somewhat_sure: 1, not_sure: 2 };
+      candidates.sort((a, b) => (confRank[a.confidence] ?? 9) - (confRank[b.confidence] ?? 9));
+      const top = candidates[0]?.observation || "";
+      if (!top) return null;
+      const text = userLang === "zh" ? `上次肤况分析：${top}` : `Last skin analysis: ${top}`;
+      return text.length > 160 ? `${text.slice(0, 157)}…` : text;
+    };
+    const analysisSummaryLine = summarizeAnalysis();
+
     const pickHeadlineActive = (actives: string[]) => {
       const items = actives.map((a) => a.trim()).filter(Boolean);
       if (!items.length) return null;
@@ -3939,6 +3972,10 @@ export async function POST(req: Request) {
       notes.push(profileLine);
 
       if (goalsLabel && notes.length < 4) notes.push(goalsLabel);
+
+      if (input.idx === 0 && analysisSummaryLine && notes.length < 4) {
+        notes.push(analysisSummaryLine);
+      }
 
       if (input.idx === 0 && logsSummary && notes.length < 4) {
         notes.push(logsSummary);
@@ -4097,6 +4134,10 @@ export async function POST(req: Request) {
           reasons.push(userLang === "zh" ? `最近 7 天趋势：${logsSummary.replace(/^Recent logs:\s*/i, "")}` : logsSummary);
         }
 
+        if (idx === 0 && analysisSummaryLine) {
+          reasons.push(analysisSummaryLine);
+        }
+
         if (budgetTier) {
           if (priceUsd != null && budgetTierCny != null) {
             const estCny = Math.round(priceUsd * USD_TO_CNY);
@@ -4138,10 +4179,11 @@ export async function POST(req: Request) {
     });
 
     const missing_info: string[] = [];
-    if (!recentLogs.length) missing_info.push("recent_logs_missing");
-    missing_info.push("itinerary_unknown");
-    missing_info.push("analysis_missing");
-    if (recommendations.length < 5) missing_info.push("insufficient_candidates");
+    const warnings: string[] = [];
+    if (!recentLogs.length) warnings.push("recent_logs_missing");
+    warnings.push("itinerary_unknown");
+    if (!analysisSummary) warnings.push("analysis_missing");
+    if (recommendations.length < 5) warnings.push("insufficient_candidates");
 
     const evidence = {
       science: {
@@ -4175,6 +4217,7 @@ export async function POST(req: Request) {
       evidence,
       confidence: evidence.confidence,
       missing_info: uniqueStrings(missing_info),
+      warnings: uniqueStrings(warnings),
     };
 
     const answer = JSON.stringify(answerJson);
