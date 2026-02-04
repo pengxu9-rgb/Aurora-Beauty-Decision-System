@@ -143,6 +143,7 @@ type AuroraStructuredResultV1 = {
   analyze?: AuroraAnalyzeResultV1;
   alternatives?: AuroraAlternativeV1[];
   ingredient_search?: IngredientSearchOutputV1;
+  external_verification?: ExternalVerification;
   conflicts?: ConflictDetectorOutputV1;
   kb_requirements_check?: {
     missing_fields: string[];
@@ -2211,9 +2212,102 @@ type ScientificCitation = {
 
 type ExternalVerification = { query: string; citations: ScientificCitation[]; error?: string; note?: string };
 
-// Tool stub (mock ok): future hook for scientific citations.
+const SCI_CIT_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SCI_CIT_CACHE = new Map<string, { ts: number; value: { query: string; citations: ScientificCitation[] } }>();
+
+async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<unknown> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    return (await res.json()) as unknown;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function pickPubMedSearchTerm(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return trimmed;
+
+  // If this looks like a single-ingredient token, bias results towards topical dermatology.
+  const looksLikeToken = /^[a-z0-9 .%+-]+$/i.test(trimmed) && trimmed.length <= 40 && !trimmed.includes(" ");
+  if (looksLikeToken) return `${trimmed} topical skin`;
+
+  return trimmed;
+}
+
+// Scientific citations via PubMed E-utilities (best-effort).
 async function getScientificCitation(input: { query: string }): Promise<{ query: string; citations: ScientificCitation[] }> {
-  return { query: input.query, citations: [] };
+  const raw = String(input.query ?? "");
+  const query = pickPubMedSearchTerm(raw);
+  if (!query) return { query: raw, citations: [] };
+
+  const cacheKey = query.toLowerCase();
+  const cached = SCI_CIT_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.ts < SCI_CIT_CACHE_TTL_MS) return cached.value;
+
+  if ((process.env.AURORA_DISABLE_CITATIONS ?? "").trim() === "true") {
+    const out = { query, citations: [] };
+    SCI_CIT_CACHE.set(cacheKey, { ts: Date.now(), value: out });
+    return out;
+  }
+
+  const base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
+  const tool = "AuroraBeautyDecisionSystem";
+
+  const esearchUrl =
+    `${base}/esearch.fcgi?db=pubmed&retmode=json&retmax=5&sort=relevance&tool=${encodeURIComponent(tool)}&term=` +
+    encodeURIComponent(query);
+  const esearchJson = (await fetchJsonWithTimeout(esearchUrl, 2500)) as any;
+  const idlistRaw = esearchJson?.esearchresult?.idlist;
+  const ids = Array.isArray(idlistRaw) ? (idlistRaw as string[]).filter((x) => typeof x === "string" && x.trim()) : [];
+  if (!ids.length) {
+    const out = { query, citations: [] };
+    SCI_CIT_CACHE.set(cacheKey, { ts: Date.now(), value: out });
+    return out;
+  }
+
+  const esummaryUrl =
+    `${base}/esummary.fcgi?db=pubmed&retmode=json&tool=${encodeURIComponent(tool)}&id=` +
+    encodeURIComponent(ids.slice(0, 5).join(","));
+  const esummaryJson = (await fetchJsonWithTimeout(esummaryUrl, 2500)) as any;
+
+  const result = esummaryJson?.result ?? null;
+  const uidsRaw = result?.uids;
+  const uids = Array.isArray(uidsRaw) ? (uidsRaw as string[]).filter((x) => typeof x === "string" && x.trim()) : ids;
+
+  const citations: ScientificCitation[] = [];
+  for (const uid of uids.slice(0, 5)) {
+    const item = result?.[uid];
+    if (!item || typeof item !== "object") continue;
+
+    const title = typeof item.title === "string" ? item.title.trim() : "";
+    if (!title) continue;
+
+    const pubdate = typeof item.pubdate === "string" ? item.pubdate : "";
+    const yearMatch = pubdate.match(/(19|20)\d{2}/);
+    const year = yearMatch ? Number(yearMatch[0]) : undefined;
+
+    const source = typeof item.fulljournalname === "string" && item.fulljournalname.trim()
+      ? item.fulljournalname.trim()
+      : typeof item.source === "string" && item.source.trim()
+        ? item.source.trim()
+        : undefined;
+
+    citations.push({
+      title,
+      source,
+      year,
+      url: `https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(uid)}/`,
+      note: `PMID:${uid}`,
+    });
+  }
+
+  const out = { query, citations };
+  SCI_CIT_CACHE.set(cacheKey, { ts: Date.now(), value: out });
+  return out;
 }
 
 async function maybeGetExternalVerification(input: { query: string; enabled: boolean }): Promise<ExternalVerification | null> {
@@ -4779,8 +4873,11 @@ export async function POST(req: Request) {
   }
 
   if (wantsScienceOnly) {
-    const external_verification = await maybeGetExternalVerification({ query, enabled: true });
     const ingredientSearchQuery = pickIngredientSearchQueryFromActiveMentions(activeMentions);
+    const external_verification = await maybeGetExternalVerification({
+      query: ingredientSearchQuery ?? "",
+      enabled: Boolean(ingredientSearchQuery),
+    });
     let ingredient_search: IngredientSearchOutputV1 | null = null;
     let ingredient_search_error: string | null = null;
     if (ingredientSearchQuery) {
@@ -4884,6 +4981,7 @@ export async function POST(req: Request) {
             parse_confidence: 0,
             normalized_query_language: languageTag,
           },
+          ...(external_verification ? { external_verification } : {}),
           ...(ingredient_search ? { ingredient_search } : {}),
         } satisfies AuroraStructuredResultV1,
       }),
