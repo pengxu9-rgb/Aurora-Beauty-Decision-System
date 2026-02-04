@@ -3343,6 +3343,7 @@ function buildFallbackRoutineCheckAnswer(input: {
   query: string;
   regionLabel: string;
   language: UserLanguage;
+  conflict_detector?: ConflictDetectorOutputV1 | null;
   detected: { sensitive_skin: boolean; barrier_impaired: boolean };
   anchor: {
     brand: string;
@@ -3415,6 +3416,21 @@ function buildFallbackRoutineCheckAnswer(input: {
     return t("Start 2–3 nights/week, then increase as tolerated.", "先从每周 2–3 晚开始，耐受后再加频。");
   })();
 
+  const conflictMessages = (() => {
+    const conflicts = input.conflict_detector?.conflicts ?? [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const c of conflicts) {
+      const msg = typeof c?.message === "string" ? c.message.trim() : "";
+      if (!msg) continue;
+      const key = msg.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(msg);
+    }
+    return out;
+  })();
+
   const lines: string[] = [];
   lines.push(t("✅ Routine integration for:", "✅ 流程整合："));
   lines.push(`- ${input.anchor.brand} ${input.anchor.name}${cite}`);
@@ -3445,14 +3461,39 @@ function buildFallbackRoutineCheckAnswer(input: {
 
   lines.push("");
   lines.push(t("⚠️ Avoid mixing / conflicts:", "⚠️ 避免叠加/冲突："));
+  const pushed = new Set<string>();
+  const pushRule = (rule: string) => {
+    const r = rule.trim();
+    if (!r) return;
+    const key = r.toLowerCase();
+    if (pushed.has(key)) return;
+    pushed.add(key);
+    lines.push(`- ${r}`);
+  };
+
+  if (conflictMessages.length) {
+    lines.push(t("🧪 Conflict detector (based on your routine mentions):", "🧪 冲突检测（基于你提到的日常/晚间活性）："));
+    for (const msg of conflictMessages.slice(0, 3)) pushRule(msg);
+  }
+
   if (avoid.length) {
-    for (const rule of avoid.slice(0, 6)) lines.push(`- ${localizeAvoidRule(rule)}`);
+    for (const rule of avoid.slice(0, 6)) pushRule(localizeAvoidRule(rule));
   } else if (activeLike) {
-    lines.push(t("- Do not stack multiple strong acids/retinoids in the same night.", "- 同一晚不要叠加强酸/高强度维A类。"));
-    lines.push(t("- If you use copper peptides, separate from direct acids / pure L-ascorbic acid.", "- 如果你同时用蓝铜肽，尽量与直酸/纯左旋维C错开（AM/PM 或隔天）。"));
+    pushRule(t("Do not stack multiple strong acids/retinoids in the same night.", "同一晚不要叠加强酸/高强度维A类。"));
+    pushRule(
+      t(
+        "If you use copper peptides, separate from direct acids / pure L-ascorbic acid.",
+        "如果你同时用蓝铜肽，尽量与直酸/纯左旋维C错开（AM/PM 或隔天）。",
+      ),
+    );
   } else {
-    lines.push(t("- Generally compatible; no major conflicts with most routines.", "- 通常兼容性很好：一般没有明显冲突，可与大多数流程搭配。"));
-    lines.push(t("- If you’re on strong acids/retinoids and you feel stinging, separate to different nights.", "- 如果你同时在用强酸/维A且出现刺痛，就把它们错开到不同晚用。"));
+    pushRule(t("Generally compatible; no major conflicts with most routines.", "通常兼容性很好：一般没有明显冲突，可与大多数流程搭配。"));
+    pushRule(
+      t(
+        "If you’re on strong acids/retinoids and you feel stinging, separate to different nights.",
+        "如果你同时在用强酸/维A且出现刺痛，就把它们错开到不同晚用。",
+      ),
+    );
   }
 
   lines.push("");
@@ -6183,6 +6224,7 @@ export async function POST(req: Request) {
 	          query,
 	          regionLabel,
 	          language: userLang,
+	          conflict_detector,
 	          detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired },
 	          anchor: {
 	            brand: anchor.brand,
