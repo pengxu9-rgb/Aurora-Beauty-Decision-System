@@ -4112,24 +4112,55 @@ export async function POST(req: Request) {
         const explainActive = (active: string) => {
           const a = String(active ?? "").toLowerCase();
           if (!a) return null;
-          if (a.includes("tranexamic") || a.includes("txa")) return userLang === "zh" ? "传明酸：更偏向淡化色沉/痘印（通常耐受更好）。" : "Tranexamic acid: targets discoloration/post-acne marks with generally good tolerance.";
+          if (a.includes("tranexamic") || a.includes("txa"))
+            return userLang === "zh"
+              ? "主效成分：传明酸——更偏向淡化色沉/痘印（通常更耐受）。"
+              : "Most effective active: Tranexamic acid — targets discoloration/post-acne marks with generally good tolerance.";
           if (a.includes("niacinamide") || a.includes("nicotinamide"))
-            return userLang === "zh" ? "烟酰胺：控油/毛孔观感 + 均匀肤色；高浓度可能刺痛，建议从低频开始。" : "Niacinamide: oil-control + tone-evening; higher % can irritate—start slowly.";
-          if (a.includes("azelaic")) return userLang === "zh" ? "壬二酸：对痘痘/泛红/色沉都有帮助，但敏感期可能刺痛。" : "Azelaic acid: helps acne/redness/discoloration; can sting if barrier is irritated.";
-          if (a.includes("salicy") || a.includes("bha")) return userLang === "zh" ? "水杨酸：更适合粉刺/闭口；屏障受损时可能刺激，注意频率。" : "BHA (salicylic acid): targets clogged pores; can irritate if barrier is impaired—use cautiously.";
-          if (a.includes("vitamin c") || a.includes("ascorb")) return userLang === "zh" ? "维C：提亮/抗氧化；屏障受损时更容易刺痛，建议温和衍生物或等屏障稳定再用。" : "Vitamin C: brightening/antioxidant; can sting if barrier is impaired—prefer gentler derivatives or wait.";
+            return userLang === "zh"
+              ? "主效成分：烟酰胺——控油/毛孔观感 + 均匀肤色；高浓度可能刺痛，建议从低频开始。"
+              : "Most effective active: Niacinamide — oil-control + tone-evening; higher % can irritate—start slowly.";
+          if (a.includes("azelaic"))
+            return userLang === "zh"
+              ? "主效成分：壬二酸——对痘痘/泛红/色沉都有帮助，但敏感期可能刺痛。"
+              : "Most effective active: Azelaic acid — helps acne/redness/discoloration; can sting if barrier is irritated.";
+          if (a.includes("salicy") || a.includes("bha"))
+            return userLang === "zh"
+              ? "主效成分：水杨酸——更适合粉刺/闭口；屏障受损时可能刺激，注意频率。"
+              : "Most effective active: BHA (salicylic acid) — targets clogged pores; can irritate if barrier is impaired—use cautiously.";
+          if (a.includes("vitamin c") || a.includes("ascorb"))
+            return userLang === "zh"
+              ? "主效成分：维C——提亮/抗氧化；屏障受损时更容易刺痛，建议温和衍生物或等屏障稳定再用。"
+              : "Most effective active: Vitamin C — brightening/antioxidant; can sting if barrier is impaired—prefer gentler derivatives or wait.";
           if (a.includes("retinol") || a.includes("retinal") || a.includes("adapalene"))
-            return userLang === "zh" ? "维A类：更偏向痘痘/抗老；屏障受损时刺激概率更高，建议先修护再上。" : "Retinoids: acne/anti-aging; higher irritation risk—better after barrier is stable.";
-          if (a.includes("panthenol") || /\bb5\b/.test(a)) return userLang === "zh" ? "维B5：偏修护/舒缓，通常更适合屏障不稳定期。" : "B5 (panthenol): barrier-supporting + soothing, typically good during barrier issues.";
-          if (a.includes("ceramide")) return userLang === "zh" ? "神经酰胺：屏障脂质补充，偏修护。" : "Ceramides: replenishes barrier lipids for repair.";
-          if (a.includes("hyal")) return userLang === "zh" ? "透明质酸：补水为主，刺激性低。" : "Hyaluronic acid: hydration-focused with low irritation risk.";
+            return userLang === "zh"
+              ? "主效成分：维A类——更偏向痘痘/抗老；屏障受损时刺激概率更高，建议先修护再上。"
+              : "Most effective active: Retinoids — acne/anti-aging; higher irritation risk—better after barrier is stable.";
+          if (a.includes("panthenol") || /\bb5\b/.test(a))
+            return userLang === "zh"
+              ? "主效成分：维B5——偏修护/舒缓，通常更适合屏障不稳定期。"
+              : "Most effective active: B5 (panthenol) — barrier-supporting + soothing, typically good during barrier issues.";
+          if (a.includes("ceramide"))
+            return userLang === "zh"
+              ? "主效成分：神经酰胺——补充屏障脂质，偏修护。"
+              : "Most effective active: Ceramides — replenishes barrier lipids for repair.";
+          if (a.includes("hyal"))
+            return userLang === "zh"
+              ? "主效成分：透明质酸——补水为主，刺激性低。"
+              : "Most effective active: Hyaluronic acid — hydration-focused with low irritation risk.";
           return null;
         };
 
         if (headline) {
           const expl = explainActive(headline);
           if (expl) reasons.push(expl);
-          else reasons.push(userLang === "zh" ? `关键成分倾向：${headline}（基于 KB/成分信息提取）` : `Key active focus: ${headline} (from KB/ingredients signals).`);
+          else reasons.push(userLang === "zh" ? `主效成分：${headline}（基于 KB/成分信息提取）` : `Most effective active: ${headline} (from KB/ingredients signals).`);
+        } else if (idx === 0 && !keyActives.length) {
+          reasons.push(
+            userLang === "zh"
+              ? "主效成分：未知（KB/成分信息缺失，推荐置信度会更低）。"
+              : "Most effective active: unknown (KB/ingredients missing → lower confidence).",
+          );
         }
 
         if (goalSet.size) {
@@ -4148,12 +4179,20 @@ export async function POST(req: Request) {
           );
         }
 
-        if (idx === 0 && routineText && (routineHasRetinoid || routineHasAcids || routineHasBpo)) {
-          const line =
-            userLang === "zh"
-              ? "与你现有流程兼容：如在用维A/酸/过氧化苯甲酰，避免同晚叠加；建议错开使用并从低频开始。"
-              : "Routine compatibility: if you're already using retinoids/acids/BPO, avoid stacking on the same night—alternate and start low-frequency.";
-          reasons.push(line);
+        if (idx === 0 && routineText) {
+          if (routineHasRetinoid || routineHasAcids || routineHasBpo) {
+            const line =
+              userLang === "zh"
+                ? "与你现有流程兼容：如在用维A/酸/过氧化苯甲酰，避免同晚叠加；建议错开使用并从低频开始。"
+                : "Routine compatibility: if you're already using retinoids/acids/BPO, avoid stacking on the same night—alternate and start low-frequency.";
+            reasons.push(line);
+          } else {
+            reasons.push(
+              userLang === "zh"
+                ? "基于你当前在用流程：优先少改动，先从“加一件最关键的产品”开始。"
+                : "Based on your current routine: keep changes minimal—start by adding just one key product.",
+            );
+          }
         }
 
         if (idx === 0 && logsSummary) {
@@ -4165,8 +4204,48 @@ export async function POST(req: Request) {
         }
 
         if (idx === 0 && hasItinerary) {
-          const short = itineraryText.length > 120 ? `${itineraryText.slice(0, 120)}…` : itineraryText;
-          reasons.push(userLang === "zh" ? `行程/环境：${short}` : `Upcoming plan: ${short}`);
+          const t = itineraryText.toLowerCase();
+          const cues: string[] = [];
+          const coldDry = /\b(cold|dry|winter)\b|冷|干|冬/.test(t);
+          const hotHumid = /\b(hot|humid|tropical)\b|热|潮|湿/.test(t);
+          const outdoorSun = /\b(outdoor|sun|uv|hiking|beach)\b|户外|太阳|紫外|海边/.test(t);
+          const travel = /\b(travel|flight|plane)\b|出差|旅行|飞机/.test(t);
+
+          if (coldDry) {
+            cues.push(
+              userLang === "zh"
+                ? "冷/干燥：加强保湿与封层，减少去角质与刺激性活性"
+                : "Cold/dry: increase hydration + barrier support; reduce exfoliation/irritating actives",
+            );
+          }
+          if (hotHumid) {
+            cues.push(
+              userLang === "zh"
+                ? "热/潮湿：质地更清爽，注意控油与毛孔堵塞"
+                : "Hot/humid: prefer lighter textures; watch oil/clogging",
+            );
+          }
+          if (outdoorSun) {
+            cues.push(
+              userLang === "zh"
+                ? "户外：优先防晒与补涂，避免叠加高刺激活性"
+                : "Outdoors: prioritize SPF + reapplication; avoid stacking strong irritants",
+            );
+          }
+          if (travel) {
+            cues.push(
+              userLang === "zh"
+                ? "旅行：先保持流程更简单稳定，避免尝试全新高刺激产品"
+                : "Travel: keep routine stable/simple; avoid introducing new high‑irritation products",
+            );
+          }
+
+          if (cues.length) {
+            reasons.push(userLang === "zh" ? `行程/环境：${cues.slice(0, 2).join("；")}` : `Upcoming plan: ${cues.slice(0, 2).join(" · ")}`);
+          } else {
+            const short = itineraryText.length > 120 ? `${itineraryText.slice(0, 120)}…` : itineraryText;
+            reasons.push(userLang === "zh" ? `行程/环境：${short}` : `Upcoming plan: ${short}`);
+          }
         }
 
         if (budgetTier) {
