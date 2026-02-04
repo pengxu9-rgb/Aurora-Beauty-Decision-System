@@ -1016,11 +1016,15 @@ def infer_kb_canonical_key(label: str) -> Optional[str]:
     or "routine" in lower
     or "layer" in lower
     or "frequency" in lower
+    or "warning" in lower
+    or "caution" in lower
     or "用法" in raw
     or "搭配" in raw
     or "叠加" in raw
     or "频率" in raw
     or "注意事项" in raw
+    or "警示" in raw
+    or "警告" in raw
   ):
     return "usage"
 

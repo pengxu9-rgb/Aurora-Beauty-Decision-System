@@ -70,7 +70,24 @@ def infer_kb_canonical_key(snippet: Dict[str, Any]) -> KbCanonicalKey:
     return "key_actives"
   if any(k in label for k in ["comparison", "compare", "dupe", "替代", "平替", "对比", "竞品"]):
     return "comparison"
-  if any(k in label for k in ["usage", "routine", "layer", "frequency", "用法", "搭配", "叠加", "频率", "注意事项"]):
+  if any(
+    k in label
+    for k in [
+      "usage",
+      "routine",
+      "layer",
+      "frequency",
+      "warning",
+      "caution",
+      "用法",
+      "搭配",
+      "叠加",
+      "频率",
+      "注意事项",
+      "警示",
+      "警告",
+    ]
+  ):
     return "usage"
   if any(k in label for k in ["texture", "finish", "pilling", "质地", "清爽", "厚重", "搓泥", "成膜", "油腻"]):
     return "texture"
@@ -348,4 +365,3 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-
