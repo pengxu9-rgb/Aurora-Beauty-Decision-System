@@ -8,6 +8,7 @@ import type { SkinLog, UserProfile } from "@prisma/client";
 import { getSkuById, getSkuDatabase, resolveProductIdForSkuId } from "@/app/v1/decision/_lib";
 import { buildActiveMatchTokens, matchesAnyToken } from "@/lib/aurora/active-matches";
 import { buildScienceFallbackAnswerV1 } from "@/lib/aurora/science-fallback";
+import { simulateConflictsV1, type ConflictDetectorOutputV1 } from "@/lib/conflict-detector";
 import { calculateScore } from "@/lib/engine";
 import { calculateStressScore } from "@/lib/env-stress";
 import { ingredientSearchV1 } from "@/lib/ingredient-search";
@@ -142,6 +143,7 @@ type AuroraStructuredResultV1 = {
   analyze?: AuroraAnalyzeResultV1;
   alternatives?: AuroraAlternativeV1[];
   ingredient_search?: IngredientSearchOutputV1;
+  conflicts?: ConflictDetectorOutputV1;
   kb_requirements_check?: {
     missing_fields: string[];
     notes?: string[];
@@ -5252,6 +5254,17 @@ export async function POST(req: Request) {
       products_with_kb: evidencePacks.filter((p) => (p.citations?.length ?? 0) > 0).length,
     };
 
+    const conflict_detector = simulateConflictsV1(
+      {
+        schema_version: "aurora.conflicts.v1",
+        routine: {
+          am: routine_primary_with_evidence.am as unknown as Array<Record<string, unknown>>,
+          pm: routine_primary_with_evidence.pm as unknown as Array<Record<string, unknown>>,
+        },
+      },
+      { lang: languageTag },
+    );
+
     const wantsExternalVerification = detectDeepScienceQuestion(routineRequestText) && evidenceSummary.products_with_kb === 0;
     const external_verification = await maybeGetExternalVerification({ query: routineRequestText, enabled: wantsExternalVerification });
 
@@ -5361,6 +5374,7 @@ export async function POST(req: Request) {
         barrier_impaired: detectBarrierImpaired(routineProfileText),
       },
       user_profile_inferred: sanitizeUserForLlm(user),
+      conflict_detector,
       navigation: { current_state: "S_ROUTINE_CHECK" satisfies AuroraState },
       ...(external_verification ? { external_verification } : {}),
       routine_evidence_summary: evidenceSummary,
@@ -5436,6 +5450,7 @@ export async function POST(req: Request) {
           budget_usd_est: routineContextData.budget_usd_est,
           budget: routineContextData.budget,
           price_summary: routineContextData.price_summary,
+          conflict_detector,
           routine: routine_primary_with_evidence,
           routine_primary: routine_primary_with_evidence,
           routine_budget: routine_budget_with_evidence,
@@ -5449,6 +5464,7 @@ export async function POST(req: Request) {
             parse_confidence: 0.6,
             normalized_query_language: languageTag,
           },
+          conflicts: conflict_detector,
         } satisfies AuroraStructuredResultV1,
       }),
     );
