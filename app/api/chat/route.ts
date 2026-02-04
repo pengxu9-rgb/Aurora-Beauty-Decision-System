@@ -3788,7 +3788,9 @@ export async function POST(req: Request) {
 
     const detectedRegion = typeof profile.region === "string" && profile.region.trim() ? (profile.region.trim() as RegionPreference) : null;
     const regionLabel = detectedRegion ?? "Global";
-    const desiredCategories = inferDesiredCategories(bffContext.stripped_query || "");
+    // BFF reco_products is designed for "single-product picks" (not full routine steps).
+    // Keep it stable for the chatbox "Product picks" UI which assumes Serum/Treatment.
+    const desiredCategories: Array<SkuVector["category"]> = ["serum", "treatment"];
 
     const normalizeLogDate = (value: unknown): string | null => {
       if (typeof value !== "string") return null;
@@ -4010,11 +4012,72 @@ export async function POST(req: Request) {
       const priceUsd = normalizeUsdPrice(c.sku.price);
       const notes = makeNotes({ productName: product.display_name, actives: keyActives, risk_flags: c.sku.risk_flags, priceUsd, idx });
 
-      return {
-        slot: "other",
-        step: c.sku.category,
-        score: Math.max(0, Math.min(100, Math.round(c.score.total))),
-        sku: {
+      const makeReasons = () => {
+        const reasons: string[] = [];
+        const headline = pickHeadlineActive(keyActives);
+        const goalSet = new Set(goalStrings.map((g) => g.toLowerCase()));
+
+        const explainActive = (active: string) => {
+          const a = String(active ?? "").toLowerCase();
+          if (!a) return null;
+          if (a.includes("tranexamic") || a.includes("txa")) return userLang === "zh" ? "传明酸：更偏向淡化色沉/痘印（通常耐受更好）。" : "Tranexamic acid: targets discoloration/post-acne marks with generally good tolerance.";
+          if (a.includes("niacinamide") || a.includes("nicotinamide"))
+            return userLang === "zh" ? "烟酰胺：控油/毛孔观感 + 均匀肤色；高浓度可能刺痛，建议从低频开始。" : "Niacinamide: oil-control + tone-evening; higher % can irritate—start slowly.";
+          if (a.includes("azelaic")) return userLang === "zh" ? "壬二酸：对痘痘/泛红/色沉都有帮助，但敏感期可能刺痛。" : "Azelaic acid: helps acne/redness/discoloration; can sting if barrier is irritated.";
+          if (a.includes("salicy") || a.includes("bha")) return userLang === "zh" ? "水杨酸：更适合粉刺/闭口；屏障受损时可能刺激，注意频率。" : "BHA (salicylic acid): targets clogged pores; can irritate if barrier is impaired—use cautiously.";
+          if (a.includes("vitamin c") || a.includes("ascorb")) return userLang === "zh" ? "维C：提亮/抗氧化；屏障受损时更容易刺痛，建议温和衍生物或等屏障稳定再用。" : "Vitamin C: brightening/antioxidant; can sting if barrier is impaired—prefer gentler derivatives or wait.";
+          if (a.includes("retinol") || a.includes("retinal") || a.includes("adapalene"))
+            return userLang === "zh" ? "维A类：更偏向痘痘/抗老；屏障受损时刺激概率更高，建议先修护再上。" : "Retinoids: acne/anti-aging; higher irritation risk—better after barrier is stable.";
+          if (a.includes("panthenol") || /\bb5\b/.test(a)) return userLang === "zh" ? "维B5：偏修护/舒缓，通常更适合屏障不稳定期。" : "B5 (panthenol): barrier-supporting + soothing, typically good during barrier issues.";
+          if (a.includes("ceramide")) return userLang === "zh" ? "神经酰胺：屏障脂质补充，偏修护。" : "Ceramides: replenishes barrier lipids for repair.";
+          if (a.includes("hyal")) return userLang === "zh" ? "透明质酸：补水为主，刺激性低。" : "Hyaluronic acid: hydration-focused with low irritation risk.";
+          return null;
+        };
+
+        if (headline) {
+          const expl = explainActive(headline);
+          if (expl) reasons.push(expl);
+          else reasons.push(userLang === "zh" ? `关键成分倾向：${headline}（基于 KB/成分信息提取）` : `Key active focus: ${headline} (from KB/ingredients signals).`);
+        }
+
+        if (goalSet.size) {
+          const goalsLine =
+            userLang === "zh"
+              ? `目标匹配：${goalStrings.slice(0, 3).join(" / ")}`
+              : `Goal fit: ${goalStrings.slice(0, 3).join(" / ")}`;
+          reasons.push(goalsLine);
+        }
+
+        if (barrierImpaired) {
+          reasons.push(
+            userLang === "zh"
+              ? "屏障受损：优先低刺激路线（已避开高刺激/强酸候选），建议低频起步。"
+              : "Barrier impaired: prioritize low irritation (filtered out high-irritation/strong-acid options); start low and slow.",
+          );
+        }
+
+        if (idx === 0 && logsSummary) {
+          reasons.push(userLang === "zh" ? `最近 7 天趋势：${logsSummary.replace(/^Recent logs:\s*/i, "")}` : logsSummary);
+        }
+
+        if (budgetTier) {
+          if (priceUsd != null && budgetTierCny != null) {
+            const estCny = Math.round(priceUsd * USD_TO_CNY);
+            reasons.push(userLang === "zh" ? `预算参考：约¥${estCny}（以标价/快照估算）` : `Budget reference: ≈¥${estCny} (estimated from price).`);
+          } else {
+            reasons.push(userLang === "zh" ? `预算参考：${budgetTier}（价格信息不完整）` : `Budget reference: ${budgetTier} (price unknown).`);
+          }
+        }
+
+        return reasons.slice(0, 5);
+      };
+      const reasons = makeReasons();
+
+        return {
+          slot: "other",
+          step: c.sku.category,
+          score: Math.max(0, Math.min(100, Math.round(c.score.total))),
+          sku: {
           brand: product.brand,
           name: product.name,
           display_name: product.display_name,
@@ -4023,13 +4086,14 @@ export async function POST(req: Request) {
           category: product.category,
           availability: [],
           price: product.price,
-        },
-        notes,
-        evidence_pack: {
-          ...(keyActives.length ? { keyActives } : {}),
-          ...(sensitivityFlags.length ? { sensitivityFlags } : {}),
-          ...(kbProfileCompact?.pairingRules?.length ? { pairingRules: kbProfileCompact.pairingRules } : {}),
-          ...(kbProfileCompact?.comparisonNotes?.length ? { comparisonNotes: kbProfileCompact.comparisonNotes } : {}),
+          },
+          notes,
+          reasons,
+          evidence_pack: {
+            ...(keyActives.length ? { keyActives } : {}),
+            ...(sensitivityFlags.length ? { sensitivityFlags } : {}),
+            ...(kbProfileCompact?.pairingRules?.length ? { pairingRules: kbProfileCompact.pairingRules } : {}),
+            ...(kbProfileCompact?.comparisonNotes?.length ? { comparisonNotes: kbProfileCompact.comparisonNotes } : {}),
           ...(kbProfileCompact?.citations?.length ? { citations: kbProfileCompact.citations } : {}),
         },
         missing_info: [] as string[],
