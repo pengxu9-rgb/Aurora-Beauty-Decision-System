@@ -11,6 +11,7 @@ import { buildScienceFallbackAnswerV1 } from "@/lib/aurora/science-fallback";
 import { simulateConflictsV1, type ConflictDetectorOutputV1 } from "@/lib/conflict-detector";
 import { calculateScore } from "@/lib/engine";
 import { calculateStressScore } from "@/lib/env-stress";
+import { ingredientKbHealthV1, getIngredientResearchProfileV1, searchIngredientResearchV1 } from "@/lib/ingredient-research-kb";
 import { ingredientSearchV1 } from "@/lib/ingredient-search";
 import type { IngredientSearchOutputV1 } from "@/lib/ingredient-search-core";
 import { buildKbProfile, type KbProfile, type KbSnippet, inferKbCanonicalKey } from "@/lib/kb-profile";
@@ -87,6 +88,29 @@ type AuroraScienceEvidenceItemV1 = {
   mechanism?: string; // consensus summary (non-product-specific)
   targets?: string[];
   risks?: string[];
+  ingredient_research?: {
+    ingredient_id: string;
+    inci_name: string | null;
+    zh_name: string | null;
+    evidence_grade: string | null;
+    categories: string[];
+    primary_benefits: string[];
+    market_presence_notes: string | null;
+    social_buzz_notes: string | null;
+    representative_products: string | null;
+    top_claims: Array<{ claim_id: string; claim_text: string; claim_type: string | null; needs_citation: string | null }>;
+    top_products: Array<{ product_id: string; brand: string | null; product_name: string | null; product_rank: number | null }>;
+    suitability_rule: {
+      good_for: string | null;
+      caution_for: string | null;
+      avoid_for: string | null;
+      pairing_recommended: string | null;
+      pairing_conflicts: string | null;
+      layering_am_pm: string | null;
+      frequency: string | null;
+      safety_notes: string | null;
+    } | null;
+  };
   evidence: AuroraEvidenceRefV1[];
 };
 
@@ -2003,11 +2027,36 @@ function inferConsensusMechanism(active: string, lang: UserLanguage): { mechanis
   return {};
 }
 
-function buildScienceEvidenceFromKbProfile(input: {
+async function buildScienceEvidenceFromKbProfile(input: {
   kb_profile: Pick<KbProfile, "keyActives" | "sensitivityFlags" | "citations">;
   ingredients: IngredientContext | null;
   lang: UserLanguage;
 }) {
+  const splitPipes = (raw: string | null | undefined): string[] => {
+    if (!raw || typeof raw !== "string") return [];
+    return raw
+      .split("|")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 12);
+  };
+
+  const canonicalizeIngredientIdCandidate = (raw: string) => {
+    const s = String(raw ?? "")
+      .toLowerCase()
+      .replace(/['’]/g, "")
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+    return s.length > 80 ? s.slice(0, 80) : s;
+  };
+
+  const shouldSkipLookup = (raw: string) => {
+    const s = String(raw ?? "").trim().toLowerCase();
+    if (!s || s.length < 3) return true;
+    if (/^(aha|bha|pha|acid|acids|peptides|ceramides|fragrance|parfum|essential oils?)$/.test(s)) return true;
+    return false;
+  };
+
   const keyActives = Array.isArray(input.kb_profile.keyActives) ? input.kb_profile.keyActives : [];
   const head = input.ingredients?.head ?? [];
   const keys = keyActives.length ? keyActives.slice(0, 8) : head.slice(0, 6);
@@ -2015,20 +2064,173 @@ function buildScienceEvidenceFromKbProfile(input: {
   const sensitivityFlags = Array.isArray(input.kb_profile.sensitivityFlags) ? input.kb_profile.sensitivityFlags : [];
 
   const items: AuroraScienceEvidenceItemV1[] = [];
+
+  let health: Awaited<ReturnType<typeof ingredientKbHealthV1>> | null = null;
+  let kbReady = false;
+  try {
+    health = await ingredientKbHealthV1();
+    kbReady = Boolean(health.kb_ready);
+  } catch {
+    kbReady = false;
+  }
+
+  const profileCache = new Map<string, Awaited<ReturnType<typeof getIngredientResearchProfileV1>>>();
+  const resolveCache = new Map<string, string | null>();
+
+  const resolveIngredientIdForActive = async (activeKey: string): Promise<string | null> => {
+    const raw = String(activeKey ?? "").trim();
+    if (!raw) return null;
+    if (resolveCache.has(raw)) return resolveCache.get(raw) ?? null;
+
+    if (!kbReady || shouldSkipLookup(raw)) {
+      resolveCache.set(raw, null);
+      return null;
+    }
+
+    const candidateId = canonicalizeIngredientIdCandidate(raw);
+    let hits: Awaited<ReturnType<typeof searchIngredientResearchV1>>["hits"] = [];
+    try {
+      const search = await searchIngredientResearchV1(raw, 6);
+      hits = Array.isArray(search.hits) ? search.hits : [];
+    } catch {
+      hits = [];
+    }
+
+    let bestId: string | null = null;
+    let bestScore = -1;
+    for (const hit of hits) {
+      const hitId = String(hit?.ingredient_id ?? "").trim();
+      if (!hitId) continue;
+
+      const rawNorm = raw.toLowerCase();
+      let score = 0;
+      if (candidateId && hitId.toLowerCase() === candidateId) score += 8;
+      if (hit.inci_name && String(hit.inci_name).trim().toLowerCase() === rawNorm) score += 6;
+      if (hit.zh_name && String(hit.zh_name).trim() === raw) score += 6;
+      if (candidateId && hitId.toLowerCase().includes(candidateId)) score += 2;
+      if (hit.synonyms && String(hit.synonyms).toLowerCase().includes(rawNorm)) score += 1;
+      if (hit.inci_name && String(hit.inci_name).toLowerCase().includes(rawNorm)) score += 1;
+      if (hit.zh_name && String(hit.zh_name).includes(raw)) score += 1;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestId = hitId;
+      }
+    }
+
+    const resolved = bestScore >= 3 ? bestId : null;
+    resolveCache.set(raw, resolved);
+    return resolved;
+  };
+
+  const getProfile = async (ingredient_id: string) => {
+    const id = String(ingredient_id ?? "").trim();
+    if (!id) return null;
+    if (profileCache.has(id)) return profileCache.get(id) ?? null;
+    let p: Awaited<ReturnType<typeof getIngredientResearchProfileV1>> | null = null;
+    try {
+      p = health
+        ? await getIngredientResearchProfileV1(id, { claims_limit: 20, products_limit: 20, themes_limit: 10 }, { health })
+        : await getIngredientResearchProfileV1(id, { claims_limit: 20, products_limit: 20, themes_limit: 10 });
+    } catch {
+      p = null;
+    }
+    if (p) profileCache.set(id, p);
+    return p;
+  };
+
   for (const raw of keys) {
     if (!raw || typeof raw !== "string") continue;
     const mech = inferConsensusMechanism(raw, input.lang);
     const risks = uniqueByNormalizedKey([...(mech.risks ?? []), ...sensitivityFlags].filter(Boolean) as string[]);
+
+    const ingredient_id = await resolveIngredientIdForActive(raw);
+    const profile = ingredient_id ? await getProfile(ingredient_id) : null;
+
+    const ingredient = profile?.ingredient ?? null;
+    const claims = Array.isArray(profile?.claims) ? profile!.claims : [];
+    const topProducts = Array.isArray(profile?.top_products) ? profile!.top_products : [];
+    const suitability = profile?.suitability_rule ?? null;
+
+    const research =
+      profile && profile.kb_ready && ingredient
+        ? {
+            ingredient_id: profile.ingredient_id,
+            inci_name: ingredient.inci_name,
+            zh_name: ingredient.zh_name,
+            evidence_grade: ingredient.evidence_grade,
+            categories: splitPipes(ingredient.categories),
+            primary_benefits: splitPipes(ingredient.primary_benefits),
+            market_presence_notes: ingredient.market_presence_notes,
+            social_buzz_notes: ingredient.social_buzz_notes,
+            representative_products: ingredient.representative_products,
+            top_claims: claims
+              .filter((c) => hasText(c.claim_text))
+              .slice(0, 6)
+              .map((c) => ({
+                claim_id: c.claim_id,
+                claim_text: c.claim_text,
+                claim_type: c.claim_type,
+                needs_citation: c.needs_citation,
+              })),
+            top_products: topProducts
+              .filter((p) => hasText(p.brand) || hasText(p.product_name))
+              .slice(0, 8)
+              .map((p) => ({
+                product_id: p.product_id,
+                brand: p.brand,
+                product_name: p.product_name,
+                product_rank: p.product_rank,
+              })),
+            suitability_rule: suitability
+              ? {
+                  good_for: suitability.good_for,
+                  caution_for: suitability.caution_for,
+                  avoid_for: suitability.avoid_for,
+                  pairing_recommended: suitability.pairing_recommended,
+                  pairing_conflicts: suitability.pairing_conflicts,
+                  layering_am_pm: suitability.layering_am_pm,
+                  frequency: suitability.frequency,
+                  safety_notes: suitability.safety_notes,
+                }
+              : null,
+          }
+        : undefined;
+
+    const researchCitations = research
+      ? [
+          `ingredient_research:ingredient:${research.ingredient_id}`,
+          ...research.top_claims.map((c) => `ingredient_research:claim:${c.claim_id}`),
+          ...research.top_products.map((p) => `ingredient_research:product:${p.product_id}`),
+        ].slice(0, 16)
+      : [];
+
+    const evidence: AuroraEvidenceRefV1[] = [
+      ...(citations.length || researchCitations.length
+        ? [
+            {
+              kind: "kb" as const,
+              citations: uniqueByNormalizedKey([...citations, ...researchCitations]),
+            },
+          ]
+        : []),
+      {
+        kind: "consensus" as const,
+        note:
+          input.lang === "zh"
+            ? "机制描述为通用共识；具体浓度/工艺以产品实物/官网为准。"
+            : "Mechanism notes are general consensus; exact concentration/formulation depends on the SKU.",
+      },
+    ];
+
     items.push({
       key: raw,
       in_product: true,
       ...(mech.mechanism ? { mechanism: mech.mechanism } : {}),
       ...(mech.targets?.length ? { targets: mech.targets } : {}),
       ...(risks.length ? { risks } : {}),
-      evidence: [
-        ...(citations.length ? [{ kind: "kb", citations }] as const : []),
-        { kind: "consensus", note: input.lang === "zh" ? "机制描述为通用共识；具体浓度/工艺以产品实物/官网为准。" : "Mechanism notes are general consensus; exact concentration/formulation depends on the SKU." },
-      ],
+      ...(research ? { ingredient_research: research } : {}),
+      evidence,
     });
   }
   return items;
@@ -6070,7 +6272,7 @@ export async function POST(req: Request) {
             ? "该产品仅有 KB 笔记，缺少 vectors/embedding；无法进行 Aurora 打分与相似检索。"
             : "This product has KB notes but is missing vectors/embedding; Aurora scoring and similarity search are unavailable.",
         ],
-        science_evidence: buildScienceEvidenceFromKbProfile({ kb_profile, ingredients: kbOnlyIngredients, lang: userLang }),
+        science_evidence: await buildScienceEvidenceFromKbProfile({ kb_profile, ingredients: kbOnlyIngredients, lang: userLang }),
         social_signals: kbOnlySocial,
         expert_notes: buildExpertNotesV1({ expert_knowledge, kb_citations: kb_profile.citations }),
         how_to_use: buildHowToUseV1({ category: null, kb_profile, lang: userLang }),
@@ -6498,7 +6700,7 @@ export async function POST(req: Request) {
       verdict,
       confidence: explicitAnchorId ? 0.9 : highConfidenceAlias ? 0.8 : 0.6,
       reasons,
-      science_evidence: buildScienceEvidenceFromKbProfile({ kb_profile: anchorKbProfile, ingredients: anchorIngredientCtx, lang: userLang }),
+      science_evidence: await buildScienceEvidenceFromKbProfile({ kb_profile: anchorKbProfile, ingredients: anchorIngredientCtx, lang: userLang }),
       social_signals: anchorSocial,
       expert_notes: expertNotes,
       how_to_use: buildHowToUseV1({ category: anchorSku.category, kb_profile: anchorKbProfile, lang: userLang }),
