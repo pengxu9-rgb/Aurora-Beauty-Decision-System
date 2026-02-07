@@ -236,7 +236,7 @@ export async function getIngredientResearchProfileV1(
         SELECT *
         FROM ${tableRef(schema, "ingredient_products")}
         WHERE ingredient_id = ${ingredient_id}
-        ORDER BY ranking_value ASC NULLS LAST, product_id ASC
+        ORDER BY product_rank ASC NULLS LAST, product_id ASC
         LIMIT ${productsLimit}
       `,
     );
