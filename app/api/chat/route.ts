@@ -16,6 +16,7 @@ import { ingredientKbHealthV1, getIngredientResearchProfileV1, searchIngredientR
 import { ingredientSearchV1 } from "@/lib/ingredient-search";
 import type { IngredientSearchOutputV1 } from "@/lib/ingredient-search-core";
 import { buildKbProfile, type KbProfile, type KbSnippet, inferKbCanonicalKey } from "@/lib/kb-profile";
+import { canonicalizeRawIngredientText } from "@/lib/raw-ingredient-cleaning";
 import { prisma } from "@/lib/server/prisma";
 import { findSimilarSkus, findSimilarSkusByAnchorProductId, type RegionPreference } from "@/lib/vector-service";
 import type { Budget, EnvStressInputV1, MechanismKey, RiskFlag, SkinType, SkuScoreBreakdown, SkuVector, UserGoal, UserVector } from "@/types";
@@ -2843,6 +2844,7 @@ function readSourceRefFromSnippetMetadata(metadata: unknown): string | null {
 
 function pickRawIngredientFromSnippets(
   snippets: Array<KbSnippetForEvidence>,
+  fullList: unknown,
 ): { text: string | null; source_sheet: string | null; source_ref: string | null } {
   if (!Array.isArray(snippets) || snippets.length === 0) {
     return { text: null, source_sheet: null, source_ref: null };
@@ -2864,9 +2866,9 @@ function pickRawIngredientFromSnippets(
     candidates.find((x) => x.source_sheet === "ingredient_harvester") ??
     candidates[0];
 
-  const text = preferred.text ? preferred.text.slice(0, 600) : null;
+  const text = canonicalizeRawIngredientText(preferred.text, fullList);
   return {
-    text,
+    text: text ? text.slice(0, 600) : null,
     source_sheet: preferred.source_sheet,
     source_ref: preferred.source_ref,
   };
@@ -2891,7 +2893,7 @@ function summarizeIngredients(
   if (anyHas(["glycerin", "butylene glycol", "propylene glycol"])) highlights.push("Humectants (glycerin/glycols)");
   if (anyHas(["algae", "seaweed", "kelp", "laminaria"])) highlights.push("Algae/seaweed extract present");
 
-  const raw = pickRawIngredientFromSnippets(snippets);
+  const raw = pickRawIngredientFromSnippets(snippets, fullList);
   return {
     head,
     hero_actives: heroActives,

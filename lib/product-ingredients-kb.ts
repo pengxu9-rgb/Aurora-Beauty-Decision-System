@@ -1,6 +1,7 @@
 import "server-only";
 
 import { prisma } from "@/lib/server/prisma";
+import { canonicalizeRawIngredientText } from "@/lib/raw-ingredient-cleaning";
 
 type ProductRawIngredientSnippetV1 = {
   source_sheet: string;
@@ -48,9 +49,13 @@ function normalizeRawIngredientCandidates(
   }>
 ): ProductRawIngredientSnippetV1[] {
   const out: ProductRawIngredientSnippetV1[] = [];
+  const seen = new Set<string>();
   for (const item of snippets) {
-    const content = typeof item.content === "string" ? item.content.trim() : "";
+    const content = canonicalizeRawIngredientText(typeof item.content === "string" ? item.content : "");
     if (!content) continue;
+    const dedupKey = `${item.sourceSheet}::${content.toLowerCase()}`;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
     out.push({
       source_sheet: item.sourceSheet,
       source_ref: readSourceRef(item.metadata),
@@ -117,7 +122,7 @@ export async function getProductIngredientsByIdV1(productId: string): Promise<Pr
       count: fullList.length,
     },
     raw_ingredient: {
-      text: preferred?.content ?? null,
+      text: canonicalizeRawIngredientText(preferred?.content, fullList),
       source_sheet: preferred?.source_sheet ?? null,
       source_ref: preferred?.source_ref ?? null,
       updated_at: preferred?.updated_at ?? null,
