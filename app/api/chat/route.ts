@@ -11,6 +11,7 @@ import { buildScienceFallbackAnswerV1 } from "@/lib/aurora/science-fallback";
 import { simulateConflictsV1, type ConflictDetectorOutputV1 } from "@/lib/conflict-detector";
 import { calculateScore } from "@/lib/engine";
 import { calculateStressScore } from "@/lib/env-stress";
+import { resolveAuroraProductId } from "@/lib/product-id-resolver";
 import { ingredientKbHealthV1, getIngredientResearchProfileV1, searchIngredientResearchV1 } from "@/lib/ingredient-research-kb";
 import { ingredientSearchV1 } from "@/lib/ingredient-search";
 import type { IngredientSearchOutputV1 } from "@/lib/ingredient-search-core";
@@ -4743,6 +4744,14 @@ export async function POST(req: Request) {
 
   const explicitAnchorId =
     typeof body.anchor_product_id === "string" && body.anchor_product_id.trim() ? body.anchor_product_id.trim() : null;
+  const resolvedExplicitAnchor = explicitAnchorId
+    ? (await resolveAuroraProductId({
+        value: explicitAnchorId,
+        sourceSystem: "pivota",
+        sourceType: "product_id",
+      })) ??
+      (await resolveAuroraProductId({ value: explicitAnchorId }))
+    : null;
   const dupeIntent = detectDupeIntent(intentText);
   const evalIntent = detectProductEvaluationIntent(intentText);
   const routineIntent =
@@ -4773,7 +4782,7 @@ export async function POST(req: Request) {
   // Legacy fallback (brand heuristics + loose token match).
   const legacyAnchorId = !explicitAnchorId && (dupeIntent || evalIntent) ? await findAnchorProductId(intentText) : null;
 
-  const anchorProductId = explicitAnchorId ?? (highConfidenceAlias ? bestAlias.product_id : null) ?? legacyAnchorId;
+  const anchorProductId = resolvedExplicitAnchor?.product_id ?? explicitAnchorId ?? (highConfidenceAlias ? bestAlias.product_id : null) ?? legacyAnchorId;
   const wantsShortlist = wantsShortlistNoAnchor && (!anchorProductId || !looksLikeUuid(anchorProductId));
 
   // If the user is asking for a dupe/compare, we should not silently drift into a routine.

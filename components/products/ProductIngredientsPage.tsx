@@ -7,6 +7,15 @@ type ProductIngredientsResponseV1 = {
   ok: boolean;
   schema_version: "aurora.product_ingredients.v1";
   product_id: string;
+  resolved?: {
+    product_ref: string;
+    product_id: string;
+    matched_by: "product_id" | "crosswalk" | "alias";
+    source_system: string | null;
+    source_type: string | null;
+    matched_ref: string | null;
+    confidence: number | null;
+  };
   product: {
     brand: string;
     name: string;
@@ -56,7 +65,15 @@ function formatUpdatedAt(value: string | null): string {
   return date.toLocaleString();
 }
 
-export function ProductIngredientsPage({ productId }: { productId: string }) {
+export function ProductIngredientsPage({
+  productId,
+  sourceSystem,
+  sourceType,
+}: {
+  productId: string;
+  sourceSystem?: string;
+  sourceType?: string;
+}) {
   const [data, setData] = useState<ProductIngredientsResponseV1 | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -68,7 +85,11 @@ export function ProductIngredientsPage({ productId }: { productId: string }) {
       setLoading(true);
       setError(null);
       try {
-        const res = await fetch(`/v1/kb/products/${encodeURIComponent(productId)}/ingredients`, {
+        const query = new URLSearchParams();
+        if (sourceSystem?.trim()) query.set("source_system", sourceSystem.trim());
+        if (sourceType?.trim()) query.set("source_type", sourceType.trim());
+        const suffix = query.toString() ? `?${query.toString()}` : "";
+        const res = await fetch(`/v1/kb/products/${encodeURIComponent(productId)}/ingredients${suffix}`, {
           method: "GET",
           cache: "no-store",
         });
@@ -89,7 +110,7 @@ export function ProductIngredientsPage({ productId }: { productId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [productId]);
+  }, [productId, sourceSystem, sourceType]);
 
   const heroActives = useMemo(() => normalizeHeroActives(data?.ingredients?.hero_actives), [data?.ingredients?.hero_actives]);
 
@@ -103,7 +124,14 @@ export function ProductIngredientsPage({ productId }: { productId: string }) {
               <h1 className="mt-1 text-2xl font-bold text-slate-900">
                 {data ? `${data.product.brand} ${data.product.name}` : "Loading product..."}
               </h1>
-              <p className="mt-2 font-mono text-xs text-slate-500">product_id: {productId}</p>
+              <p className="mt-2 font-mono text-xs text-slate-500">request_ref: {productId}</p>
+              {data?.resolved ? (
+                <p className="mt-1 font-mono text-xs text-slate-500">
+                  resolved_product_id: {data.resolved.product_id} ({data.resolved.matched_by})
+                </p>
+              ) : data?.product_id ? (
+                <p className="mt-1 font-mono text-xs text-slate-500">product_id: {data.product_id}</p>
+              ) : null}
             </div>
             {loading ? (
               <span className="inline-flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-sm text-slate-600">
@@ -149,6 +177,21 @@ export function ProductIngredientsPage({ productId }: { productId: string }) {
                 </p>
               </div>
             </section>
+
+            {data.resolved ? (
+              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <p className="text-xs uppercase text-slate-500">Resolution</p>
+                <p className="mt-2 text-sm text-slate-700">
+                  matched_by=<span className="font-semibold text-slate-900">{data.resolved.matched_by}</span>
+                  {" · "}source_system=
+                  <span className="font-semibold text-slate-900">{data.resolved.source_system || "N/A"}</span>
+                  {" · "}source_type=
+                  <span className="font-semibold text-slate-900">{data.resolved.source_type || "N/A"}</span>
+                  {" · "}confidence=
+                  <span className="font-semibold text-slate-900">{data.resolved.confidence ?? "N/A"}</span>
+                </p>
+              </section>
+            ) : null}
 
             <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
               <div className="flex items-center gap-2">

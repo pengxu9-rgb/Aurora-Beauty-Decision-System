@@ -28,6 +28,7 @@ model Product {
   kbSnippets  ProductKbSnippet[]
   priceSnapshots ProductPriceSnapshot[]
   aliases ProductAlias[]
+  crosswalks ProductCrosswalk[]
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -161,6 +162,28 @@ model ProductAlias {
   @@index([aliasNormalized])
   @@index([productId])
   @@map("product_aliases")
+}
+
+model ProductCrosswalk {
+  id        String  @id @default(uuid())
+  productId String  @map("product_id")
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  sourceSystem          String @map("source_system")
+  sourceType            String @map("source_type")
+  externalRef           String @map("external_ref")
+  externalRefNormalized String @map("external_ref_normalized")
+
+  confidence Int   @default(100)
+  metadata   Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([sourceSystem, sourceType, externalRefNormalized], map: "product_crosswalks_source_type_ref_norm_uidx")
+  @@index([productId])
+  @@index([externalRefNormalized])
+  @@map("product_crosswalks")
 }
 
 // 6. User Profile Memory (Lifecycle)

@@ -1,5 +1,6 @@
 import { AURORA_SKU_DB } from "@/data/mock-db";
 import { fetchLatestPriceSnapshotsByProductIds } from "@/lib/pricing";
+import { resolveAuroraProductId } from "@/lib/product-id-resolver";
 import { prisma } from "@/lib/server/prisma";
 import type { ExperienceVector, RiskFlag, SkuCategory, SkuVector, SocialStats } from "@/types";
 
@@ -244,9 +245,22 @@ function shouldUseDb() {
 
 export async function resolveProductIdForSkuId(skuId: string): Promise<string | null> {
   if (!shouldUseDb()) return null;
-  if (looksLikeUuid(skuId)) return skuId;
+  const raw = String(skuId ?? "").trim();
+  if (!raw) return null;
 
-  const alias = aliasForSkuId(skuId);
+  const strictResolution = await resolveAuroraProductId({
+    value: raw,
+    sourceSystem: "pivota",
+    sourceType: "sku_id",
+  });
+  if (strictResolution?.product_id) return strictResolution.product_id;
+
+  const broadResolution = await resolveAuroraProductId({ value: raw });
+  if (broadResolution?.product_id) return broadResolution.product_id;
+
+  if (looksLikeUuid(raw)) return raw;
+
+  const alias = aliasForSkuId(raw);
   if (!alias) return null;
 
   const product = await prisma.product.findFirst({

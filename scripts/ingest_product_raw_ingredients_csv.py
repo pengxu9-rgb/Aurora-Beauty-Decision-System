@@ -15,7 +15,9 @@ Usage:
 
   python3 scripts/ingest_product_raw_ingredients_csv.py \
     --input-csv "/Users/.../product_candidates_master_v0_i18n__人工检测完毕.csv" \
-    --commit
+    --commit \
+    --upsert-aliases \
+    --upsert-crosswalks
 """
 
 from __future__ import annotations
@@ -71,6 +73,38 @@ def normalize_alias_text(text: str) -> str:
     s = re.sub(r"[^\w\s]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def normalize_crosswalk_ref(value: str) -> str:
+    s = unicodedata.normalize("NFKC", str(value or ""))
+    s = s.strip().casefold()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def canonicalize_url_reference(value: str) -> str:
+    raw = norm_str(value)
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    host = parsed.hostname.casefold() if parsed.hostname else ""
+    path = parsed.path or "/"
+    path = re.sub(r"/{2,}", "/", path)
+    path = path.rstrip("/") or "/"
+    return f"{host}{path}"
+
+
+def normalize_crosswalk_ref_by_type(source_type: str, value: str) -> str:
+    if "url" in source_type:
+        canonical = canonicalize_url_reference(value)
+        if canonical:
+            return canonical
+    return normalize_crosswalk_ref(value)
 
 
 def strip_schema_query_param(database_url: str) -> str:
@@ -133,10 +167,15 @@ def split_ingredient_list(inci_list: str, raw_text: str) -> List[str]:
 @dataclass
 class IngestRow:
     row_index: int
+    candidate_id: str
     brand: str
     name: str
     market: str
     source_ref: str
+    canonical_url: str
+    pivota_product_id: str
+    external_product_id: str
+    external_seed_id: str
     raw_ingredient_text: str
     ingredient_list: List[str]
     parse_status: str
@@ -164,6 +203,11 @@ def build_rows(df: pd.DataFrame) -> Tuple[List[IngestRow], Dict[str, int]]:
     parse_status_col = choose_column(df.columns, ["parse_status", "status"])
     review_status_col = choose_column(df.columns, ["review_status"])
     source_ref_col = choose_column(df.columns, ["source_ref"])
+    candidate_id_col = choose_column(df.columns, ["candidate_id"])
+    canonical_url_col = choose_column(df.columns, ["canonical_url", "destination_url", "product_url"])
+    pivota_product_id_col = choose_column(df.columns, ["pivota_product_id", "product_id"])
+    external_product_id_col = choose_column(df.columns, ["external_product_id"])
+    external_seed_id_col = choose_column(df.columns, ["external_seed_id", "seed_id"])
 
     if not brand_col or not name_col:
         fail("CSV is missing required brand/product columns.")
@@ -205,10 +249,15 @@ def build_rows(df: pd.DataFrame) -> Tuple[List[IngestRow], Dict[str, int]]:
 
         row = IngestRow(
             row_index=idx,
+            candidate_id=norm_str(record.get(candidate_id_col)) if candidate_id_col else "",
             brand=brand,
             name=name,
             market=norm_str(record.get(market_col)) if market_col else "",
             source_ref=norm_str(record.get(source_ref_col)) if source_ref_col else "",
+            canonical_url=norm_str(record.get(canonical_url_col)) if canonical_url_col else "",
+            pivota_product_id=norm_str(record.get(pivota_product_id_col)) if pivota_product_id_col else "",
+            external_product_id=norm_str(record.get(external_product_id_col)) if external_product_id_col else "",
+            external_seed_id=norm_str(record.get(external_seed_id_col)) if external_seed_id_col else "",
             raw_ingredient_text=clean_raw_ingredient_text(raw_text),
             ingredient_list=ing_list,
             parse_status=parse_status,
@@ -239,7 +288,7 @@ def build_rows(df: pd.DataFrame) -> Tuple[List[IngestRow], Dict[str, int]]:
     return rows, stats
 
 
-def ensure_db_prerequisites(conn: "psycopg2.extensions.connection") -> Tuple[bool, bool]:
+def ensure_db_prerequisites(conn: "psycopg2.extensions.connection") -> Tuple[bool, bool, bool]:
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -263,7 +312,18 @@ def ensure_db_prerequisites(conn: "psycopg2.extensions.connection") -> Tuple[boo
         )
         has_kb_snippets = bool(cur.fetchone()[0])
 
-    return has_region_availability, has_kb_snippets
+        cur.execute(
+            """
+            SELECT EXISTS(
+              SELECT 1
+              FROM information_schema.tables
+              WHERE table_schema='public' AND table_name='product_crosswalks'
+            );
+            """
+        )
+        has_product_crosswalks = bool(cur.fetchone()[0])
+
+    return has_region_availability, has_kb_snippets, has_product_crosswalks
 
 
 def load_product_index(conn: "psycopg2.extensions.connection") -> Dict[str, Tuple[str, List[str]]]:
@@ -326,14 +386,152 @@ def upsert_product_aliases(
     return applied
 
 
+def upsert_product_crosswalks(conn: "psycopg2.extensions.connection", product_id: str, row: IngestRow) -> Tuple[int, int]:
+    refs: List[Tuple[str, str, str, int, Dict[str, object]]] = []
+
+    refs.append(
+        (
+            "aurora",
+            "product_id",
+            product_id,
+            100,
+            {"source": "aurora_ingest", "row_index": row.row_index},
+        )
+    )
+
+    if row.candidate_id:
+        refs.append(
+            (
+                "harvester",
+                "candidate_id",
+                row.candidate_id,
+                80,
+                {"source": "manual_review_csv", "row_index": row.row_index},
+            )
+        )
+    if row.pivota_product_id:
+        refs.append(
+            (
+                "pivota",
+                "product_id",
+                row.pivota_product_id,
+                95,
+                {"source": "manual_review_csv", "row_index": row.row_index},
+            )
+        )
+    if row.external_product_id:
+        refs.append(
+            (
+                "pivota",
+                "external_product_id",
+                row.external_product_id,
+                95,
+                {"source": "manual_review_csv", "row_index": row.row_index},
+            )
+        )
+    if row.external_seed_id:
+        refs.append(
+            (
+                "pivota",
+                "external_seed_id",
+                row.external_seed_id,
+                90,
+                {"source": "manual_review_csv", "row_index": row.row_index},
+            )
+        )
+    if row.canonical_url:
+        refs.append(
+            (
+                "merchant",
+                "canonical_url",
+                row.canonical_url,
+                90,
+                {"source": "manual_review_csv", "row_index": row.row_index},
+            )
+        )
+    if row.source_ref:
+        refs.append(
+            (
+                "merchant",
+                "source_ref_url",
+                row.source_ref,
+                85,
+                {"source": "manual_review_csv", "row_index": row.row_index},
+            )
+        )
+
+    upserted = 0
+    conflicts = 0
+    seen_keys = set()
+    with conn.cursor() as cur:
+        for source_system, source_type, external_ref, confidence, metadata in refs:
+            normalized = normalize_crosswalk_ref_by_type(source_type, external_ref)
+            if not normalized:
+                continue
+
+            dedup_key = (source_system, source_type, normalized)
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+
+            cur.execute(
+                """
+                INSERT INTO "product_crosswalks" (
+                  id, product_id, source_system, source_type, external_ref, external_ref_normalized, confidence, metadata, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (source_system, source_type, external_ref_normalized) DO UPDATE SET
+                  external_ref = EXCLUDED.external_ref,
+                  confidence = EXCLUDED.confidence,
+                  metadata = EXCLUDED.metadata,
+                  updated_at = NOW()
+                WHERE "product_crosswalks"."product_id" = EXCLUDED.product_id;
+                """,
+                (
+                    str(uuid.uuid4()),
+                    product_id,
+                    source_system,
+                    source_type,
+                    external_ref,
+                    normalized,
+                    int(confidence),
+                    Json(metadata),
+                ),
+            )
+            if cur.rowcount == 1:
+                upserted += 1
+                continue
+
+            # Conflict means same external reference is already mapped to a different product.
+            cur.execute(
+                """
+                SELECT product_id::text
+                FROM "product_crosswalks"
+                WHERE source_system=%s AND source_type=%s AND external_ref_normalized=%s
+                LIMIT 1;
+                """,
+                (source_system, source_type, normalized),
+            )
+            existing = cur.fetchone()
+            existing_product_id = str(existing[0]) if existing else "unknown"
+            conflicts += 1
+            log_warn(
+                f"crosswalk conflict source={source_system}/{source_type} ref={external_ref!r} "
+                f"existing_product_id={existing_product_id} incoming_product_id={product_id}"
+            )
+
+    return upserted, conflicts
+
+
 def ingest_rows(
     conn: "psycopg2.extensions.connection",
     rows: Sequence[IngestRow],
     *,
     commit: bool,
     upsert_aliases: bool,
+    upsert_crosswalks: bool,
 ) -> Dict[str, int]:
-    has_region_availability, has_kb_snippets = ensure_db_prerequisites(conn)
+    has_region_availability, has_kb_snippets, has_product_crosswalks = ensure_db_prerequisites(conn)
     product_index = load_product_index(conn)
     ingredient_index = load_ingredient_index(conn)
 
@@ -345,7 +543,12 @@ def ingest_rows(
         "ingredients_unchanged": 0,
         "raw_snippets_upserted": 0,
         "aliases_upserted": 0,
+        "crosswalks_upserted": 0,
+        "crosswalk_conflicts": 0,
     }
+
+    if upsert_crosswalks and not has_product_crosswalks:
+        log_warn("`product_crosswalks` table not found; skipping crosswalk upsert. Run DB migration first.")
 
     total_rows = len(rows)
     for idx, row in enumerate(rows, start=1):
@@ -426,6 +629,10 @@ def ingest_rows(
 
         if upsert_aliases:
             stats["aliases_upserted"] += upsert_product_aliases(conn, product_id, row.brand, row.name)
+        if upsert_crosswalks and has_product_crosswalks:
+            upserted, conflicts = upsert_product_crosswalks(conn, product_id, row)
+            stats["crosswalks_upserted"] += upserted
+            stats["crosswalk_conflicts"] += conflicts
 
         if has_kb_snippets and row.raw_ingredient_text:
             metadata = {
@@ -472,6 +679,7 @@ def main() -> None:
     parser.add_argument("--commit", action="store_true", help="Write changes to DB.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and simulate writes without commit.")
     parser.add_argument("--upsert-aliases", action="store_true", help="Also upsert entries into product_aliases.")
+    parser.add_argument("--upsert-crosswalks", action="store_true", help="Also upsert entries into product_crosswalks.")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of deduped rows to ingest (for debugging).")
     args = parser.parse_args()
 
@@ -507,7 +715,13 @@ def main() -> None:
     conn = psycopg2.connect(strip_schema_query_param(database_url))
     conn.autocommit = False
     try:
-        write_stats = ingest_rows(conn, rows, commit=args.commit, upsert_aliases=args.upsert_aliases)
+        write_stats = ingest_rows(
+            conn,
+            rows,
+            commit=args.commit,
+            upsert_aliases=args.upsert_aliases,
+            upsert_crosswalks=args.upsert_crosswalks,
+        )
     except BaseException:
         conn.rollback()
         raise
