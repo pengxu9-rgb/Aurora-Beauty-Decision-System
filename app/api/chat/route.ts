@@ -4135,8 +4135,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const query = normalizeQuery(body);
-  if (!query) return NextResponse.json({ error: "`query` (or `message`) is required" }, { status: 400 });
+  const rawQuery = normalizeQuery(body);
+  if (!rawQuery) return NextResponse.json({ error: "`query` (or `message`) is required" }, { status: 400 });
+  const bffContext = parseBffContextPrefix(rawQuery);
+  // Always use the user-authored text for intent parsing. The BFF prefix carries context JSON
+  // and can contain unrelated tokens (e.g. "budget"), which should not drive intent detection.
+  const query = bffContext?.stripped_query?.trim() ? bffContext.stripped_query.trim() : rawQuery;
 
   const { userId, setCookieHeader } = getOrCreateAnonymousUserId(req);
   const jsonResponse = (data: unknown, init?: Parameters<typeof NextResponse.json>[1]) =>
@@ -4160,7 +4164,6 @@ export async function POST(req: Request) {
       ? `${recentUserContextText}\n\nFollow-up: ${query}`
       : query;
 
-  const bffContext = parseBffContextPrefix(query);
   if (bffContext && isBffRecoProductsRequest(bffContext.meta)) {
     const userLang = coerceBffLanguage(bffContext.meta) ?? detectUserLanguage(bffContext.stripped_query || query);
     const languageTag = toAuroraLanguageTag(userLang);
