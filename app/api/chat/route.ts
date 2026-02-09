@@ -2694,6 +2694,10 @@ type IngredientContext = {
   head: string[];
   hero_actives?: unknown;
   highlights: string[];
+  full_list_count: number;
+  raw_ingredient_text: string | null;
+  raw_ingredient_source_sheet: string | null;
+  raw_ingredient_source_ref: string | null;
 };
 
 type ExpertKnowledge = {
@@ -2829,7 +2833,50 @@ function normalizeIngredientList(fullList: unknown): string[] {
   return [];
 }
 
-function summarizeIngredients(fullList: unknown, heroActives: unknown): IngredientContext {
+function readSourceRefFromSnippetMetadata(metadata: unknown): string | null {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
+  const value = (metadata as Record<string, unknown>).source_ref;
+  if (typeof value !== "string") return null;
+  const out = value.trim();
+  return out || null;
+}
+
+function pickRawIngredientFromSnippets(
+  snippets: Array<KbSnippetForEvidence>,
+): { text: string | null; source_sheet: string | null; source_ref: string | null } {
+  if (!Array.isArray(snippets) || snippets.length === 0) {
+    return { text: null, source_sheet: null, source_ref: null };
+  }
+
+  const candidates = snippets
+    .filter((s) => String(s.field ?? "").trim() === "raw_ingredient_text")
+    .map((s) => ({
+      source_sheet: String(s.source_sheet ?? "").trim() || null,
+      source_ref: readSourceRefFromSnippetMetadata(s.metadata),
+      text: String(s.content ?? "").trim() || null,
+    }))
+    .filter((s) => Boolean(s.text));
+
+  if (!candidates.length) return { text: null, source_sheet: null, source_ref: null };
+
+  const preferred =
+    candidates.find((x) => x.source_sheet === "ingredient_harvester_manual") ??
+    candidates.find((x) => x.source_sheet === "ingredient_harvester") ??
+    candidates[0];
+
+  const text = preferred.text ? preferred.text.slice(0, 600) : null;
+  return {
+    text,
+    source_sheet: preferred.source_sheet,
+    source_ref: preferred.source_ref,
+  };
+}
+
+function summarizeIngredients(
+  fullList: unknown,
+  heroActives: unknown,
+  snippets: Array<KbSnippetForEvidence> = [],
+): IngredientContext {
   const list = normalizeIngredientList(fullList);
   const head = list.slice(0, 12);
   const lowered = list.map((i) => i.toLowerCase());
@@ -2844,7 +2891,16 @@ function summarizeIngredients(fullList: unknown, heroActives: unknown): Ingredie
   if (anyHas(["glycerin", "butylene glycol", "propylene glycol"])) highlights.push("Humectants (glycerin/glycols)");
   if (anyHas(["algae", "seaweed", "kelp", "laminaria"])) highlights.push("Algae/seaweed extract present");
 
-  return { head, hero_actives: heroActives, highlights };
+  const raw = pickRawIngredientFromSnippets(snippets);
+  return {
+    head,
+    hero_actives: heroActives,
+    highlights,
+    full_list_count: list.length,
+    raw_ingredient_text: raw.text,
+    raw_ingredient_source_sheet: raw.source_sheet,
+    raw_ingredient_source_ref: raw.source_ref,
+  };
 }
 
 function computeUsdToCny(usd: number) {
@@ -2971,9 +3027,6 @@ async function buildRoutineEvidenceIndex(input: {
     where: { productId: { in: productIds } },
     select: { productId: true, fullList: true, heroActives: true },
   });
-  for (const row of ingredientRows) {
-    ingredientsByProductId.set(row.productId, summarizeIngredients(row.fullList, row.heroActives));
-  }
 
   const kbRows = await prisma.productKbSnippet.findMany({
     where: { productId: { in: productIds } },
@@ -2985,6 +3038,10 @@ async function buildRoutineEvidenceIndex(input: {
     const list = kbByProductId.get(row.productId) ?? [];
     list.push({ id: row.id, source_sheet: row.sourceSheet, field: row.field, content: row.content, metadata: row.metadata });
     kbByProductId.set(row.productId, list);
+  }
+
+  for (const row of ingredientRows) {
+    ingredientsByProductId.set(row.productId, summarizeIngredients(row.fullList, row.heroActives, kbByProductId.get(row.productId) ?? []));
   }
 
   for (const sku of skuById.values()) {
@@ -4429,8 +4486,8 @@ export async function POST(req: Request) {
       });
 
       const ing = ingredientByProductId.get(productId);
-      const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives);
       const snippets = kbByProductId.get(productId) ?? [];
+      const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives, snippets);
       const kbProfile = buildKbProfile({
         product_id: productId,
         display_name: `${c.sku.brand} ${c.sku.name}`.trim(),
@@ -5465,7 +5522,7 @@ export async function POST(req: Request) {
 
     const candidates = top.map((c) => {
       const ing = ingredientByProductId.get(c.product_id);
-      const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives);
+      const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives, kbByProductId.get(c.product_id) ?? []);
       const skuLlm = sanitizeSkuForLlm(c.sku);
       const kb_profile = buildKbProfile({
         product_id: c.product_id,
@@ -6251,7 +6308,7 @@ export async function POST(req: Request) {
       price_usd: normalizeUsdPrice((anchor as any).priceUsd),
       price_cny: coerceNumber((anchor as any).priceCny),
     });
-    const kbOnlyIngredients = summarizeIngredients((anchor as any).ingredients?.fullList, (anchor as any).ingredients?.heroActives);
+    const kbOnlyIngredients = summarizeIngredients((anchor as any).ingredients?.fullList, (anchor as any).ingredients?.heroActives, snippets);
     const kbOnlySocial: AuroraSocialSignalsV1 | null = anchor.socialStats
       ? {
           red_score: Number.isFinite(anchor.socialStats.redScore) ? anchor.socialStats.redScore : null,
@@ -6396,7 +6453,7 @@ export async function POST(req: Request) {
   }
 
   const anchorIngredients = ingredientByProductId.get(anchor.id);
-  const anchorIngredientCtx = summarizeIngredients(anchorIngredients?.fullList, anchorIngredients?.heroActives);
+  const anchorIngredientCtx = summarizeIngredients(anchorIngredients?.fullList, anchorIngredients?.heroActives, kbByProductId.get(anchor.id) ?? []);
   const anchorExpertKnowledge = buildExpertKnowledgeFromKb(kbByProductId.get(anchor.id) ?? []);
   const anchorKbProfile = buildKbProfile({
     product_id: anchor.id,
@@ -6410,7 +6467,7 @@ export async function POST(req: Request) {
 
   const mappedCandidates = candidates.map((c) => {
     const ing = ingredientByProductId.get(c.product_id);
-    const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives);
+    const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives, kbByProductId.get(c.product_id) ?? []);
     const candidatePriceUsd = normalizeUsdPrice(c.sku.price);
     return {
       product_id: c.product_id,
@@ -6504,7 +6561,7 @@ export async function POST(req: Request) {
     },
     candidates: candidates.slice(0, 5).map((c) => {
       const ing = ingredientByProductId.get(c.product_id);
-      const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives);
+      const ingCtx = summarizeIngredients(ing?.fullList, ing?.heroActives, kbByProductId.get(c.product_id) ?? []);
       const skuLlm = sanitizeSkuForLlm(c.sku);
       const tradeoff = computeCandidateTradeoff({
         lang: userLang,

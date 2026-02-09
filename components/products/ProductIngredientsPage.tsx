@@ -3,6 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, Beaker, CircleCheckBig, ExternalLink, FlaskConical, Loader2 } from "lucide-react";
 
+import { inferSourceHintFromProductRef } from "@/lib/product-ref-hints";
+
 type ProductIngredientsResponseV1 = {
   ok: boolean;
   schema_version: "aurora.product_ingredients.v1";
@@ -77,6 +79,9 @@ export function ProductIngredientsPage({
   const [data, setData] = useState<ProductIngredientsResponseV1 | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const inferred = useMemo(() => inferSourceHintFromProductRef(productId), [productId]);
+  const effectiveSourceSystem = sourceSystem?.trim() || inferred?.sourceSystem || "";
+  const effectiveSourceType = sourceType?.trim() || inferred?.sourceType || "";
 
   useEffect(() => {
     let cancelled = false;
@@ -86,8 +91,8 @@ export function ProductIngredientsPage({
       setError(null);
       try {
         const query = new URLSearchParams();
-        if (sourceSystem?.trim()) query.set("source_system", sourceSystem.trim());
-        if (sourceType?.trim()) query.set("source_type", sourceType.trim());
+        if (effectiveSourceSystem) query.set("source_system", effectiveSourceSystem);
+        if (effectiveSourceType) query.set("source_type", effectiveSourceType);
         const suffix = query.toString() ? `?${query.toString()}` : "";
         const res = await fetch(`/v1/kb/products/${encodeURIComponent(productId)}/ingredients${suffix}`, {
           method: "GET",
@@ -110,7 +115,7 @@ export function ProductIngredientsPage({
     return () => {
       cancelled = true;
     };
-  }, [productId, sourceSystem, sourceType]);
+  }, [productId, effectiveSourceSystem, effectiveSourceType]);
 
   const heroActives = useMemo(() => normalizeHeroActives(data?.ingredients?.hero_actives), [data?.ingredients?.hero_actives]);
 

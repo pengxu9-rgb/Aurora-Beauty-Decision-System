@@ -4,6 +4,8 @@ import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Search } from "lucide-react";
 
+import { inferSourceHintFromProductRef } from "@/lib/product-ref-hints";
+
 export default function ProductLookupPage() {
   const router = useRouter();
   const [productRef, setProductRef] = useState("");
@@ -14,9 +16,12 @@ export default function ProductLookupPage() {
     e.preventDefault();
     const value = productRef.trim();
     if (!value) return;
+    const inferred = inferSourceHintFromProductRef(value);
+    const finalSourceSystem = sourceSystem.trim() || inferred?.sourceSystem || "";
+    const finalSourceType = sourceType.trim() || inferred?.sourceType || "";
     const query = new URLSearchParams();
-    if (sourceSystem.trim()) query.set("source_system", sourceSystem.trim());
-    if (sourceType.trim()) query.set("source_type", sourceType.trim());
+    if (finalSourceSystem) query.set("source_system", finalSourceSystem);
+    if (finalSourceType) query.set("source_type", finalSourceType);
     const suffix = query.toString() ? `?${query.toString()}` : "";
     router.push(`/products/${encodeURIComponent(value)}${suffix}`);
   };
@@ -59,7 +64,7 @@ export default function ProductLookupPage() {
           </div>
         </form>
         <p className="mt-3 text-xs text-slate-500">
-          Example: `source_system=pivota`, `source_type=external_product_id`
+          Defaults: `ext_*` → `pivota/external_product_id`, `eps_*` → `pivota/external_seed_id`, URL → `merchant/canonical_url`, hex id → `harvester/candidate_id`.
         </p>
       </div>
     </main>

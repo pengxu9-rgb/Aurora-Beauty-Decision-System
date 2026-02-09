@@ -386,7 +386,13 @@ def upsert_product_aliases(
     return applied
 
 
-def upsert_product_crosswalks(conn: "psycopg2.extensions.connection", product_id: str, row: IngestRow) -> Tuple[int, int]:
+def upsert_product_crosswalks(
+    conn: "psycopg2.extensions.connection",
+    product_id: str,
+    row: IngestRow,
+    *,
+    include_source_ref_url: bool,
+) -> Tuple[int, int]:
     refs: List[Tuple[str, str, str, int, Dict[str, object]]] = []
 
     refs.append(
@@ -449,7 +455,7 @@ def upsert_product_crosswalks(conn: "psycopg2.extensions.connection", product_id
                 {"source": "manual_review_csv", "row_index": row.row_index},
             )
         )
-    if row.source_ref:
+    if include_source_ref_url and row.source_ref:
         refs.append(
             (
                 "merchant",
@@ -530,6 +536,7 @@ def ingest_rows(
     commit: bool,
     upsert_aliases: bool,
     upsert_crosswalks: bool,
+    include_source_ref_crosswalk: bool,
 ) -> Dict[str, int]:
     has_region_availability, has_kb_snippets, has_product_crosswalks = ensure_db_prerequisites(conn)
     product_index = load_product_index(conn)
@@ -630,7 +637,12 @@ def ingest_rows(
         if upsert_aliases:
             stats["aliases_upserted"] += upsert_product_aliases(conn, product_id, row.brand, row.name)
         if upsert_crosswalks and has_product_crosswalks:
-            upserted, conflicts = upsert_product_crosswalks(conn, product_id, row)
+            upserted, conflicts = upsert_product_crosswalks(
+                conn,
+                product_id,
+                row,
+                include_source_ref_url=include_source_ref_crosswalk,
+            )
             stats["crosswalks_upserted"] += upserted
             stats["crosswalk_conflicts"] += conflicts
 
@@ -680,6 +692,11 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Validate and simulate writes without commit.")
     parser.add_argument("--upsert-aliases", action="store_true", help="Also upsert entries into product_aliases.")
     parser.add_argument("--upsert-crosswalks", action="store_true", help="Also upsert entries into product_crosswalks.")
+    parser.add_argument(
+        "--include-source-ref-crosswalk",
+        action="store_true",
+        help="Also write merchant/source_ref_url crosswalk entries (can be ambiguous across products).",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Limit number of deduped rows to ingest (for debugging).")
     args = parser.parse_args()
 
@@ -721,6 +738,7 @@ def main() -> None:
             commit=args.commit,
             upsert_aliases=args.upsert_aliases,
             upsert_crosswalks=args.upsert_crosswalks,
+            include_source_ref_crosswalk=args.include_source_ref_crosswalk,
         )
     except BaseException:
         conn.rollback()
