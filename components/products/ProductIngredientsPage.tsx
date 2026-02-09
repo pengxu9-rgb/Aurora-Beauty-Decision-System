@@ -30,6 +30,7 @@ type ProductIngredientsResponseV1 = {
   };
   raw_ingredient: {
     text: string | null;
+    original_text: string | null;
     source_sheet: string | null;
     source_ref: string | null;
     updated_at: string | null;
@@ -38,6 +39,7 @@ type ProductIngredientsResponseV1 = {
     source_sheet: string;
     source_ref: string | null;
     content: string;
+    original_content: string | null;
     updated_at: string;
   }>;
 };
@@ -206,6 +208,12 @@ export function ProductIngredientsPage({
               <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
                 <p className="whitespace-pre-wrap text-sm leading-6 text-slate-700">{data.raw_ingredient.text || "N/A"}</p>
               </div>
+              {data.raw_ingredient.original_text && data.raw_ingredient.original_text !== data.raw_ingredient.text ? (
+                <details className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
+                  <summary className="cursor-pointer text-sm font-semibold text-amber-900">View Original Text (Before Cleaning)</summary>
+                  <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-amber-900">{data.raw_ingredient.original_text}</p>
+                </details>
+              ) : null}
               <div className="mt-3 flex flex-wrap items-center gap-3 text-sm text-slate-600">
                 <span>
                   Source: <span className="font-medium text-slate-800">{data.raw_ingredient.source_sheet || "N/A"}</span>
@@ -260,6 +268,12 @@ export function ProductIngredientsPage({
                         ) : null}
                       </div>
                       <p className="whitespace-pre-wrap text-sm leading-6 text-slate-700">{item.content}</p>
+                      {item.original_content && item.original_content !== item.content ? (
+                        <details className="mt-2 rounded border border-slate-300 bg-white p-2">
+                          <summary className="cursor-pointer text-xs font-medium text-slate-700">Original snippet</summary>
+                          <p className="mt-1 whitespace-pre-wrap text-xs leading-5 text-slate-600">{item.original_content}</p>
+                        </details>
+                      ) : null}
                     </article>
                   ))}
                 </div>

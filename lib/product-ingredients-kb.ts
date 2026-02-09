@@ -7,6 +7,7 @@ type ProductRawIngredientSnippetV1 = {
   source_sheet: string;
   source_ref: string | null;
   content: string;
+  original_content: string | null;
   updated_at: string;
 };
 
@@ -25,6 +26,7 @@ type ProductIngredientsPayloadV1 = {
   };
   raw_ingredient: {
     text: string | null;
+    original_text: string | null;
     source_sheet: string | null;
     source_ref: string | null;
     updated_at: string | null;
@@ -51,7 +53,8 @@ function normalizeRawIngredientCandidates(
   const out: ProductRawIngredientSnippetV1[] = [];
   const seen = new Set<string>();
   for (const item of snippets) {
-    const content = canonicalizeRawIngredientText(typeof item.content === "string" ? item.content : "");
+    const originalContent = typeof item.content === "string" ? item.content.trim() : "";
+    const content = canonicalizeRawIngredientText(originalContent);
     if (!content) continue;
     const dedupKey = `${item.sourceSheet}::${content.toLowerCase()}`;
     if (seen.has(dedupKey)) continue;
@@ -60,6 +63,7 @@ function normalizeRawIngredientCandidates(
       source_sheet: item.sourceSheet,
       source_ref: readSourceRef(item.metadata),
       content,
+      original_content: originalContent || null,
       updated_at: item.updatedAt.toISOString(),
     });
   }
@@ -123,6 +127,7 @@ export async function getProductIngredientsByIdV1(productId: string): Promise<Pr
     },
     raw_ingredient: {
       text: canonicalizeRawIngredientText(preferred?.content, fullList),
+      original_text: preferred?.original_content ?? null,
       source_sheet: preferred?.source_sheet ?? null,
       source_ref: preferred?.source_ref ?? null,
       updated_at: preferred?.updated_at ?? null,
