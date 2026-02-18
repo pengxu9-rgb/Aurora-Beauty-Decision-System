@@ -3,10 +3,26 @@
 import type { SkinIdentitySnapshot } from "@/actions/userProfile";
 import { getEnvStressUiModel, getSkinIdentitySnapshot, setUserConcerns } from "@/actions/userProfile";
 import { ActionChips, type ActionChip } from "@/components/chat/ActionChips";
+import { ProductAnalysisCard } from "@/components/chat/ProductAnalysisCard";
 import { RoutineTimeline, type ConflictDetectorOutputV1, type RoutineRec } from "@/components/chat/RoutineTimeline";
 import { SkinIdentityCard } from "@/components/chat/SkinIdentityCard";
 import { cn } from "@/lib/cn";
-import { bffRequest, normalizeAuroraLang, type AuroraLang, type BffCard, type BffEnvelope, type SuggestedChip } from "@/lib/pivotaAgentBff";
+import { extractDogfoodViewModel } from "@/lib/recoDogfoodView";
+import {
+  bffRequest,
+  getRecoAsyncUpdates,
+  normalizeAuroraLang,
+  postRecoEmployeeFeedback,
+  postRecoInterleaveClick,
+  type AuroraLang,
+  type BffCard,
+  type BffEnvelope,
+  type RecoEmployeeFeedbackPayload,
+  type RecoInterleaveClickPayload,
+  type SuggestedChip,
+} from "@/lib/pivotaAgentBff";
+import { createRecoFeedbackReporter, parseRecoBlockName } from "@/lib/recoEmployeeFeedback";
+import { mergeRecoPayloadWithAsyncPatch, startRecoAsyncPolling } from "@/lib/recoRealtimeUpdates";
 import type { EnvStressUiModelV1 } from "@/types";
 import { ChevronDown, ChevronUp, Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -139,6 +155,8 @@ export function AuroraChatPage() {
   const [sessionState, setSessionState] = useState<string | null>(null);
   const traceIdRef = useRef<string>(safeUuid());
   const briefIdRef = useRef<string>(safeUuid());
+  const cardRequestIdRef = useRef<Record<string, string>>({});
+  const asyncPollStopsRef = useRef<Map<string, () => void>>(new Map());
   const pendingGateMessageRef = useRef<string | null>(null);
   const [lang, setLang] = useState<AuroraLang>(() => normalizeAuroraLang(typeof navigator !== "undefined" ? navigator.language : "EN"));
 
@@ -157,6 +175,33 @@ export function AuroraChatPage() {
   const [diagnosisExpanded, setDiagnosisExpanded] = useState(true);
   const [diagnosisProgressOverride, setDiagnosisProgressOverride] = useState<number>(0);
   const prevDiagnosisProgress = useRef<number>(0);
+
+  const feedbackReporter = useMemo(() => {
+    if (!userId) return null;
+    return createRecoFeedbackReporter({
+      uid: userId,
+      lang,
+      traceId: traceIdRef.current,
+      briefId: briefIdRef.current,
+      debounceMs: 320,
+      sendFeedback: async (payload) => {
+        await postRecoEmployeeFeedback(payload, {
+          uid: userId,
+          lang,
+          traceId: traceIdRef.current,
+          briefId: briefIdRef.current,
+        });
+      },
+      sendClick: async (payload) => {
+        await postRecoInterleaveClick(payload, {
+          uid: userId,
+          lang,
+          traceId: traceIdRef.current,
+          briefId: briefIdRef.current,
+        });
+      },
+    });
+  }, [lang, userId]);
 
   const lastMessageId = useMemo(() => messages[messages.length - 1]?.id ?? null, [messages]);
 
@@ -236,9 +281,104 @@ export function AuroraChatPage() {
     };
   }, [avatarUrl]);
 
+  useEffect(() => {
+    return () => {
+      feedbackReporter?.dispose();
+    };
+  }, [feedbackReporter]);
+
+  useEffect(() => {
+    return () => {
+      for (const stop of asyncPollStopsRef.current.values()) stop();
+      asyncPollStopsRef.current.clear();
+    };
+  }, []);
+
   const pushMessage = useCallback((message: ChatMessage) => {
     setMessages((prev) => [...prev, message]);
   }, []);
+
+  const applyAsyncPatchToCard = useCallback((cardId: string, patchPayload: Record<string, unknown>, lockTopN: number) => {
+    setCardFeed((prev) =>
+      prev.map((card) => {
+        if (!card || card.card_id !== cardId || card.type !== "product_analysis") return card;
+        const currentPayload = isPlainObject(card.payload) ? card.payload : {};
+        return {
+          ...card,
+          payload: mergeRecoPayloadWithAsyncPatch(currentPayload, patchPayload, lockTopN),
+        };
+      }),
+    );
+  }, []);
+
+  const startAsyncPollingForCard = useCallback(
+    (card: BffCard, requestId: string) => {
+      if (!userId) return;
+      if (!isPlainObject(card?.payload) || card.type !== "product_analysis") return;
+      const vm = extractDogfoodViewModel(card.payload);
+      const ticketId = String(vm.async_ticket_id || "").trim();
+      if (!ticketId) return;
+      const cardId = card.card_id;
+      if (!cardId) return;
+
+      if (asyncPollStopsRef.current.has(ticketId)) return;
+
+      const stop = startRecoAsyncPolling({
+        uid: userId,
+        ticketId,
+        sinceVersion: 1,
+        intervalMs: 2500,
+        lang,
+        traceId: traceIdRef.current,
+        briefId: briefIdRef.current,
+        requestAsyncUpdates: async (params) =>
+          getRecoAsyncUpdates(params, {
+            uid: userId,
+            lang,
+            traceId: traceIdRef.current,
+            briefId: briefIdRef.current,
+          }),
+        onPatch: (patchPayload) => {
+          applyAsyncPatchToCard(cardId, patchPayload, vm.lock_top_n_on_first_paint);
+        },
+      });
+      asyncPollStopsRef.current.set(ticketId, stop);
+      cardRequestIdRef.current[cardId] = requestId;
+    },
+    [applyAsyncPatchToCard, lang, userId],
+  );
+
+  const sendEmployeeFeedback = useCallback(
+    (payload: RecoEmployeeFeedbackPayload) => {
+      if (!feedbackReporter || !userId) return;
+      const block = parseRecoBlockName(payload.block);
+      if (!block) return;
+      feedbackReporter.queueFeedback({
+        ...payload,
+        block,
+        request_id: payload.request_id || traceIdRef.current,
+        session_id: payload.session_id || userId,
+      });
+    },
+    [feedbackReporter, userId],
+  );
+
+  const sendInterleaveClick = useCallback(
+    (payload: RecoInterleaveClickPayload) => {
+      if (!feedbackReporter || !userId) return;
+      const block = parseRecoBlockName(payload.block);
+      if (!block) return;
+      void feedbackReporter
+        .sendInterleaveClick({
+          ...payload,
+          block,
+          request_id: payload.request_id || traceIdRef.current,
+          session_id: payload.session_id || userId,
+        })
+        .catch(() => {});
+    },
+    [feedbackReporter, userId],
+  );
 
   const applyEnvelope = useCallback(
     (envelope: BffEnvelope, { userMessage, gateMessage }: { userMessage?: string; gateMessage?: string } = {}) => {
@@ -253,7 +393,14 @@ export function AuroraChatPage() {
       setSuggestedChips(Array.isArray(envelope.suggested_chips) ? envelope.suggested_chips : []);
 
       const cards = Array.isArray(envelope.cards) ? envelope.cards : [];
-      if (cards.length) setCardFeed((prev) => [...prev, ...cards].slice(-60));
+      if (cards.length) {
+        setCardFeed((prev) => [...prev, ...cards].slice(-60));
+        for (const card of cards) {
+          if (!card || typeof card.card_id !== "string") continue;
+          cardRequestIdRef.current[card.card_id] = envelope.request_id;
+          startAsyncPollingForCard(card, envelope.request_id);
+        }
+      }
 
       const nextState =
         envelope.session_patch && typeof envelope.session_patch === "object" && typeof (envelope.session_patch as any).next_state === "string"
@@ -274,7 +421,7 @@ export function AuroraChatPage() {
         setDiagnosisProgressOverride(100);
       }
     },
-    [pushMessage],
+    [pushMessage, startAsyncPollingForCard],
   );
 
   const sendText = useCallback(
@@ -538,26 +685,16 @@ export function AuroraChatPage() {
     }
 
     if (card.type === "product_analysis") {
-      const verdict = (payload as any)?.assessment?.verdict ?? null;
-      const evidence = (payload as any)?.evidence ?? null;
-      const keyIng = Array.isArray(evidence?.science?.key_ingredients) ? evidence.science.key_ingredients : [];
-      const riskNotes = Array.isArray(evidence?.science?.risk_notes) ? evidence.science.risk_notes : [];
-
       return (
-        <section key={card.card_id} className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm" aria-label="Product analysis">
-          <div className="text-xs font-semibold text-slate-900">Product Deep Scan</div>
-          {verdict ? <div className="mt-1 text-sm font-semibold text-slate-900">Verdict: {String(verdict)}</div> : null}
-          {keyIng.length ? (
-            <div className="mt-2 text-xs text-slate-700">
-              <span className="font-semibold">Key ingredients:</span> {keyIng.slice(0, 8).join(", ")}
-            </div>
-          ) : null}
-          {riskNotes.length ? (
-            <div className="mt-2 text-xs text-rose-700">
-              <span className="font-semibold">Risk notes:</span> {riskNotes.slice(0, 6).join(" · ")}
-            </div>
-          ) : null}
-        </section>
+        <ProductAnalysisCard
+          key={card.card_id}
+          cardId={card.card_id}
+          payload={payload}
+          requestId={cardRequestIdRef.current[card.card_id] || traceIdRef.current}
+          sessionId={userId || "anonymous"}
+          onEmployeeFeedback={sendEmployeeFeedback}
+          onInterleaveClick={sendInterleaveClick}
+        />
       );
     }
 
@@ -624,7 +761,7 @@ export function AuroraChatPage() {
         </pre>
       </details>
     );
-  }, []);
+  }, [sendEmployeeFeedback, sendInterleaveClick, userId]);
 
   return (
     <main className="min-h-screen bg-gradient-to-b from-white via-slate-50 to-slate-100">
@@ -652,6 +789,9 @@ export function AuroraChatPage() {
                 ]);
                 setSuggestedChips([]);
                 setCardFeed([]);
+                for (const stop of asyncPollStopsRef.current.values()) stop();
+                asyncPollStopsRef.current.clear();
+                cardRequestIdRef.current = {};
                 setSessionState(null);
                 pendingGateMessageRef.current = null;
                 setSendError(null);

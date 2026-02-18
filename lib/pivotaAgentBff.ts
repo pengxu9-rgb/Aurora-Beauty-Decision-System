@@ -36,6 +36,51 @@ export type BffEnvelope = {
   events: Record<string, unknown>[];
 };
 
+export type RecoBlockName = "competitors" | "dupes" | "related_products";
+
+export type RecoEmployeeFeedbackType = "relevant" | "not_relevant" | "wrong_block";
+
+export type RecoEmployeeFeedbackPayload = {
+  anchor_product_id: string;
+  block: RecoBlockName;
+  candidate_product_id?: string;
+  candidate_name?: string;
+  feedback_type: RecoEmployeeFeedbackType;
+  wrong_block_target?: RecoBlockName;
+  reason_tags?: string[];
+  was_exploration_slot?: boolean;
+  rank_position?: number;
+  pipeline_version?: string;
+  models?: string | Record<string, unknown>;
+  request_id?: string;
+  session_id?: string;
+  timestamp?: number;
+};
+
+export type RecoInterleaveClickPayload = {
+  anchor_product_id: string;
+  block: RecoBlockName;
+  candidate_product_id?: string;
+  candidate_name?: string;
+  request_id: string;
+  session_id: string;
+  pipeline_version?: string;
+  models?: string | Record<string, unknown>;
+  category_bucket?: string;
+  price_band?: string;
+  timestamp?: number;
+};
+
+export type RecoAsyncUpdatesResponse = {
+  ok: boolean;
+  version?: number;
+  has_update?: boolean;
+  expires_at_ms?: number;
+  payload_patch?: Record<string, unknown>;
+  reason?: string;
+  error?: string;
+};
+
 const DEFAULT_PIVOTA_AGENT_BASE_URL = "https://pivota-agent-production.up.railway.app";
 
 export function getPivotaAgentBaseUrl() {
@@ -90,3 +135,60 @@ export async function bffRequest<T>(
   throw new Error(msg || `Request failed (${res.status})`);
 }
 
+export async function postRecoEmployeeFeedback(
+  payload: RecoEmployeeFeedbackPayload,
+  opts: {
+    uid: string;
+    lang?: AuroraLang;
+    traceId?: string;
+    briefId?: string;
+    signal?: AbortSignal;
+  },
+) {
+  return bffRequest<{ ok: boolean; event?: Record<string, unknown> }>("/v1/reco/employee-feedback", {
+    ...opts,
+    method: "POST",
+    body: payload,
+  });
+}
+
+export async function postRecoInterleaveClick(
+  payload: RecoInterleaveClickPayload,
+  opts: {
+    uid: string;
+    lang?: AuroraLang;
+    traceId?: string;
+    briefId?: string;
+    signal?: AbortSignal;
+  },
+) {
+  return bffRequest<{ ok: boolean; attribution?: string; was_exploration_slot?: boolean; rank_position?: number }>(
+    "/v1/reco/interleave/click",
+    {
+      ...opts,
+      method: "POST",
+      body: payload,
+    },
+  );
+}
+
+export async function getRecoAsyncUpdates(
+  params: { ticket_id: string; since_version?: number },
+  opts: {
+    uid: string;
+    lang?: AuroraLang;
+    traceId?: string;
+    briefId?: string;
+    signal?: AbortSignal;
+  },
+) {
+  const qp = new URLSearchParams();
+  qp.set("ticket_id", params.ticket_id);
+  if (typeof params.since_version === "number" && Number.isFinite(params.since_version)) {
+    qp.set("since_version", String(Math.max(0, Math.trunc(params.since_version))));
+  }
+  return bffRequest<RecoAsyncUpdatesResponse>(`/v1/reco/async-updates?${qp.toString()}`, {
+    ...opts,
+    method: "GET",
+  });
+}

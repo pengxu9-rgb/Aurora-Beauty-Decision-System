@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { normalizeConflictHeatmapUiModelV1, normalizeEnvStressUiModelV1 } from "../lib/ui-contracts.ts";
+import { extractDogfoodViewModel } from "../lib/recoDogfoodView.ts";
 
 test("UI-001: Radar clamps values to 0..100", () => {
   const input = {
@@ -49,4 +50,29 @@ test("UI-003: Heatmap contract placeholder does not require extra fields", () =>
 
   const out = normalizeConflictHeatmapUiModelV1(input);
   assert.deepEqual(out, { schema_version: "aurora.ui.conflict_heatmap.v1" });
+});
+
+test("UI-004: Dogfood provenance parser reads employee controls and async ticket", () => {
+  const vm = extractDogfoodViewModel({
+    provenance: {
+      dogfood_mode: true,
+      dogfood_features_effective: {
+        show_employee_feedback_controls: true,
+      },
+      async_ticket_id: "ticket_123",
+      lock_top_n_on_first_paint: 3,
+      pipeline: "reco_blocks_dag.v1",
+      interleave: {
+        enabled: true,
+        rankerA: "ranker_v1",
+        rankerB: "ranker_v2",
+      },
+    },
+  });
+  assert.equal(vm.dogfood_mode, true);
+  assert.equal(vm.show_employee_feedback_controls, true);
+  assert.equal(vm.async_ticket_id, "ticket_123");
+  assert.equal(vm.lock_top_n_on_first_paint, 3);
+  assert.equal(vm.pipeline_version, "reco_blocks_dag.v1");
+  assert.equal((vm.models as Record<string, unknown>).rankerA, "ranker_v1");
 });
