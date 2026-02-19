@@ -72,6 +72,52 @@ function blockLabel(block: RecoBlockName) {
   return "Related products";
 }
 
+function toChannelLabel(raw: string) {
+  const token = String(raw || "").trim().toLowerCase();
+  if (token === "reddit") return "Reddit";
+  if (token === "xiaohongshu") return "Xiaohongshu";
+  if (token === "tiktok") return "TikTok";
+  if (token === "youtube") return "YouTube";
+  if (token === "instagram") return "Instagram";
+  return token;
+}
+
+function buildOverallSocialSummary(candidates: Candidate[]) {
+  const summaries = candidates
+    .map((row) => (row && typeof row.social_summary_user_visible === "object" ? row.social_summary_user_visible : null))
+    .filter(Boolean) as Array<{
+    themes?: string[];
+    top_keywords?: string[];
+    sentiment_hint?: string;
+    volume_bucket?: string;
+  }>;
+  if (!summaries.length) return "";
+
+  const themes = Array.from(
+    new Set(
+      summaries
+        .flatMap((s) => (Array.isArray(s.themes) ? s.themes : []))
+        .map((x) => String(x || "").trim())
+        .filter(Boolean),
+    ),
+  ).slice(0, 3);
+  const sentimentRows = summaries
+    .map((s) => String(s.sentiment_hint || "").trim())
+    .filter(Boolean);
+  const sentimentText = sentimentRows[0] || "";
+  const volumeRank = { unknown: 0, low: 1, mid: 2, high: 3 } as const;
+  let volume: keyof typeof volumeRank = "unknown";
+  for (const summary of summaries) {
+    const raw = String(summary.volume_bucket || "").trim().toLowerCase() as keyof typeof volumeRank;
+    if (!(raw in volumeRank)) continue;
+    if (volumeRank[raw] > volumeRank[volume]) volume = raw;
+  }
+
+  const themeText = themes.length ? `Key themes: ${themes.join(" · ")}.` : "";
+  const sentiment = sentimentText ? `Overall sentiment: ${sentimentText}` : "Overall sentiment: mixed.";
+  return `${sentiment} ${themeText} Discussion volume: ${volume}.`.trim();
+}
+
 export function ProductAnalysisCard({
   cardId,
   payload,
@@ -91,6 +137,17 @@ export function ProductAnalysisCard({
   const verdict = typeof assessment.verdict === "string" ? assessment.verdict : "";
   const reasons = Array.isArray(assessment.reasons) ? assessment.reasons.map((x) => String(x || "").trim()).filter(Boolean) : [];
   const anchor = asObj(assessment.anchor_product) || {};
+  const provenance = asObj(payload?.provenance) || {};
+  const socialChannels = Array.isArray(provenance.social_channels_used)
+    ? Array.from(
+        new Set(
+          provenance.social_channels_used
+            .map((x) => toChannelLabel(String(x || "")))
+            .filter(Boolean),
+        ),
+      ).slice(0, 5)
+    : [];
+  const socialFetchMode = typeof provenance.social_fetch_mode === "string" ? provenance.social_fetch_mode : "";
   const anchorProductId =
     (typeof anchor.product_id === "string" && anchor.product_id) ||
     (typeof anchor.sku_id === "string" && anchor.sku_id) ||
@@ -125,6 +182,22 @@ export function ProductAnalysisCard({
                 {data.candidates.length} items
               </div>
             </div>
+            {(() => {
+              const summary = buildOverallSocialSummary(data.candidates);
+              if (!summary && !socialChannels.length) return null;
+              return (
+                <div className="mt-2 rounded-md border border-emerald-100 bg-emerald-50 p-2">
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-emerald-700">Overall social signal</div>
+                  {summary ? <div className="mt-1 text-[11px] text-emerald-800">{summary}</div> : null}
+                  {!summary && socialFetchMode === "async_refresh" ? (
+                    <div className="mt-1 text-[11px] text-emerald-700">Cross-platform signal is syncing. Refresh to see updated highlights.</div>
+                  ) : null}
+                  {socialChannels.length ? (
+                    <div className="mt-1 text-[11px] text-emerald-700">Sources: {socialChannels.join(", ")}</div>
+                  ) : null}
+                </div>
+              );
+            })()}
 
             {data.candidates.length ? (
               <div className="mt-2 space-y-2">
