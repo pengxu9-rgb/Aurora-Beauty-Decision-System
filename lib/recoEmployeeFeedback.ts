@@ -14,6 +14,9 @@ export type RecoEmployeeFeedbackPayload = {
   rank_position?: number;
   pipeline_version?: string;
   models?: string | Record<string, unknown>;
+  suggestion_id?: string;
+  llm_suggested_label?: "relevant" | "not_relevant" | "wrong_block";
+  llm_confidence?: number;
   request_id?: string;
   session_id?: string;
   timestamp?: number;

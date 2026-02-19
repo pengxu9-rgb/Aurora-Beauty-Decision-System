@@ -3,6 +3,7 @@
 import { EmployeeFeedbackPanel } from "@/components/chat/EmployeeFeedbackPanel";
 import { cn } from "@/lib/cn";
 import { extractDogfoodViewModel } from "@/lib/recoDogfoodView";
+import { formatSuggestionConfidence, normalizeLlmSuggestion, suggestionLabelText } from "@/lib/recoPrelabelUi";
 import type { RecoBlockName, RecoEmployeeFeedbackPayload, RecoInterleaveClickPayload } from "@/lib/pivotaAgentBff";
 
 type AnyObj = Record<string, unknown>;
@@ -27,6 +28,7 @@ type Candidate = {
     volume_bucket?: string;
   };
   evidence_refs?: Array<{ id?: string; source_type?: string }>;
+  llm_suggestion?: Record<string, unknown>;
 };
 
 type BlockPayload = {
@@ -138,6 +140,7 @@ export function ProductAnalysisCard({
                   const socialThemes = Array.isArray(social.themes) ? social.themes.slice(0, 3) : [];
                   const socialKeywords = Array.isArray(social.top_keywords) ? social.top_keywords.slice(0, 6) : [];
                   const evidenceRefs = Array.isArray(candidate.evidence_refs) ? candidate.evidence_refs : [];
+                  const llmSuggestion = normalizeLlmSuggestion(candidate.llm_suggestion);
                   const candidateId = String(candidate.product_id || candidate.sku_id || name);
 
                   const interleavePayload: RecoInterleaveClickPayload = {
@@ -183,6 +186,25 @@ export function ProductAnalysisCard({
                       </div>
 
                       {summary ? <div className="mt-1.5 text-[11px] text-slate-700">{summary}</div> : null}
+                      {dogfood.dogfood_mode && llmSuggestion?.suggested_label ? (
+                        <div className="mt-1.5 rounded-md border border-indigo-200 bg-indigo-50 p-2 text-[11px] text-indigo-700">
+                          <div className="font-semibold">
+                            LLM suggestion: {suggestionLabelText(llmSuggestion.suggested_label)}
+                            {llmSuggestion.wrong_block_target ? ` -> ${llmSuggestion.wrong_block_target}` : ""}
+                            {llmSuggestion.confidence != null ? ` (${formatSuggestionConfidence(llmSuggestion.confidence)})` : ""}
+                          </div>
+                          {llmSuggestion.rationale_user_visible ? <div className="mt-1">{llmSuggestion.rationale_user_visible}</div> : null}
+                          {llmSuggestion.flags.length ? (
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              {llmSuggestion.flags.slice(0, 6).map((flag) => (
+                                <span key={`${candidateId}_${flag}`} className="rounded-full border border-indigo-200 bg-white px-1.5 py-0.5 text-[10px]">
+                                  {flag}
+                                </span>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
                       {reasonRows.length ? (
                         <ul className="mt-1.5 list-disc pl-4 text-[11px] text-slate-600">
                           {reasonRows.map((r, reasonIdx) => (
@@ -226,6 +248,7 @@ export function ProductAnalysisCard({
                           sessionId={sessionId}
                           pipelineVersion={dogfood.pipeline_version || undefined}
                           models={dogfood.models}
+                          llmSuggestion={llmSuggestion}
                           onSubmit={onEmployeeFeedback}
                         />
                       ) : null}
