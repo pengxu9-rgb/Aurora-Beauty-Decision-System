@@ -88,8 +88,8 @@ const DEFAULT_PIVOTA_AGENT_BASE_URL = "https://pivota-agent-production.up.railwa
 
 export function getPivotaAgentBaseUrl() {
   const raw =
-    process.env.NEXT_PUBLIC_PIVOTA_AGENT_URL?.trim() ||
     process.env.PIVOTA_AGENT_URL?.trim() ||
+    process.env.NEXT_PUBLIC_PIVOTA_AGENT_URL?.trim() ||
     DEFAULT_PIVOTA_AGENT_BASE_URL;
   return raw.replace(/\/$/, "");
 }

@@ -3,6 +3,7 @@
 import { EmployeeFeedbackPanel } from "@/components/chat/EmployeeFeedbackPanel";
 import { cn } from "@/lib/cn";
 import { extractDogfoodViewModel } from "@/lib/recoDogfoodView";
+import { normalizeMissingInfoForUi } from "@/lib/recoMissingInfoUi";
 import { formatSuggestionConfidence, normalizeLlmSuggestion, suggestionLabelText } from "@/lib/recoPrelabelUi";
 import type { RecoBlockName, RecoEmployeeFeedbackPayload, RecoInterleaveClickPayload } from "@/lib/pivotaAgentBff";
 
@@ -115,7 +116,15 @@ function buildOverallSocialSummary(candidates: Candidate[]) {
 
   const themeText = themes.length ? `Key themes: ${themes.join(" · ")}.` : "";
   const sentiment = sentimentText ? `Overall sentiment: ${sentimentText}` : "Overall sentiment: mixed.";
-  return `${sentiment} ${themeText} Discussion volume: ${volume}.`.trim();
+  const volumeText =
+    volume === "high"
+      ? "Discussion volume is high."
+      : volume === "mid"
+        ? "Discussion volume is moderate."
+        : volume === "low"
+          ? "Discussion volume is limited."
+          : "Discussion volume is unknown.";
+  return `${sentiment} ${themeText} ${volumeText}`.trim();
 }
 
 export function ProductAnalysisCard({
@@ -148,6 +157,7 @@ export function ProductAnalysisCard({
       ).slice(0, 5)
     : [];
   const socialFetchMode = typeof provenance.social_fetch_mode === "string" ? provenance.social_fetch_mode : "";
+  const missingInfoLabels = normalizeMissingInfoForUi(payload?.missing_info);
   const anchorProductId =
     (typeof anchor.product_id === "string" && anchor.product_id) ||
     (typeof anchor.sku_id === "string" && anchor.sku_id) ||
@@ -184,13 +194,21 @@ export function ProductAnalysisCard({
             </div>
             {(() => {
               const summary = buildOverallSocialSummary(data.candidates);
-              if (!summary && !socialChannels.length) return null;
+              if (!summary && !socialChannels.length && socialFetchMode !== "async_refresh" && socialFetchMode !== "stale_kb") return null;
               return (
                 <div className="mt-2 rounded-md border border-emerald-100 bg-emerald-50 p-2">
                   <div className="text-[10px] font-semibold uppercase tracking-wide text-emerald-700">Overall social signal</div>
                   {summary ? <div className="mt-1 text-[11px] text-emerald-800">{summary}</div> : null}
-                  {!summary && socialFetchMode === "async_refresh" ? (
+                  {!summary && socialFetchMode === "async_refresh" && socialChannels.length ? (
+                    <div className="mt-1 text-[11px] text-emerald-700">
+                      Cross-platform discussion is limited for now; we are continuously refreshing social evidence.
+                    </div>
+                  ) : null}
+                  {!summary && socialFetchMode === "async_refresh" && !socialChannels.length ? (
                     <div className="mt-1 text-[11px] text-emerald-700">Cross-platform signal is syncing. Refresh to see updated highlights.</div>
+                  ) : null}
+                  {!summary && socialFetchMode === "stale_kb" ? (
+                    <div className="mt-1 text-[11px] text-emerald-700">Cross-platform social signal is stale and being refreshed.</div>
                   ) : null}
                   {socialChannels.length ? (
                     <div className="mt-1 text-[11px] text-emerald-700">Sources: {socialChannels.join(", ")}</div>
@@ -335,6 +353,16 @@ export function ProductAnalysisCard({
           </div>
         ))}
       </div>
+      {missingInfoLabels.length ? (
+        <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3">
+          <div className="text-[11px] font-semibold text-amber-800">Current limits</div>
+          <ul className="mt-1 list-disc space-y-1 pl-4 text-[11px] text-amber-700">
+            {missingInfoLabels.map((line, idx) => (
+              <li key={`${cardId}_limit_${idx}`}>{line}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </section>
   );
 }

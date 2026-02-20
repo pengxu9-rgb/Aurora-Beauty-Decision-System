@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 
 function getBaseUrl() {
   const raw =
-    process.env.NEXT_PUBLIC_PIVOTA_AGENT_URL?.trim() ||
     process.env.PIVOTA_AGENT_URL?.trim() ||
+    process.env.NEXT_PUBLIC_PIVOTA_AGENT_URL?.trim() ||
     "https://pivota-agent-production.up.railway.app";
   return raw.replace(/\/$/, "");
 }
