@@ -30,7 +30,12 @@ type ChatRequest = {
   query?: string;
   message?: string;
   messages?: unknown[];
+  action_id?: string;
+  action_label?: string;
+  clarification_id?: string;
+  selected_option_index?: number;
   anchor_product_id?: string;
+  anchor_product_url?: string;
   limit?: number;
   llm_provider?: "gemini" | "openai";
   llm_model?: string;
@@ -169,6 +174,7 @@ type AuroraStructuredResultV1 = {
   analyze?: AuroraAnalyzeResultV1;
   alternatives?: AuroraAlternativeV1[];
   ingredient_search?: IngredientSearchOutputV1;
+  ingredient_research_profiles?: Array<Record<string, unknown>>;
   external_verification?: ExternalVerification;
   conflicts?: ConflictDetectorOutputV1;
   kb_requirements_check?: {
@@ -600,6 +606,79 @@ function inferSessionSkinProfileFromMessages(messages: unknown[], query: string)
   return merged;
 }
 
+function normalizeSessionSkinTypeValue(value: unknown): SessionSkinProfile["skinType"] {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+
+  if (/(combination|combo|mixed|混合)/i.test(raw)) return "Combo";
+  if (/(oily|油皮|油性|油痘)/i.test(raw)) return "Oily";
+  if (/(dry|干皮|干性|极干)/i.test(raw)) return "Dry";
+  if (/(normal|中性|正常肤质)/i.test(raw)) return "Normal";
+  if (/(not sure|unsure|unknown|不确定|不知道)/i.test(raw)) return "Unknown";
+
+  // Accept title-cased values already aligned with SessionSkinProfile.
+  if (lower === "combo" || lower === "oily" || lower === "dry" || lower === "normal" || lower === "unknown") {
+    return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
+  }
+  return null;
+}
+
+function normalizeSessionBarrierStatusValue(value: unknown): SessionSkinProfile["barrierStatus"] {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+
+  if (
+    /(impaired|reactive|sensitive|stinging|red|burning|刺痛|泛红|敏感|受损|屏障差)/i.test(raw) &&
+    !/(not stinging|not red|不刺痛|不泛红)/i.test(raw)
+  ) {
+    return "Impaired";
+  }
+  if (/(healthy|stable|strong|耐受|稳定|屏障健康|屏障稳定)/i.test(raw)) return "Healthy";
+  if (/(not sure|unsure|unknown|不确定|不知道)/i.test(raw)) return "Unknown";
+
+  if (lower === "impaired" || lower === "healthy" || lower === "unknown") {
+    return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
+  }
+  return null;
+}
+
+function inferSessionSkinProfileFromBffProfile(profile: unknown): SessionSkinProfile {
+  if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
+    return { skinType: null, barrierStatus: null, concerns: [] };
+  }
+
+  const p = profile as Record<string, unknown>;
+  const skinType = normalizeSessionSkinTypeValue(p.skinType ?? p.skin_type);
+  const barrierStatus = normalizeSessionBarrierStatusValue(p.barrierStatus ?? p.barrier_status ?? p.barrier);
+
+  const concernPool: string[] = [];
+  const goals = Array.isArray(p.goals) ? p.goals : [];
+  const concerns = Array.isArray(p.concerns) ? p.concerns : [];
+  for (const raw of [...goals, ...concerns]) {
+    const text = String(raw ?? "").trim();
+    if (text) concernPool.push(text);
+  }
+  const concernSet = new Set<string>();
+  for (const item of concernPool) {
+    for (const mapped of inferSessionConcernsFromText(item)) concernSet.add(mapped);
+  }
+
+  return { skinType, barrierStatus, concerns: Array.from(concernSet) };
+}
+
+function mergeSessionSkinProfiles(primary: SessionSkinProfile, secondary: SessionSkinProfile): SessionSkinProfile {
+  const p = primary ?? { skinType: null, barrierStatus: null, concerns: [] };
+  const s = secondary ?? { skinType: null, barrierStatus: null, concerns: [] };
+  const concerns = new Set<string>([...(Array.isArray(p.concerns) ? p.concerns : []), ...(Array.isArray(s.concerns) ? s.concerns : [])]);
+  return {
+    skinType: p.skinType || s.skinType || null,
+    barrierStatus: p.barrierStatus || s.barrierStatus || null,
+    concerns: Array.from(concerns),
+  };
+}
+
 function isSessionSkinProfileComplete(profile: SessionSkinProfile) {
   return Boolean(profile.skinType) && Boolean(profile.barrierStatus) && profile.concerns.length > 0;
 }
@@ -784,7 +863,7 @@ function buildAuroraStructuredSystemPrompt(input: {
       ? "LANGUAGE: Reply in Simplified Chinese."
       : "LANGUAGE: Reply in English.";
 
-  const unknownPriceLabel = input.language === "zh" ? "价格未知" : "Price unknown";
+  const unknownPriceLabel = input.language === "zh" ? "价格暂不可得" : "Price unavailable";
 
   const modeGuidance =
     input.mode === "routine"
@@ -853,6 +932,8 @@ function extractTextFromUnknownMessage(message: unknown): string {
 function normalizeQuery(body: ChatRequest): string {
   const query = typeof body.query === "string" && body.query.trim() ? body.query.trim() : null;
   const message = typeof body.message === "string" && body.message.trim() ? body.message.trim() : null;
+  const actionLabel = typeof body.action_label === "string" && body.action_label.trim() ? body.action_label.trim() : null;
+  const actionId = typeof body.action_id === "string" && body.action_id.trim() ? body.action_id.trim() : null;
 
   // Some clients accidentally keep `query` static while still sending updated `messages[]`.
   // Heuristic: if `query` matches any earlier user message but differs from the latest user message, prefer the latest.
@@ -871,6 +952,8 @@ function normalizeQuery(body: ChatRequest): string {
   }
 
   if (message) return message;
+  if (actionLabel) return actionLabel;
+  if (actionId) return actionId;
 
   if (Array.isArray(body.messages) && body.messages.length > 0) {
     const lastUser = [...body.messages].reverse().find((m) => Boolean(m && typeof m === "object" && (m as any).role === "user"));
@@ -1176,15 +1259,30 @@ function detectDupeIntent(query: string) {
 function detectProductEvaluationIntent(query: string) {
   const q = query.toLowerCase();
   return (
+    q.includes("evaluate") ||
+    q.includes("evaluation") ||
+    q.includes("assess") ||
+    q.includes("analyze this product") ||
+    q.includes("analyse this product") ||
+    q.includes("check this product") ||
+    q.includes("product check") ||
     q.includes("worth") ||
     q.includes("good") ||
     q.includes("ok") ||
     q.includes("works") ||
     q.includes("review") ||
+    query.includes("评测") ||
     q.includes("怎么样") ||
     query.includes("评估") ||
     query.includes("测评") ||
     query.includes("评价") ||
+    query.includes("测一下") ||
+    query.includes("看一下这款") ||
+    query.includes("看看这款") ||
+    query.includes("分析这款") ||
+    query.includes("分析这个产品") ||
+    query.includes("评估这款") ||
+    query.includes("评估这个产品") ||
     query.includes("分析一下") ||
     query.includes("好用吗") ||
     query.includes("值吗") ||
@@ -1457,6 +1555,14 @@ function detectDeepScienceQuestion(query: string): boolean {
   const q = query.toLowerCase();
 
   const enHits = [
+    "ingredient science",
+    "ingredient analysis",
+    "analyze ingredient",
+    "analyse ingredient",
+    "ingredient mechanism",
+    "benefits",
+    "watchout",
+    "watchouts",
     "evidence",
     "study",
     "paper",
@@ -1476,10 +1582,358 @@ function detectDeepScienceQuestion(query: string): boolean {
   ];
   if (enHits.some((h) => q.includes(h))) return true;
 
-  const cnHits = ["论文", "研究", "临床", "随机", "双盲", "指南", "共识", "循证", "证据", "机制", "有效吗", "有用吗", "副作用", "毒理", "风险", "安全性"];
+  const cnHits = [
+    "成分分析",
+    "成分科学",
+    "机理",
+    "机制",
+    "好处",
+    "益处",
+    "注意事项",
+    "避坑",
+    "风险点",
+    "论文",
+    "研究",
+    "临床",
+    "随机",
+    "双盲",
+    "指南",
+    "共识",
+    "循证",
+    "证据",
+    "有效吗",
+    "有用吗",
+    "副作用",
+    "毒理",
+    "风险",
+    "安全性",
+  ];
   if (cnHits.some((h) => query.includes(h))) return true;
 
   return false;
+}
+
+type IntentSignalSourceV2 = "action_id" | "known_option_text" | "heuristic_regex" | "none";
+type IntentResolvedV2 = "reco_products" | "routine" | "evaluate_product" | "dupe_compare" | "ingredient_science" | null;
+type IntentSignalIdV2 =
+  | "next.reco_products"
+  | "next.routine"
+  | "next.evaluate_product"
+  | "next.dupes"
+  | "next.ingredient_science"
+  | "anchor.send_product_name"
+  | "anchor.send_link"
+  | "anchor.send_anchor_id"
+  | "reco_products"
+  | "routine"
+  | "evaluate_product"
+  | "dupe_compare"
+  | "ingredient_science";
+
+type IntentSignalV2 = {
+  source: IntentSignalSourceV2;
+  intent_id: IntentSignalIdV2 | null;
+  intent_resolved: IntentResolvedV2;
+  matched_text?: string;
+};
+
+function normalizeIntentLikeText(value: string) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function resolveIntentFromIntentIdV2(intentId: IntentSignalIdV2 | null): IntentResolvedV2 {
+  if (!intentId) return null;
+  if (intentId === "next.reco_products" || intentId === "reco_products") return "reco_products";
+  if (intentId === "next.routine" || intentId === "routine") return "routine";
+  if (intentId === "next.evaluate_product" || intentId === "evaluate_product") return "evaluate_product";
+  if (intentId === "next.dupes" || intentId === "dupe_compare") return "dupe_compare";
+  if (intentId === "next.ingredient_science" || intentId === "ingredient_science") return "ingredient_science";
+  return null;
+}
+
+function mapKnownOptionTextToIntentIdV2(input: string): IntentSignalIdV2 | null {
+  const text = normalizeIntentLikeText(input);
+  if (!text) return null;
+
+  const hit = (patterns: RegExp[]) => patterns.some((p) => p.test(text));
+
+  if (
+    hit([
+      /^recommend( a few| 1-3)?( gentle)? products?/i,
+      /brightening serum/i,
+      /^给我推荐/i,
+      /推荐.*(单品|产品|精华)/i,
+    ])
+  ) {
+    return "next.reco_products";
+  }
+
+  if (
+    hit([
+      /build an am\/pm routine/i,
+      /\bam\/pm\b/i,
+      /generate routine/i,
+      /早晚流程/i,
+      /护肤流程/i,
+      /护肤方案/i,
+    ])
+  ) {
+    return "next.routine";
+  }
+
+  if (
+    hit([
+      /evaluate a specific product/i,
+      /\bevaluate\b.*\bproduct\b/i,
+      /\bassess\b.*\bproduct\b/i,
+      /\bcheck\b.*\bproduct\b/i,
+      /^评估/i,
+      /评估.*产品/i,
+      /评估.*单品/i,
+      /测评/i,
+      /评价/i,
+    ])
+  ) {
+    return "next.evaluate_product";
+  }
+
+  if (
+    hit([
+      /find dupes?/i,
+      /cheaper alternatives?/i,
+      /\bdupe\b/i,
+      /^平替$/i,
+      /平替|替代|更便宜/i,
+    ])
+  ) {
+    return "next.dupes";
+  }
+
+  if (
+    hit([
+      /ask ingredient science/i,
+      /evidence\/mechanism/i,
+      /ingredient (science|analysis|mechanism)/i,
+      /analy[sz]e ingredient/i,
+      /成分(科学|分析)/i,
+      /机理|机制|循证|证据/i,
+    ])
+  ) {
+    return "next.ingredient_science";
+  }
+
+  if (hit([/^send product name$/i, /^直接发产品名$/i, /发产品名/i])) return "anchor.send_product_name";
+  if (hit([/^send a link$/i, /^send link$/i, /^发购买链接$/i, /^发链接$/i, /发送链接/i])) return "anchor.send_link";
+  if (hit([/^send anchor_product_id$/i, /anchor_product_id/i, /^传 anchor_product_id$/i])) return "anchor.send_anchor_id";
+
+  return null;
+}
+
+function mapActionIdToIntentIdV2(actionIdRaw: string): IntentSignalIdV2 | null {
+  const actionId = String(actionIdRaw ?? "").trim();
+  if (!actionId) return null;
+  const normalized = actionId.toLowerCase();
+
+  const direct: IntentSignalIdV2[] = [
+    "next.reco_products",
+    "next.routine",
+    "next.evaluate_product",
+    "next.dupes",
+    "next.ingredient_science",
+    "anchor.send_product_name",
+    "anchor.send_link",
+    "anchor.send_anchor_id",
+    "reco_products",
+    "routine",
+    "evaluate_product",
+    "dupe_compare",
+    "ingredient_science",
+  ];
+  if (direct.includes(normalized as IntentSignalIdV2)) return normalized as IntentSignalIdV2;
+
+  // Legacy index-style ids (e.g. "next:2" / "anchor:1").
+  const m = normalized.match(/^([a-z_]+)[:.]([0-9]+)$/);
+  if (m?.[1] && m?.[2]) {
+    const qid = m[1];
+    const idx = Number(m[2]);
+    const mapped = mapClarificationOptionToActionId({ questionId: qid, optionIndex: idx, optionText: "" });
+    if (mapped) return mapped;
+  }
+
+  if (normalized.includes("evaluate")) return "next.evaluate_product";
+  if (normalized.includes("dupe") || normalized.includes("alternative")) return "next.dupes";
+  if (normalized.includes("science")) return "next.ingredient_science";
+  if (normalized.includes("routine")) return "next.routine";
+  if (normalized.includes("reco")) return "next.reco_products";
+  if (normalized.includes("send_link")) return "anchor.send_link";
+  if (normalized.includes("send_product_name")) return "anchor.send_product_name";
+
+  return null;
+}
+
+function mapClarificationOptionToActionId(input: {
+  questionId: string;
+  optionIndex: number;
+  optionText: string;
+}): IntentSignalIdV2 | null {
+  const qid = String(input.questionId ?? "").trim().toLowerCase();
+  const idx = Number.isFinite(input.optionIndex) ? Math.max(0, Math.floor(input.optionIndex)) : -1;
+  const opt = normalizeIntentLikeText(input.optionText);
+
+  if (qid === "next") {
+    if (idx === 0) return "next.reco_products";
+    if (idx === 1) return "next.routine";
+    if (idx === 2) return "next.evaluate_product";
+    if (idx === 3) return "next.dupes";
+    if (idx === 4) return "next.ingredient_science";
+    return mapKnownOptionTextToIntentIdV2(opt);
+  }
+
+  if (qid === "anchor") {
+    if (idx === 0) return "anchor.send_product_name";
+    if (idx === 1) return "anchor.send_link";
+    if (idx === 2) return "anchor.send_anchor_id";
+    return mapKnownOptionTextToIntentIdV2(opt);
+  }
+
+  return mapKnownOptionTextToIntentIdV2(opt);
+}
+
+function resolveIntentSignalV2(input: {
+  query: string;
+  action_id?: string | null;
+  action_label?: string | null;
+  clarification_id?: string | null;
+  selected_option_index?: number | null;
+}): IntentSignalV2 {
+  const actionId = String(input.action_id ?? "").trim();
+  const actionLabel = String(input.action_label ?? "").trim();
+  const clarificationId = String(input.clarification_id ?? "").trim();
+  const selectedOptionIndex = typeof input.selected_option_index === "number" ? input.selected_option_index : null;
+  const query = String(input.query ?? "").trim();
+
+  if (actionId) {
+    const mappedById = mapActionIdToIntentIdV2(actionId);
+    if (mappedById) {
+      return {
+        source: "action_id",
+        intent_id: mappedById,
+        intent_resolved: resolveIntentFromIntentIdV2(mappedById),
+        matched_text: actionId,
+      };
+    }
+  }
+
+  if (clarificationId && selectedOptionIndex != null && Number.isFinite(selectedOptionIndex)) {
+    const mappedByClarification = mapClarificationOptionToActionId({
+      questionId: clarificationId,
+      optionIndex: selectedOptionIndex,
+      optionText: actionLabel || query,
+    });
+    if (mappedByClarification) {
+      return {
+        source: "action_id",
+        intent_id: mappedByClarification,
+        intent_resolved: resolveIntentFromIntentIdV2(mappedByClarification),
+        matched_text: `${clarificationId}:${selectedOptionIndex}`,
+      };
+    }
+  }
+
+  const knownText = actionLabel || query;
+  const knownMapped = mapKnownOptionTextToIntentIdV2(knownText);
+  if (knownMapped) {
+    return {
+      source: "known_option_text",
+      intent_id: knownMapped,
+      intent_resolved: resolveIntentFromIntentIdV2(knownMapped),
+      matched_text: knownText,
+    };
+  }
+
+  const heuristicCandidates: Array<{ when: boolean; id: IntentSignalIdV2 }> = [
+    { when: /\b(send (a )?link|paste (a )?link)\b/i.test(query) || /发(购买)?链接|贴链接/.test(query), id: "anchor.send_link" },
+    { when: /\b(send product name|product name)\b/i.test(query) || /发产品名/.test(query), id: "anchor.send_product_name" },
+    { when: /\banchor_product_id\b/i.test(query) || /传\s*anchor_product_id/.test(query), id: "anchor.send_anchor_id" },
+    { when: detectDeepScienceQuestion(query), id: "ingredient_science" },
+    { when: detectDupeIntent(query), id: "dupe_compare" },
+    { when: detectProductEvaluationIntent(query), id: "evaluate_product" },
+    { when: detectRoutineIntegrationIntent(query), id: "routine" },
+    { when: detectProductShortlistIntent(query), id: "reco_products" },
+  ];
+
+  for (const c of heuristicCandidates) {
+    if (!c.when) continue;
+    return {
+      source: "heuristic_regex",
+      intent_id: c.id,
+      intent_resolved: resolveIntentFromIntentIdV2(c.id),
+      matched_text: query,
+    };
+  }
+
+  return { source: "none", intent_id: null, intent_resolved: null };
+}
+
+function isLoopingClarificationLikeAnswerV2(answer: string): boolean {
+  const t = String(answer ?? "").trim();
+  if (!t) return false;
+  if (/pick what you want next|先选一下方向|我可以继续，但我需要你先选|i can continue, but/i.test(t)) return true;
+  if (/quick skin profile|补齐一个简短的皮肤画像|before i can recommend products safely/i.test(t)) return true;
+  if (/reply with the options|点选即可|tap an option/i.test(t)) return true;
+  return false;
+}
+
+function countRecentAssistantClarificationLoopsV2(messages: unknown[], maxScan = 8): number {
+  if (!Array.isArray(messages) || messages.length === 0) return 0;
+  let count = 0;
+  const recent = [...messages].slice(-maxScan).reverse();
+  for (const item of recent) {
+    if (!item || typeof item !== "object") continue;
+    if ((item as any).role !== "assistant") continue;
+    const text = extractTextFromUnknownMessage(item);
+    if (!text.trim()) continue;
+    if (isLoopingClarificationLikeAnswerV2(text)) count += 1;
+    else break;
+  }
+  return count;
+}
+
+function buildSingleSoftSafetyQuestion(input: {
+  missing: { skinType: boolean; barrierStatus: boolean; concerns: boolean };
+  lang: UserLanguage;
+}): ClarificationQuestion | null {
+  if (input.missing.barrierStatus) {
+    return {
+      id: "barrier_status",
+      question:
+        input.lang === "zh"
+          ? "补 1 个安全信息：你当前屏障是稳定，还是会刺痛/泛红？"
+          : "One quick safety check: is your barrier stable, or do you have stinging/redness?",
+      options: input.lang === "zh" ? ["稳定", "刺痛/泛红", "不确定"] : ["Stable", "Stinging/Red", "Not sure"],
+    };
+  }
+  if (input.missing.skinType) {
+    return {
+      id: "skin_type",
+      question: input.lang === "zh" ? "补 1 个安全信息：你更偏油皮 / 干皮 / 混合皮？" : "One quick safety check: is your skin oily, dry, or mixed?",
+      options: input.lang === "zh" ? ["油皮", "干皮", "混合/中性", "不确定"] : ["Oily", "Dry", "Combo/Mixed", "Not sure"],
+    };
+  }
+  if (input.missing.concerns) {
+    return {
+      id: "goals",
+      question: input.lang === "zh" ? "最后补 1 个目标：你更想优先解决什么？" : "One last thing for safety: what is your main goal?",
+      options:
+        input.lang === "zh"
+          ? ["痘痘/闭口/粗糙", "提亮/淡斑", "抗老/细纹", "泛红/修护屏障", "补水保湿"]
+          : ["Acne/Texture", "Dark spots/Brightening", "Aging", "Redness/Barrier repair", "Hydration"],
+    };
+  }
+  return null;
 }
 
 function parseBudgetCny(query: string): number | null {
@@ -1503,7 +1957,8 @@ function buildNextActionsFromClarificationQuestions(questions: ClarificationQues
     for (let idx = 0; idx < options.length; idx += 1) {
       const opt = String(options[idx] ?? "").trim();
       if (!opt) continue;
-      out.push({ id: `${q.id}:${idx}`, label: opt, text: opt, next_state: "S_DIAGNOSIS" });
+      const semanticId = mapClarificationOptionToActionId({ questionId: q.id, optionIndex: idx, optionText: opt });
+      out.push({ id: semanticId ?? `${q.id}:${idx}`, label: opt, text: opt, next_state: "S_DIAGNOSIS" });
     }
   }
   return out.slice(0, 10);
@@ -3412,6 +3867,7 @@ function buildBudgetSafeRoutine(db: SkuVector[], user: UserVector, query: string
 function isBadAnswer(answer: string, mode: "routine" | "product") {
   const trimmed = answer.trim();
   if (trimmed.length < 80) return true;
+  if (isLoopingClarificationLikeAnswerV2(trimmed)) return true;
 
   // Reject obvious "unfinished bullet" stubs that commonly happen with streaming truncation.
   if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
@@ -3449,6 +3905,7 @@ function isBadRoutineCheckAnswer(answer: string, opts?: { activeLike?: boolean }
   const trimmed = answer.trim();
   if (trimmed.length < 80) return true;
   if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
+  if (isLoopingClarificationLikeAnswerV2(trimmed)) return true;
 
   // Avoid dead-end "pick a direction" loops.
   if (/(我可以继续|需要你先选|pick what you want next|I can continue, but)/i.test(trimmed)) return true;
@@ -3501,6 +3958,7 @@ function isBadScienceAnswer(
   const trimmed = answer.trim();
   if (trimmed.length < 80) return true;
   if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
+  if (isLoopingClarificationLikeAnswerV2(trimmed)) return true;
 
   // In science-only mode we should not output a full AM/PM routine template.
   const looksLikeRoutineTemplate =
@@ -3530,6 +3988,7 @@ function isBadShortlistAnswer(answer: string) {
   const trimmed = answer.trim();
   if (trimmed.length < 60) return true;
   if (/\n\s*[-*•]\s*$/.test(trimmed)) return true;
+  if (isLoopingClarificationLikeAnswerV2(trimmed)) return true;
 
   return false;
 }
@@ -3555,7 +4014,7 @@ function buildFallbackShortlistAnswer(input: {
   const lang = detectUserLanguage(input.query);
   const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
   const priceLabel = (usd: number | null) =>
-    usd != null && Number.isFinite(usd) && usd > 0 ? formatUsd(usd) : t("Price unknown", "价格未知");
+    usd != null && Number.isFinite(usd) && usd > 0 ? formatUsd(usd) : t("Price unavailable", "价格暂不可得");
   const region = input.regionLabel?.trim() ? input.regionLabel.trim() : "Global";
 
   const lines: string[] = [];
@@ -3625,7 +4084,7 @@ function buildFallbackProductAnswer(input: {
   const lang = detectUserLanguage(input.query);
   const t = (en: string, zh: string) => (lang === "zh" ? zh : en);
   const priceLabel = (usd: number | null) =>
-    usd != null && Number.isFinite(usd) && usd > 0 ? formatUsd(usd) : t("Price unknown", "价格未知");
+    usd != null && Number.isFinite(usd) && usd > 0 ? formatUsd(usd) : t("Price unavailable", "价格暂不可得");
 
   const header =
     detected.barrier_impaired && anchor.vetoed
@@ -3937,7 +4396,7 @@ function buildFallbackRoutineAnswer(input: {
   const withinBudget =
     budget_cny != null && costSummary.unknownCount === 0 ? costSummary.knownCny <= budget_cny : null;
 
-  const priceLabel = (usd: number) => (!Number.isFinite(usd) || usd <= 0 ? t("Price unknown", "价格未知") : formatUsd(usd));
+  const priceLabel = (usd: number) => (!Number.isFinite(usd) || usd <= 0 ? t("Price unavailable", "价格暂不可得") : formatUsd(usd));
 
   const budgetNegotiation = (() => {
     const budgetUsd = budget_cny != null ? budget_cny / USD_TO_CNY : null;
@@ -4143,8 +4602,17 @@ export async function POST(req: Request) {
   const query = bffContext?.stripped_query?.trim() ? bffContext.stripped_query.trim() : rawQuery;
 
   const { userId, setCookieHeader } = getOrCreateAnonymousUserId(req);
-  const jsonResponse = (data: unknown, init?: Parameters<typeof NextResponse.json>[1]) =>
-    withSetCookie(NextResponse.json(data, init), setCookieHeader);
+  const jsonResponse = (data: unknown, init?: Parameters<typeof NextResponse.json>[1]) => {
+    const routing = (data as any)?.router_v2;
+    if (routing && process.env.NODE_ENV !== "test") {
+      try {
+        console.info("[aurora.chat.router_v2]", JSON.stringify(routing));
+      } catch {
+        // no-op
+      }
+    }
+    return withSetCookie(NextResponse.json(data, init), setCookieHeader);
+  };
   const streamResponse = (text: string, opts?: Parameters<typeof streamTextResponse>[1]) =>
     withSetCookie(streamTextResponse(text, opts), setCookieHeader);
 
@@ -4157,7 +4625,11 @@ export async function POST(req: Request) {
   // Use recent user messages as additional context for Phase-0 clarification and profile inference.
   // This prevents redundant questions when the user already provided skin type / barrier / goals earlier in the session.
   const profileText = [recentUserContextText, query].filter(Boolean).join("\n");
-  const sessionProfileEarly = inferSessionSkinProfileFromMessages(messages, query);
+  const inferredSessionProfile = inferSessionSkinProfileFromMessages(messages, query);
+  const sessionProfileEarly = mergeSessionSkinProfiles(
+    inferredSessionProfile,
+    inferSessionSkinProfileFromBffProfile(bffContext?.profile ?? null),
+  );
   const profileAnswerKind = detectProfileAnswerKind(query);
   const contextualQuery =
     isShortFollowUpQuery(query) && recentUserContextText.trim() && recentUserContextText.trim() !== query
@@ -4791,21 +5263,59 @@ export async function POST(req: Request) {
 
   const userLang = detectUserLanguage(profileText);
   const languageTag = toAuroraLanguageTag(userLang);
+  const intentRouterV2Enabled = (() => {
+    const raw = process.env.AURORA_CHAT_INTENT_ROUTER_V2;
+    if (raw == null || raw.trim() === "") return true;
+    return /^(1|true|yes|on)$/i.test(raw.trim());
+  })();
+  const requestActionId = typeof body.action_id === "string" && body.action_id.trim() ? body.action_id.trim() : null;
+  const requestActionLabel = typeof body.action_label === "string" && body.action_label.trim() ? body.action_label.trim() : null;
+  const requestClarificationId = typeof body.clarification_id === "string" && body.clarification_id.trim() ? body.clarification_id.trim() : null;
+  const requestSelectedOptionIndex = typeof body.selected_option_index === "number" ? body.selected_option_index : null;
+  const intentSignalV2 = intentRouterV2Enabled
+    ? resolveIntentSignalV2({
+        query,
+        action_id: requestActionId,
+        action_label: requestActionLabel,
+        clarification_id: requestClarificationId,
+        selected_option_index: requestSelectedOptionIndex,
+      })
+    : ({ source: "none", intent_id: null, intent_resolved: null } satisfies IntentSignalV2);
+  const recentIntentSignalV2 =
+    intentRouterV2Enabled && recentUserContextText.trim()
+      ? resolveIntentSignalV2({ query: recentUserContextText })
+      : ({ source: "none", intent_id: null, intent_resolved: null } satisfies IntentSignalV2);
+  const resolvedIntentV2 = intentSignalV2.intent_resolved ?? recentIntentSignalV2.intent_resolved;
+  const loopLikeClarificationCount = intentRouterV2Enabled ? countRecentAssistantClarificationLoopsV2(messages) : 0;
+  const routingMeta = {
+    intent_source: intentSignalV2.source,
+    intent_resolved: resolvedIntentV2,
+    loop_breaker_triggered: false,
+    gate_applied: "none" as "none" | "phase0_strict" | "phase0_soft",
+    clarification_id: requestClarificationId,
+  };
   const envelope = <T extends Record<string, unknown>>(payload: T) =>
-    ({ schema_version: AURORA_CHAT_SCHEMA_VERSION satisfies AuroraChatSchemaVersion, language: languageTag, ...payload }) as const;
+    ({
+      schema_version: AURORA_CHAT_SCHEMA_VERSION satisfies AuroraChatSchemaVersion,
+      language: languageTag,
+      ...(intentRouterV2Enabled ? { router_v2: routingMeta } : {}),
+      ...payload,
+    }) as const;
   const intentText = contextualQuery;
 
   const budgetCny = parseBudgetCny(intentText);
   const priceSensitive = detectPriceSensitivity(intentText);
   const detectedRegion = detectRegionPreference(intentText);
   const regionLabel = detectedRegion ?? "Global";
-  const deepScience = detectDeepScienceQuestion(intentText);
+  let deepScience = detectDeepScienceQuestion(intentText);
 
   const activeMentions = extractActiveMentions(intentText);
   const similarEfficacyIntent = detectSimilarEfficacyIntent(intentText);
 
   const explicitAnchorId =
     typeof body.anchor_product_id === "string" && body.anchor_product_id.trim() ? body.anchor_product_id.trim() : null;
+  const explicitAnchorUrl =
+    typeof body.anchor_product_url === "string" && body.anchor_product_url.trim() ? body.anchor_product_url.trim() : null;
   const resolvedExplicitAnchor = explicitAnchorId
     ? (await resolveAuroraProductId({
         value: explicitAnchorId,
@@ -4814,9 +5324,33 @@ export async function POST(req: Request) {
       })) ??
       (await resolveAuroraProductId({ value: explicitAnchorId }))
     : null;
-  const dupeIntent = detectDupeIntent(intentText);
-  const evalIntent = detectProductEvaluationIntent(intentText);
-  const routineIntent =
+  let resolvedExplicitAnchorFromUrl: Awaited<ReturnType<typeof resolveAuroraProductId>> | null = null;
+  if (explicitAnchorUrl) {
+    // Prefer explicit URL crosswalk lookup first, then broaden source filters.
+    const resolverHints: Array<{ sourceSystem?: string; sourceType?: string }> = [
+      { sourceSystem: "pivota", sourceType: "product_url" },
+      { sourceSystem: "pivota", sourceType: "url" },
+      { sourceType: "product_url" },
+      { sourceType: "url" },
+      {},
+    ];
+    for (const hint of resolverHints) {
+      const resolved = await resolveAuroraProductId({
+        value: explicitAnchorUrl,
+        ...(hint.sourceSystem ? { sourceSystem: hint.sourceSystem } : {}),
+        ...(hint.sourceType ? { sourceType: hint.sourceType } : {}),
+      });
+      if (resolved) {
+        resolvedExplicitAnchorFromUrl = resolved;
+        break;
+      }
+    }
+  }
+  const hasResolvedExplicitAnchor = Boolean(resolvedExplicitAnchor?.product_id || resolvedExplicitAnchorFromUrl?.product_id);
+  const hasExplicitAnchorInput = Boolean(explicitAnchorId || explicitAnchorUrl);
+  let dupeIntent = detectDupeIntent(intentText);
+  let evalIntent = detectProductEvaluationIntent(intentText);
+  let routineIntent =
     intentText.includes("流程") ||
     intentText.includes("早晚") ||
     intentText.includes("怎么用") ||
@@ -4824,8 +5358,17 @@ export async function POST(req: Request) {
     intentText.includes("叠加") ||
     intentText.toLowerCase().includes("routine") ||
     intentText.toLowerCase().includes("layer");
+  let explicitRecoIntent = false;
 
-  const aliasCandidates = explicitAnchorId ? [] : await findAnchorCandidatesFromAliases(intentText);
+  if (intentRouterV2Enabled && resolvedIntentV2) {
+    if (resolvedIntentV2 === "dupe_compare") dupeIntent = true;
+    if (resolvedIntentV2 === "evaluate_product") evalIntent = true;
+    if (resolvedIntentV2 === "routine") routineIntent = true;
+    if (resolvedIntentV2 === "ingredient_science") deepScience = true;
+    if (resolvedIntentV2 === "reco_products") explicitRecoIntent = true;
+  }
+
+  const aliasCandidates = hasExplicitAnchorInput ? [] : await findAnchorCandidatesFromAliases(intentText);
   const bestAlias = aliasCandidates[0] ?? null;
   const isBrandOnlyAlias = typeof bestAlias?.alias_kind === "string" && bestAlias.alias_kind.toLowerCase().includes("brand");
   const highConfidenceAlias = bestAlias != null && bestAlias.confidence >= 0.72 && !isBrandOnlyAlias;
@@ -4834,18 +5377,67 @@ export async function POST(req: Request) {
 
   const wantsShortlistNoAnchor =
     !routineIntent &&
-    (detectProductShortlistIntent(intentText) ||
+    (explicitRecoIntent ||
+      detectProductShortlistIntent(intentText) ||
       similarEfficacyIntent ||
-      (evalIntent && activeMentions.length > 0) ||
       // If the user has completed their profile via chips and the last chip is a goal (e.g. "提亮/淡斑"),
       // default into the shortlist path. This avoids a dead-end "what next?" loop.
       (profileAnswerKind === "concerns" && hasCompleteSessionProfile));
 
   // Legacy fallback (brand heuristics + loose token match).
-  const legacyAnchorId = !explicitAnchorId && (dupeIntent || evalIntent) ? await findAnchorProductId(intentText) : null;
+  const legacyAnchorId = !hasExplicitAnchorInput && (dupeIntent || evalIntent) ? await findAnchorProductId(intentText) : null;
 
-  const anchorProductId = resolvedExplicitAnchor?.product_id ?? explicitAnchorId ?? (highConfidenceAlias ? bestAlias.product_id : null) ?? legacyAnchorId;
+  const anchorProductId =
+    resolvedExplicitAnchor?.product_id ??
+    resolvedExplicitAnchorFromUrl?.product_id ??
+    explicitAnchorId ??
+    (highConfidenceAlias ? bestAlias.product_id : null) ??
+    legacyAnchorId;
   const wantsShortlist = wantsShortlistNoAnchor && (!anchorProductId || !looksLikeUuid(anchorProductId));
+
+  const isAnchorCollectionIntent =
+    intentSignalV2.intent_id === "anchor.send_product_name" ||
+    intentSignalV2.intent_id === "anchor.send_link" ||
+    intentSignalV2.intent_id === "anchor.send_anchor_id";
+
+  if (intentRouterV2Enabled && isAnchorCollectionIntent) {
+    const answer =
+      intentSignalV2.intent_id === "anchor.send_link"
+        ? userLang === "zh"
+          ? "好的，请直接把产品链接贴在下一条消息里（电商页/品牌页都可以），我会继续解析并评估。"
+          : "Please paste the product link in your next message (retailer or brand page is fine), and I’ll continue the evaluation."
+        : intentSignalV2.intent_id === "anchor.send_anchor_id"
+          ? userLang === "zh"
+            ? "好的，请直接发 `anchor_product_id`（UUID），我会按该产品继续分析。"
+            : "Please send the `anchor_product_id` (UUID) in your next message, and I’ll continue with that product."
+          : userLang === "zh"
+            ? "好的，请直接发完整产品名（品牌 + 产品名更好），我会继续评估。"
+            : "Please send the exact product name next (brand + product name is best), and I’ll continue the evaluation.";
+    const questions: ClarificationQuestion[] = [
+      userLang === "zh"
+        ? { id: "anchor", question: "你想怎么提供产品锚点？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] }
+        : { id: "anchor", question: "How do you want to provide the product anchor?", options: ["Send product name", "Send a link", "Send anchor_product_id"] },
+    ];
+    if (Boolean(body.stream)) return streamResponse(answer);
+    return jsonResponse(
+      envelope({
+        query,
+        intent: "clarify",
+        answer,
+        current_state: "S_SKU_BROWSING" satisfies AuroraState,
+        next_actions: buildNextActionsFromClarificationQuestions(questions),
+        clarification: { questions },
+        structured: {
+          schema_version: "aurora.structured.v1",
+          parse: {
+            normalized_query: query,
+            parse_confidence: 1,
+            normalized_query_language: languageTag,
+          },
+        } satisfies AuroraStructuredResultV1,
+      }),
+    );
+  }
 
   // If the user is asking for a dupe/compare, we should not silently drift into a routine.
   if ((dupeIntent || evalIntent) && !wantsShortlist && (!anchorProductId || !looksLikeUuid(anchorProductId))) {
@@ -4962,6 +5554,39 @@ export async function POST(req: Request) {
   }
 
   const skinProfileComplete = isSkinProfileComplete(userProfile) || isSessionSkinProfileComplete(sessionProfile);
+  const phase0Missing = {
+    skinType: !userProfile?.skinType && !sessionProfile.skinType,
+    barrierStatus: !userProfile?.barrierStatus && !sessionProfile.barrierStatus,
+    concerns: (userProfile?.concerns?.length ?? 0) === 0 && sessionProfile.concerns.length === 0,
+  };
+  const softSafetyFollowupQuestion =
+    intentRouterV2Enabled && !skinProfileComplete && (evalIntent || dupeIntent)
+      ? buildSingleSoftSafetyQuestion({ missing: phase0Missing, lang: userLang })
+      : null;
+  const applySoftSafetyFollowup = (base: { answer: string; next_actions: NextActionChip[] }) => {
+    if (!softSafetyFollowupQuestion) return { ...base, clarification: undefined as Record<string, unknown> | undefined };
+    routingMeta.gate_applied = "phase0_soft";
+    const prefix =
+      userLang === "zh"
+        ? "在我给你的主结论基础上，再补 1 个安全信息就能把建议收敛得更稳："
+        : "I can proceed with the core assessment now; one quick safety check will tighten the recommendation:";
+    const mergedNextActions = [
+      ...buildNextActionsFromClarificationQuestions([softSafetyFollowupQuestion]),
+      ...base.next_actions,
+    ].slice(0, 10);
+    return {
+      answer: `${base.answer}\n\n${prefix}\n- ${softSafetyFollowupQuestion.question}`,
+      next_actions: mergedNextActions,
+      clarification: {
+        questions: [softSafetyFollowupQuestion],
+        missing_fields: Object.entries(phase0Missing)
+          .filter(([, v]) => v)
+          .map(([k]) => k),
+        gate_mode: "soft_safety",
+      } satisfies Record<string, unknown>,
+    };
+  };
+
   const userHistoryContext = buildUserHistoryContext({
     userId,
     profile: userProfile,
@@ -4989,7 +5614,7 @@ export async function POST(req: Request) {
     } satisfies EnvStressInputV1,
   );
 
-  const phase0Enforcement = skinProfileComplete || wantsScienceOnly
+  const phase0Enforcement = skinProfileComplete || wantsScienceOnly || evalIntent || dupeIntent
     ? undefined
     : [
         "## Phase 0 Enforcement (Server)",
@@ -5008,30 +5633,31 @@ export async function POST(req: Request) {
       language: userLang,
     });
 
-  const wantsProductHelp =
-    routineIntent ||
-    dupeIntent ||
-    evalIntent ||
+  const looksLikeFollowUpAnswer =
+    isShortFollowUpQuery(query) &&
+    !/^(?:ok|okay|kk|thx|thanks|thank you|ty|好的|好|嗯|收到|明白|了解|谢谢|谢了|不用了|不用|先这样)$/i.test(query.trim());
+
+  const strictGateIntent =
+    shouldPlanRoutine ||
     wantsShortlist ||
     wantsShortlistNoAnchor ||
+    explicitRecoIntent ||
     detectProductShortlistIntent(intentText) ||
     similarEfficacyIntent ||
     /\b(am|pm)\b/i.test(intentText) ||
     intentText.toLowerCase().includes("skincare plan");
 
-  const looksLikeFollowUpAnswer =
-    isShortFollowUpQuery(query) &&
-    !/^(?:ok|okay|kk|thx|thanks|thank you|ty|好的|好|嗯|收到|明白|了解|谢谢|谢了|不用了|不用|先这样)$/i.test(query.trim());
+  const shouldApplyStrictPhase0 =
+    !wantsScienceOnly &&
+    !skinProfileComplete &&
+    (strictGateIntent || (looksLikeFollowUpAnswer && !evalIntent && !dupeIntent && !isAnchorCollectionIntent));
 
   // If the user is only answering a profile chip (and there is no prior "ask"),
   // short-circuit into deterministic Phase-0 progression to avoid LLM loops.
   // Exception: if the user just completed the "goals" chip (profile complete), let it flow into shortlist.
   if (!wantsScienceOnly && profileAnswerOnly && !(profileAnswerKind === "concerns" && hasCompleteSessionProfile)) {
-    const missing = {
-      skinType: !userProfile?.skinType && !sessionProfile.skinType,
-      barrierStatus: !userProfile?.barrierStatus && !sessionProfile.barrierStatus,
-      concerns: (userProfile?.concerns?.length ?? 0) === 0 && sessionProfile.concerns.length === 0,
-    };
+    routingMeta.gate_applied = "phase0_strict";
+    const missing = phase0Missing;
 
     const phase0Questions = buildPhase0ClarificationQuestions({ missing }, userLang);
     if (phase0Questions.length) {
@@ -5094,7 +5720,6 @@ export async function POST(req: Request) {
         options,
       },
     ];
-
     if (wantsStream) return streamResponse(answer);
     return jsonResponse(
       envelope({
@@ -5116,12 +5741,57 @@ export async function POST(req: Request) {
     );
   }
 
-  if (!wantsScienceOnly && (wantsProductHelp || looksLikeFollowUpAnswer) && !skinProfileComplete) {
-    const missing = {
-      skinType: !userProfile?.skinType && !sessionProfile.skinType,
-      barrierStatus: !userProfile?.barrierStatus && !sessionProfile.barrierStatus,
-      concerns: (userProfile?.concerns?.length ?? 0) === 0 && sessionProfile.concerns.length === 0,
-    };
+  if (shouldApplyStrictPhase0) {
+    routingMeta.gate_applied = "phase0_strict";
+    if (intentRouterV2Enabled && loopLikeClarificationCount >= 2) {
+      routingMeta.loop_breaker_triggered = true;
+      const loopBreakerQuestions: ClarificationQuestion[] = [
+        userLang === "zh"
+          ? {
+              id: "next_loop",
+              question: "为了避免继续卡在画像问题，你可以先走以下任一入口：",
+              options: [
+                "评估单品（发送产品名或链接）",
+                "成分科学（发送成分名 + 具体问题）",
+                "推荐产品（先告诉我肤质 + 目标）",
+              ],
+            }
+          : {
+              id: "next_loop",
+              question: "To avoid another profile loop, choose one clear path:",
+              options: [
+                "Evaluate one product (send name or link)",
+                "Ingredient science (send ingredient + question)",
+                "Recommend products (share skin type + goal first)",
+              ],
+            },
+      ];
+      const answer =
+        userLang === "zh"
+          ? "我检测到连续两轮澄清循环。已切到防循环模式：按下面任一路径继续，我会直接推进。"
+          : "I detected repeated clarification loops. Switching to loop-breaker mode: pick one path below and I’ll move forward directly.";
+      if (wantsStream) return streamResponse(answer);
+      return jsonResponse(
+        envelope({
+          query,
+          intent: "clarify",
+          answer,
+          current_state: "S_DIAGNOSIS" satisfies AuroraState,
+          next_actions: buildNextActionsFromClarificationQuestions(loopBreakerQuestions),
+          clarification: { questions: loopBreakerQuestions, loop_breaker: true },
+          structured: {
+            schema_version: "aurora.structured.v1",
+            parse: {
+              normalized_query: query,
+              parse_confidence: 0.3,
+              normalized_query_language: languageTag,
+            },
+          } satisfies AuroraStructuredResultV1,
+        }),
+      );
+    }
+
+    const missing = phase0Missing;
 
     const questions = buildPhase0ClarificationQuestions({ missing }, userLang);
     const lines: string[] = [];
@@ -5184,6 +5854,67 @@ export async function POST(req: Request) {
       }
     }
 
+    let ingredient_research_profiles: Array<{
+      ingredient_id: string;
+      inci_name: string | null;
+      zh_name: string | null;
+      evidence_grade: string | null;
+      primary_benefits: string[];
+      key_watchouts: string[];
+      top_claims: string[];
+      representative_products: Array<{ brand: string | null; product_name: string | null; product_rank: number | null }>;
+    }> = [];
+    let ingredient_research_error: string | null = null;
+    try {
+      const health = await ingredientKbHealthV1();
+      if (health.kb_ready) {
+        const terms = uniqueStrings([...(activeMentions ?? []), ingredientSearchQuery ?? ""])
+          .map((v) => String(v ?? "").trim())
+          .filter(Boolean)
+          .slice(0, 3);
+        for (const term of terms) {
+          const search = await searchIngredientResearchV1(term, 5);
+          const hit = Array.isArray(search.hits) ? search.hits[0] : null;
+          const ingredientId = String(hit?.ingredient_id ?? "").trim();
+          if (!ingredientId) continue;
+          const profile = await getIngredientResearchProfileV1(
+            ingredientId,
+            { claims_limit: 6, products_limit: 6, themes_limit: 4 },
+            { health },
+          );
+          const ingredient = profile.ingredient;
+          if (!ingredient) continue;
+          const parsePipe = (raw: string | null | undefined) =>
+            String(raw ?? "")
+              .split("|")
+              .map((s) => s.trim())
+              .filter(Boolean)
+              .slice(0, 8);
+          ingredient_research_profiles.push({
+            ingredient_id: profile.ingredient_id,
+            inci_name: ingredient.inci_name,
+            zh_name: ingredient.zh_name,
+            evidence_grade: ingredient.evidence_grade,
+            primary_benefits: parsePipe(ingredient.primary_benefits),
+            key_watchouts: parsePipe(profile.suitability_rule?.caution_for),
+            top_claims: (Array.isArray(profile.claims) ? profile.claims : [])
+              .map((c) => String(c?.claim_text ?? "").trim())
+              .filter(Boolean)
+              .slice(0, 4),
+            representative_products: (Array.isArray(profile.top_products) ? profile.top_products : [])
+              .slice(0, 4)
+              .map((p) => ({
+                brand: p.brand ?? null,
+                product_name: p.product_name ?? null,
+                product_rank: p.product_rank ?? null,
+              })),
+          });
+        }
+      }
+    } catch (e) {
+      ingredient_research_error = e instanceof Error ? e.message : String(e);
+    }
+
     const scienceContextData = {
       user_query: query,
       region_preference: detectedRegion,
@@ -5197,6 +5928,8 @@ export async function POST(req: Request) {
       ...(external_verification ? { external_verification } : {}),
       ...(ingredient_search ? { ingredient_search } : {}),
       ...(ingredient_search_error ? { ingredient_search_error } : {}),
+      ...(ingredient_research_profiles.length ? { ingredient_research_profiles } : {}),
+      ...(ingredient_research_error ? { ingredient_research_error } : {}),
       note: "Science-only question detected; no anchor product identified.",
     };
 
@@ -5265,6 +5998,8 @@ export async function POST(req: Request) {
           ...(external_verification ? { external_verification } : {}),
           ...(ingredient_search ? { ingredient_search } : {}),
           ...(ingredient_search_error ? { ingredient_search_error } : {}),
+          ...(ingredient_research_profiles.length ? { ingredient_research_profiles } : {}),
+          ...(ingredient_research_error ? { ingredient_research_error } : {}),
         },
         structured: {
           schema_version: "aurora.structured.v1",
@@ -5275,6 +6010,7 @@ export async function POST(req: Request) {
           },
           ...(external_verification ? { external_verification } : {}),
           ...(ingredient_search ? { ingredient_search } : {}),
+          ...(ingredient_research_profiles.length ? { ingredient_research_profiles } : {}),
         } satisfies AuroraStructuredResultV1,
       }),
     );
@@ -5617,7 +6353,7 @@ export async function POST(req: Request) {
     const refinementPrompt = [
       "You are improving an existing shortlist draft.",
       "CRITICAL: You MUST NOT change the product list (names/order). You may only improve explanations, add safety notes, and add citations if present.",
-      "If any price is unknown, say '价格未知' (do not print $0). Do not invent prices.",
+      "If any price is unavailable, say '价格暂不可得' (do not print $0). Do not invent prices.",
       "",
       "DRAFT SHORTLIST (DO NOT CHANGE THE LIST):",
       "```text",
@@ -6124,6 +6860,85 @@ export async function POST(req: Request) {
     }
 
     // Otherwise: treat as navigation (the user may just be answering a profile question or starting the chat).
+    if (intentRouterV2Enabled && loopLikeClarificationCount >= 2) {
+      routingMeta.loop_breaker_triggered = true;
+
+      if (resolvedIntentV2 === "evaluate_product" || resolvedIntentV2 === "dupe_compare") {
+        const answer =
+          userLang === "zh"
+            ? "我直接推进：请发你要评估/对比的具体产品（产品名或链接都可以）。"
+            : "I’ll move this forward directly: please send the exact product to evaluate/compare (name or link).";
+        const questions: ClarificationQuestion[] = [
+          userLang === "zh"
+            ? { id: "anchor", question: "你想评估/对比的具体产品是？", options: ["直接发产品名", "发购买链接", "传 anchor_product_id"] }
+            : { id: "anchor", question: "Which product do you want to evaluate/compare?", options: ["Send product name", "Send a link", "Send anchor_product_id"] },
+        ];
+        return jsonResponse(
+          envelope({
+            query,
+            intent: "clarify",
+            answer,
+            current_state: "S_SKU_BROWSING" satisfies AuroraState,
+            next_actions: buildNextActionsFromClarificationQuestions(questions),
+            clarification: { questions },
+            structured: {
+              schema_version: "aurora.structured.v1",
+              parse: {
+                normalized_query: query,
+                parse_confidence: 0.6,
+                normalized_query_language: languageTag,
+              },
+            } satisfies AuroraStructuredResultV1,
+          }),
+        );
+      }
+
+      const questions: ClarificationQuestion[] = [
+        userLang === "zh"
+          ? {
+              id: "next_loop",
+              question: "为了避免卡住，请选一个入口（并按提示输入）：",
+              options: [
+                "评估单品（发送产品名或链接）",
+                "成分科学（发送成分名 + 想了解的问题）",
+                "推荐产品（发送目标，如提亮/祛痘）",
+              ],
+            }
+          : {
+              id: "next_loop",
+              question: "To avoid getting stuck, pick one clear entry (with required input):",
+              options: [
+                "Evaluate one product (send name or link)",
+                "Ingredient science (send ingredient + question)",
+                "Recommend products (send your goal)",
+              ],
+            },
+      ];
+      const answer =
+        userLang === "zh"
+          ? "我检测到你连续两轮都卡在澄清环节。我已切到防循环模式：请按下面任一入口继续。"
+          : "I detected repeated clarification loops. Switching to loop-breaker mode: pick one entry below to continue.";
+
+      return jsonResponse(
+        envelope({
+          query,
+          intent: "clarify",
+          answer,
+          current_state: "S_DIAGNOSIS" satisfies AuroraState,
+          next_actions: buildNextActionsFromClarificationQuestions(questions),
+          clarification: { questions, loop_breaker: true },
+          structured: {
+            schema_version: "aurora.structured.v1",
+            parse: {
+              normalized_query: query,
+              parse_confidence: 0.3,
+              normalized_query_language: languageTag,
+            },
+          } satisfies AuroraStructuredResultV1,
+        }),
+      );
+    }
+
     const questions: ClarificationQuestion[] = [
       userLang === "zh"
         ? {
@@ -6331,7 +7146,7 @@ export async function POST(req: Request) {
       schema_version: "aurora.structured.v1",
       parse: {
         normalized_query: query,
-        parse_confidence: explicitAnchorId ? 1 : highConfidenceAlias ? bestAlias?.confidence ?? 0.7 : 0.6,
+        parse_confidence: hasResolvedExplicitAnchor ? 1 : highConfidenceAlias ? bestAlias?.confidence ?? 0.7 : 0.6,
         normalized_query_language: languageTag,
         anchor_product: kbOnlyAnchorEntity,
       },
@@ -6358,6 +7173,11 @@ export async function POST(req: Request) {
       }),
     };
 
+    const kbOnlyBaseNextActions = buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true });
+    const kbOnlyAugmented = applySoftSafetyFollowup({ answer, next_actions: kbOnlyBaseNextActions });
+
+    if (wantsStream) return streamResponse(kbOnlyAugmented.answer);
+
     return jsonResponse(
       envelope({
         query,
@@ -6368,11 +7188,12 @@ export async function POST(req: Request) {
           (provider === "gemini"
             ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
             : process.env.OPENAI_MODEL ?? "gpt-4o"),
-        answer,
+        answer: kbOnlyAugmented.answer,
         ...(includeLlmError ? { llm_error } : {}),
         intent: "product",
         current_state: productState,
-        next_actions: buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true }),
+        next_actions: kbOnlyAugmented.next_actions,
+        ...(kbOnlyAugmented.clarification ? { clarification: kbOnlyAugmented.clarification } : {}),
         context: kbOnlyContext,
         structured: kbOnlyStructured,
       }),
@@ -6675,7 +7496,10 @@ export async function POST(req: Request) {
     answer = fallbackAnswer;
   }
 
-  if (wantsStream) return streamResponse(answer);
+  const productBaseNextActions = buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true });
+  const productAugmented = applySoftSafetyFollowup({ answer, next_actions: productBaseNextActions });
+
+  if (wantsStream) return streamResponse(productAugmented.answer);
 
   const anchorEntity = buildAuroraProductEntityV1({
     product_id: anchor.id,
@@ -6763,13 +7587,13 @@ export async function POST(req: Request) {
     schema_version: "aurora.structured.v1",
     parse: {
       normalized_query: query,
-      parse_confidence: explicitAnchorId ? 1 : highConfidenceAlias ? bestAlias?.confidence ?? 0.6 : 0.4,
+      parse_confidence: hasResolvedExplicitAnchor ? 1 : highConfidenceAlias ? bestAlias?.confidence ?? 0.6 : 0.4,
       normalized_query_language: languageTag,
       anchor_product: anchorEntity,
     },
     analyze: {
       verdict,
-      confidence: explicitAnchorId ? 0.9 : highConfidenceAlias ? 0.8 : 0.6,
+      confidence: hasResolvedExplicitAnchor ? 0.9 : highConfidenceAlias ? 0.8 : 0.6,
       reasons,
       science_evidence: await buildScienceEvidenceFromKbProfile({ kb_profile: anchorKbProfile, ingredients: anchorIngredientCtx, lang: userLang }),
       social_signals: anchorSocial,
@@ -6798,11 +7622,12 @@ export async function POST(req: Request) {
         (provider === "gemini"
           ? process.env.GEMINI_LLM_MODEL ?? "gemini-2.5-flash"
           : process.env.OPENAI_MODEL ?? "gpt-4o"),
-      answer,
+      answer: productAugmented.answer,
       ...(includeLlmError ? { llm_error } : {}),
       intent: "product",
       current_state: productState,
-      next_actions: buildNextActionsForState({ state: productState, language: userLang, hasAnchor: true }),
+      next_actions: productAugmented.next_actions,
+      ...(productAugmented.clarification ? { clarification: productAugmented.clarification } : {}),
       context: {
         detected: { sensitive_skin: sensitive, barrier_impaired: barrierImpaired, region_preference: detectedRegion },
         ...(external_verification ? { external_verification } : {}),
@@ -6839,7 +7664,8 @@ export async function POST(req: Request) {
 export async function GET() {
   return NextResponse.json({
     ok: true,
-    message: "POST JSON to this endpoint. Example: { query: string, llm_provider?: 'gemini'|'openai', llm_model?: string }",
+    message:
+      "POST JSON to this endpoint. Example: { query: string, action_id?: string, action_label?: string, clarification_id?: string, selected_option_index?: number, llm_provider?: 'gemini'|'openai', llm_model?: string }",
     ...(process.env.NODE_ENV === "development" ? { tools: Object.keys(TOOL_STUBS) } : {}),
   });
 }
