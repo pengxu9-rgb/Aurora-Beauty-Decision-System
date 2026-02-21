@@ -77,6 +77,7 @@ test("mapBffEnvelopeToChatProxyResponse keeps assistant/cards/chips fields", () 
       suggested_chips: [{ chip_id: "chip_1", label: "Next" }],
       session_patch: { next_state: "S5_ANALYSIS_SUMMARY" },
       events: [{ type: "value_moment" }],
+      meta: { policy_version: "aurora_chat_v2_p0", degraded: false },
     },
     "trace_fallback",
   );
@@ -90,6 +91,8 @@ test("mapBffEnvelopeToChatProxyResponse keeps assistant/cards/chips fields", () 
   assert.equal(out.suggested_chips?.length, 1);
   assert.deepEqual(out.session_patch, { next_state: "S5_ANALYSIS_SUMMARY" });
   assert.equal(Array.isArray(out.events), true);
+  assert.equal(out.policy_version, "aurora_chat_v2_p0");
+  assert.equal(out.degraded, undefined);
 });
 
 test("buildProxyFallbackResponse includes confidence notice + diagnosis gate + proxy_fallback event", () => {
@@ -109,6 +112,9 @@ test("buildProxyFallbackResponse includes confidence notice + diagnosis gate + p
   assert.equal(out.cards?.some((c) => c.type === "recommendations"), false);
   assert.equal(Array.isArray(out.events), true);
   assert.equal(out.events?.some((e) => e.proxy_fallback === true), true);
+  assert.equal(out.policy_version, "chat_route_proxy_degraded_v1");
+  assert.equal(out.degraded, true);
+  assert.equal((out.session_patch as any)?.meta?.degraded, true);
 
   const gateCard = out.cards?.find((c) => c.type === "diagnosis_gate");
   const missing = Array.isArray((gateCard as any)?.payload?.missing_fields) ? ((gateCard as any).payload.missing_fields as string[]) : [];

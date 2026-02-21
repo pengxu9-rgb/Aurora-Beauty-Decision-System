@@ -7,10 +7,13 @@ export type ProxyChatResponse = {
   answer?: string;
   bff_request_id?: string | null;
   bff_trace_id?: string | null;
+  policy_version?: string;
+  degraded?: boolean;
   cards?: Array<Record<string, unknown>>;
   suggested_chips?: Array<Record<string, unknown>>;
   session_patch?: Record<string, unknown>;
   events?: Array<Record<string, unknown>>;
+  meta?: Record<string, unknown>;
 };
 
 type BffEnvelopeLike = {
@@ -21,6 +24,7 @@ type BffEnvelopeLike = {
   suggested_chips?: unknown;
   session_patch?: unknown;
   events?: unknown;
+  meta?: unknown;
 };
 
 type BffChatReqInput = {
@@ -142,15 +146,21 @@ export function mapBffEnvelopeToChatProxyResponse(input: BffEnvelopeLike, fallba
   const events = Array.isArray(input && input.events)
     ? (input.events as unknown[]).filter((item) => isPlainObject(item)).map((item) => item as Record<string, unknown>)
     : [];
+  const meta = isPlainObject(input && input.meta) ? (input.meta as Record<string, unknown>) : {};
+  const policyVersion = asNonEmptyString(meta.policy_version);
+  const degraded = meta.degraded === true;
 
   return {
     answer,
     bff_request_id: requestId,
     bff_trace_id: traceId,
+    ...(policyVersion ? { policy_version: policyVersion } : {}),
+    ...(degraded ? { degraded: true } : {}),
     cards,
     suggested_chips: suggestedChips,
     session_patch: sessionPatch,
     events,
+    ...(Object.keys(meta).length ? { meta } : {}),
   };
 }
 
@@ -178,11 +188,14 @@ export function buildProxyFallbackResponse({
     lang === "CN"
       ? "当前处于保守降级模式：本轮不输出激进推荐，请先补充诊断信息或重试。"
       : "Conservative fallback mode is active: no aggressive recommendations this turn. Please complete diagnosis inputs or retry.";
+  const policyVersion = "chat_route_proxy_degraded_v1";
 
   return {
     answer,
     bff_request_id: requestId,
     bff_trace_id: traceId,
+    policy_version: policyVersion,
+    degraded: true,
     cards: [
       {
         card_id: `conf_${requestId}`,
@@ -209,7 +222,12 @@ export function buildProxyFallbackResponse({
       },
     ],
     suggested_chips: [],
-    session_patch: {},
+    session_patch: {
+      meta: {
+        policy_version: policyVersion,
+        degraded: true,
+      },
+    },
     events: [
       {
         type: "proxy_fallback",
@@ -218,5 +236,9 @@ export function buildProxyFallbackResponse({
         ...(detail ? { reason: detail } : {}),
       },
     ],
+    meta: {
+      policy_version: policyVersion,
+      degraded: true,
+    },
   };
 }

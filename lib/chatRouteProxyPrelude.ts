@@ -39,6 +39,12 @@ function isRuntimeTest(env: NodeJS.ProcessEnv = process.env) {
   return env.NODE_ENV === "test";
 }
 
+function isStrictProxyDecisionEnabled(env: NodeJS.ProcessEnv = process.env) {
+  return String(env.AURORA_CHAT_ROUTE_STRICT_PROXY_DECISION || "true")
+    .trim()
+    .toLowerCase() !== "false";
+}
+
 function safeWarn(message: string, payload: Record<string, unknown>, env: NodeJS.ProcessEnv = process.env) {
   if (isRuntimeTest(env)) return;
   try {
@@ -80,7 +86,7 @@ export async function resolveChatRouteProxyPrelude({
   if (proxyHandled.handled) return proxyHandled;
 
   const proxyEnabled = proxyEnabledChecker(env);
-  if (proxyEnabled) {
+  if (proxyEnabled && isStrictProxyDecisionEnabled(env)) {
     const traceId = req.headers.get("x-trace-id")?.trim() || `trace_${idFactory()}`;
     const fallback = buildProxyFallbackResponse({
       language: normalizeProxyLanguage(body.language || req.headers.get("x-lang") || req.headers.get("x-aurora-lang") || "EN"),
@@ -104,6 +110,20 @@ export async function resolveChatRouteProxyPrelude({
     };
   }
 
+  if (proxyEnabled && !isStrictProxyDecisionEnabled(env)) {
+    safeInfo(
+      "[aurora.chat.proxy.metric]",
+      {
+        kind: "metric",
+        name: "aurora.chat.proxy.legacy_path_used",
+        value: 1,
+        reason: "strict_proxy_decision_disabled",
+      },
+      env,
+    );
+    return { handled: false, reason: "proxy_disabled" };
+  }
+
   safeInfo(
     "[aurora.chat.proxy.metric]",
     {
@@ -116,4 +136,3 @@ export async function resolveChatRouteProxyPrelude({
   );
   return { handled: false, reason: "proxy_disabled" };
 }
-

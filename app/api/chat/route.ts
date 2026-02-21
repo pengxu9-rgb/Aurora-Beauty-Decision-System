@@ -4948,7 +4948,16 @@ export async function POST(req: Request) {
   });
   if (proxyPrelude.handled) {
     if (proxyPrelude.kind === "strict_error") {
-      return withSetCookies(NextResponse.json({ error: proxyPrelude.error }, { status: proxyPrelude.status }), [
+      return withSetCookies(
+        NextResponse.json(
+          {
+            error: proxyPrelude.error,
+            policy_version: "chat_route_proxy_strict_error_v1",
+            degraded: true,
+          },
+          { status: proxyPrelude.status },
+        ),
+        [
         setCookieHeader,
         makeRouterStateCookieHeader({ answerText: "" }),
       ]);

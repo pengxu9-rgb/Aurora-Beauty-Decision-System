@@ -97,3 +97,22 @@ test("proxy prelude: disabled + unhandled returns handled=false with proxy_disab
   assert.equal(out.reason, "proxy_disabled");
 });
 
+test("proxy prelude: strict proxy decision disabled allows legacy path even when proxy is enabled", async () => {
+  const out = await resolveChatRouteProxyPrelude({
+    req: makeReq({ "x-lang": "EN" }),
+    body: { message: "hello" },
+    userId: "uid_local",
+    extractTextFromUnknownMessage: extractText,
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      AURORA_CHAT_ROUTE_STRICT_PROXY_DECISION: "false",
+    },
+    proxyHandler: async () => ({ handled: false }),
+    proxyEnabledChecker: () => true,
+  });
+
+  assert.equal(out.handled, false);
+  if (out.handled) return;
+  assert.equal(out.reason, "proxy_disabled");
+});
