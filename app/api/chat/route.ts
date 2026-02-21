@@ -702,6 +702,11 @@ function inferSessionBarrierStatusFromText(text: string): SessionSkinProfile["ba
   ) {
     return "Healthy";
   }
+  // Accept compact mixed replies like "Oily Stable Brightening".
+  // This avoids re-asking barrier status when user already provided "stable" in one-line profile answers.
+  if (/\bstable\b/i.test(q) || /(^|[\s,，/])稳定([\s,，/]|$)/.test(text)) {
+    return "Healthy";
+  }
 
   return null;
 }
