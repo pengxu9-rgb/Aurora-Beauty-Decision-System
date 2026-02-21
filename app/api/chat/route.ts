@@ -870,11 +870,17 @@ function detectProfileAnswerKind(query: string): "skinType" | "barrierStatus" | 
 }
 
 function looksLikeStandaloneProfileAnswer(input: { query: string; messages: unknown[] }) {
-  const kind = detectProfileAnswerKind(input.query);
-  if (!kind) return false;
+  const queryText = String(input.query || "").trim();
+  const kind = detectProfileAnswerKind(queryText);
+  const inferred = inferSessionSkinProfileFromMessages([], queryText);
+  const hasProfileSignal =
+    Boolean(kind) || Boolean(inferred.skinType) || Boolean(inferred.barrierStatus) || inferred.concerns.length > 0;
+  if (!hasProfileSignal) return false;
+  // Keep this as a "chip-like answer" detector, not a general parser for long natural language.
+  if (!kind && queryText.length > 120) return false;
 
   // If the query also includes a real question/request, don't treat it as "just a chip".
-  const q = input.query.trim();
+  const q = queryText;
   const hasAsk =
     q.includes("推荐") ||
     q.includes("流程") ||
@@ -4968,6 +4974,7 @@ export async function POST(req: Request) {
     inferSessionSkinProfileFromBffProfile(bffContext?.profile ?? null),
   );
   const profileAnswerKind = detectProfileAnswerKind(query);
+  const profileAnswerOnlyHint = looksLikeStandaloneProfileAnswer({ query, messages });
   const contextualQuery =
     isShortFollowUpQuery(query) && recentUserContextText.trim() && recentUserContextText.trim() !== query
       ? `${recentUserContextText}\n\nFollow-up: ${query}`
@@ -5721,7 +5728,7 @@ export async function POST(req: Request) {
       similarEfficacyIntent ||
       // If the user has completed their profile via chips and the last chip is a goal (e.g. "提亮/淡斑"),
       // default into the shortlist path. This avoids a dead-end "what next?" loop.
-      (profileAnswerKind === "concerns" && hasCompleteSessionProfile));
+      ((profileAnswerKind === "concerns" || profileAnswerOnlyHint) && hasCompleteSessionProfile));
 
   // Legacy fallback (brand heuristics + loose token match).
   const legacyAnchorId = !hasExplicitAnchorInput && (dupeIntent || evalIntent) ? await findAnchorProductId(intentText) : null;
@@ -5862,7 +5869,7 @@ export async function POST(req: Request) {
   let recentSkinLogs: SkinLog[] = [];
   let userHistoryDbError: string | null = null;
   const sessionProfile = sessionProfileEarly;
-  const profileAnswerOnly = looksLikeStandaloneProfileAnswer({ query, messages });
+  const profileAnswerOnly = profileAnswerOnlyHint;
 
   try {
     userProfile = await prisma.userProfile.upsert({
@@ -5994,7 +6001,7 @@ export async function POST(req: Request) {
   // If the user is only answering a profile chip (and there is no prior "ask"),
   // short-circuit into deterministic Phase-0 progression to avoid LLM loops.
   // Exception: if the user just completed the "goals" chip (profile complete), let it flow into shortlist.
-  if (!wantsScienceOnly && profileAnswerOnly && !(profileAnswerKind === "concerns" && hasCompleteSessionProfile)) {
+  if (!wantsScienceOnly && profileAnswerOnly && !hasCompleteSessionProfile) {
     routingMeta.gate_applied = "phase0_strict";
     const missing = phase0Missing;
 
