@@ -36,6 +36,38 @@ type ChatMessage = {
   content: string;
 };
 
+type AnalysisPhotoRef = {
+  slot_id: "daylight" | "indoor_white";
+  photo_id: string;
+  qc_status: string;
+};
+
+function normalizePhotoQcStatus(value: unknown) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return "unknown";
+  if (raw === "passed" || raw === "pass" || raw === "ok") return "passed";
+  if (raw === "degraded" || raw === "warn" || raw === "warning" || raw === "low") return "degraded";
+  if (raw === "fail" || raw === "failed" || raw === "reject" || raw === "rejected" || raw === "bad") return "failed";
+  if (raw === "pending" || raw === "processing" || raw === "checking") return "pending";
+  return "unknown";
+}
+
+function isPhotoUsableForDiagnosis(status: unknown) {
+  const normalized = normalizePhotoQcStatus(status);
+  return normalized === "passed" || normalized === "degraded";
+}
+
+function mergeAnalysisPhotoRefs(existing: AnalysisPhotoRef[], incoming: AnalysisPhotoRef[]) {
+  const next = [...(Array.isArray(existing) ? existing : [])];
+  for (const item of incoming) {
+    if (!item || !item.slot_id || !item.photo_id) continue;
+    const idx = next.findIndex((entry) => entry.slot_id === item.slot_id);
+    if (idx >= 0) next[idx] = item;
+    else next.push(item);
+  }
+  return next.slice(0, 4);
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -137,7 +169,47 @@ function setAuroraUidCookie(uid: string) {
     .join("; ");
 }
 
+type ChatProxyResponse = {
+  error?: string;
+  answer?: string;
+  bff_request_id?: string | null;
+  bff_trace_id?: string | null;
+  cards?: BffCard[];
+  suggested_chips?: SuggestedChip[];
+  session_patch?: Record<string, unknown>;
+  events?: Record<string, unknown>[];
+};
+
+function toBffEnvelopeFromChatProxy(payload: ChatProxyResponse, fallbackTraceId: string): BffEnvelope {
+  const answer = typeof payload.answer === "string" ? payload.answer.trim() : "";
+  const requestId =
+    typeof payload.bff_request_id === "string" && payload.bff_request_id.trim()
+      ? payload.bff_request_id.trim()
+      : `chatproxy_${Date.now()}`;
+  const traceId =
+    typeof payload.bff_trace_id === "string" && payload.bff_trace_id.trim()
+      ? payload.bff_trace_id.trim()
+      : fallbackTraceId;
+  return {
+    request_id: requestId,
+    trace_id: traceId,
+    assistant_message: answer ? { role: "assistant", content: answer } : null,
+    cards: Array.isArray(payload.cards) ? payload.cards : [],
+    suggested_chips: Array.isArray(payload.suggested_chips) ? payload.suggested_chips : [],
+    session_patch: isPlainObject(payload.session_patch) ? payload.session_patch : {},
+    events: Array.isArray(payload.events) ? payload.events : [],
+  };
+}
+
 export function AuroraChatPage() {
+  const photoPipelineEnabled =
+    String(
+      process.env.NEXT_PUBLIC_AURORA_AURORAAPP_PHOTO_PIPELINE_ENABLED ||
+        process.env.NEXT_PUBLIC_AURORA_PHOTO_PIPELINE_ENABLED ||
+        "true",
+    )
+      .trim()
+      .toLowerCase() !== "false";
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
     {
       id: makeId("a"),
@@ -168,6 +240,7 @@ export function AuroraChatPage() {
   const [skinIdentity, setSkinIdentity] = useState<SkinIdentitySnapshot | null>(null);
   const [isIdentityLoading, setIsIdentityLoading] = useState(false);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  const [analysisPhotoRefs, setAnalysisPhotoRefs] = useState<AnalysisPhotoRef[]>([]);
   const [envStress, setEnvStress] = useState<EnvStressUiModelV1 | null>(null);
   const [envStressLoading, setEnvStressLoading] = useState(false);
   const [envStressError, setEnvStressError] = useState<string | null>(null);
@@ -288,9 +361,10 @@ export function AuroraChatPage() {
   }, [feedbackReporter]);
 
   useEffect(() => {
+    const pollStops = asyncPollStopsRef.current;
     return () => {
-      for (const stop of asyncPollStopsRef.current.values()) stop();
-      asyncPollStopsRef.current.clear();
+      for (const stop of pollStops.values()) stop();
+      pollStops.clear();
     };
   }, []);
 
@@ -424,6 +498,58 @@ export function AuroraChatPage() {
     [pushMessage, startAsyncPollingForCard],
   );
 
+  const requestChatViaProxy = useCallback(
+    async ({
+      requestLang,
+      message,
+      actionId,
+      actionLabel,
+      actionData,
+      signal,
+    }: {
+      requestLang: AuroraLang;
+      message?: string;
+      actionId?: string;
+      actionLabel?: string;
+      actionData?: Record<string, unknown>;
+      signal?: AbortSignal;
+    }) => {
+      const payload: Record<string, unknown> = {
+        ...(typeof message === "string" && message.trim() ? { message: message.trim() } : {}),
+        ...(typeof actionId === "string" && actionId.trim() ? { action_id: actionId.trim() } : {}),
+        ...(typeof actionLabel === "string" && actionLabel.trim() ? { action_label: actionLabel.trim() } : {}),
+        ...(isPlainObject(actionData) ? { action_data: actionData } : {}),
+        session: { state: sessionState, trace_id: traceIdRef.current, brief_id: briefIdRef.current },
+        language: requestLang,
+      };
+
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Aurora-UID": userId || "",
+          "X-Trace-ID": traceIdRef.current,
+          "X-Brief-ID": briefIdRef.current,
+          "X-Lang": requestLang,
+          "X-Aurora-Lang": requestLang === "CN" ? "cn" : "en",
+        },
+        body: JSON.stringify(payload),
+        signal,
+      });
+
+      const raw = (await res.json().catch(() => null)) as ChatProxyResponse | null;
+      if (!res.ok) {
+        const message =
+          raw && typeof raw.error === "string" && raw.error.trim() ? raw.error.trim() : `Request failed (${res.status})`;
+        throw new Error(message);
+      }
+      if (!raw || !isPlainObject(raw)) throw new Error("Invalid /api/chat response");
+      return toBffEnvelopeFromChatProxy(raw, traceIdRef.current);
+    },
+    [sessionState, userId],
+  );
+
   const sendText = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
@@ -450,22 +576,18 @@ export function AuroraChatPage() {
         const controller = new AbortController();
         const timeout = window.setTimeout(() => controller.abort(), 25000);
 
-        const requestLang: AuroraLang = /[\u4e00-\u9fff]/.test(trimmed) ? "CN" : lang;
-        if (requestLang !== lang) setLang(requestLang);
-
-        const envelope = await bffRequest<BffEnvelope>("/v1/chat", {
-          uid: userId,
-          lang: requestLang,
-          traceId: traceIdRef.current,
-          briefId: briefIdRef.current,
-          method: "POST",
-          body: {
+        let envelope: BffEnvelope;
+        try {
+          const requestLang: AuroraLang = /[\u4e00-\u9fff]/.test(trimmed) ? "CN" : lang;
+          if (requestLang !== lang) setLang(requestLang);
+          envelope = await requestChatViaProxy({
+            requestLang,
             message: trimmed,
-            session: { state: sessionState, trace_id: traceIdRef.current, brief_id: briefIdRef.current },
-          },
-          signal: controller.signal,
-        });
-        window.clearTimeout(timeout);
+            signal: controller.signal,
+          });
+        } finally {
+          window.clearTimeout(timeout);
+        }
 
         applyEnvelope(envelope, { userMessage: trimmed });
         if (userId) {
@@ -485,7 +607,7 @@ export function AuroraChatPage() {
         setIsSending(false);
       }
     },
-    [applyEnvelope, isSending, lang, pushMessage, refreshEnvStress, refreshIdentity, sessionState, userId],
+    [applyEnvelope, isSending, lang, pushMessage, refreshEnvStress, refreshIdentity, requestChatViaProxy, userId],
   );
 
   const onSubmit = useCallback(
@@ -522,19 +644,148 @@ export function AuroraChatPage() {
   }, []);
 
   const handleSelfiePicked = useCallback(
-    (file: File | null) => {
+    async (file: File | null) => {
       if (!file) return;
+      if (isSending) return;
+
+      if (selfieInputRef.current) selfieInputRef.current.value = "";
       if (avatarUrl) URL.revokeObjectURL(avatarUrl);
       const url = URL.createObjectURL(file);
       setAvatarUrl(url);
+
+      if (!photoPipelineEnabled) {
+        pushMessage({
+          id: makeId("a"),
+          role: "assistant",
+          content:
+            "Selfie selected (preview). CV-based analysis is coming next — for now, please answer the quick profile questions so I can stay safe and consistent.",
+        });
+        return;
+      }
+
+      if (!userId) {
+        setSendError("Missing user id. Please refresh the page.");
+        return;
+      }
+
+      const consentCopy =
+        lang === "CN"
+          ? "继续上传即表示你同意用于本次护肤分析。是否继续？"
+          : "Uploading means you consent to use this photo for skincare analysis. Continue?";
+      const consented = typeof window !== "undefined" ? window.confirm(consentCopy) : false;
+      if (!consented) {
+        pushMessage({
+          id: makeId("a"),
+          role: "assistant",
+          content: lang === "CN" ? "已取消上传。准备好后可再次上传。" : "Upload cancelled. You can retry anytime.",
+        });
+        return;
+      }
+
+      const hasDaylight = analysisPhotoRefs.some((entry) => entry.slot_id === "daylight");
+      const hasIndoorWhite = analysisPhotoRefs.some((entry) => entry.slot_id === "indoor_white");
+      const slotId: AnalysisPhotoRef["slot_id"] = !hasDaylight ? "daylight" : !hasIndoorWhite ? "indoor_white" : "daylight";
+      const slotLabel = slotId === "daylight" ? (lang === "CN" ? "自然光" : "daylight") : lang === "CN" ? "室内白光" : "indoor white";
+
+      setIsSending(true);
+      setSendError(null);
+      setSuggestedChips([]);
       pushMessage({
-        id: makeId("a"),
-        role: "assistant",
-        content:
-          "Selfie selected (preview). CV-based analysis is coming next — for now, please answer the quick profile questions so I can stay safe and consistent.",
+        id: makeId("u"),
+        role: "user",
+        content: lang === "CN" ? `上传照片（${slotLabel}）` : `Upload photo (${slotLabel})`,
       });
+
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 45000);
+      try {
+        const form = new FormData();
+        form.append("slot_id", slotId);
+        form.append("consent", "true");
+        form.append("photo", file, file.name || `photo_${slotId}.jpg`);
+
+        const uploadEnvelope = await bffRequest<BffEnvelope>("/v1/photos/upload", {
+          uid: userId,
+          lang,
+          traceId: traceIdRef.current,
+          briefId: briefIdRef.current,
+          method: "POST",
+          body: form,
+          signal: controller.signal,
+        });
+        applyEnvelope(uploadEnvelope, { gateMessage: "photo_upload" });
+
+        const confirmCard = uploadEnvelope.cards.find((card) => card && card.type === "photo_confirm");
+        const confirmPayload = confirmCard && isPlainObject(confirmCard.payload) ? confirmCard.payload : {};
+        const photoId = typeof confirmPayload.photo_id === "string" ? confirmPayload.photo_id.trim() : "";
+        const qcStatus = normalizePhotoQcStatus(confirmPayload.qc_status);
+        if (!photoId || !isPhotoUsableForDiagnosis(qcStatus)) {
+          pushMessage({
+            id: makeId("a"),
+            role: "assistant",
+            content:
+              lang === "CN"
+                ? "照片质量未通过，建议按引导重拍（自然光、正脸、无滤镜）后再分析。"
+                : "Photo quality did not pass. Please retake in daylight, front-facing, and without filters.",
+          });
+          return;
+        }
+
+        const mergedPhotos = mergeAnalysisPhotoRefs(analysisPhotoRefs, [{ slot_id: slotId, photo_id: photoId, qc_status: qcStatus }]);
+        setAnalysisPhotoRefs(mergedPhotos);
+
+        const analysisEnvelope = await bffRequest<BffEnvelope>("/v1/analysis/skin", {
+          uid: userId,
+          lang,
+          traceId: traceIdRef.current,
+          briefId: briefIdRef.current,
+          method: "POST",
+          body: {
+            use_photo: true,
+            photos: mergedPhotos,
+          },
+          signal: controller.signal,
+        });
+        applyEnvelope(analysisEnvelope, { gateMessage: "analysis_summary" });
+
+        const hasBothSlots = mergedPhotos.some((entry) => entry.slot_id === "daylight") && mergedPhotos.some((entry) => entry.slot_id === "indoor_white");
+        if (!hasBothSlots) {
+          pushMessage({
+            id: makeId("a"),
+            role: "assistant",
+            content:
+              lang === "CN"
+                ? "为了提升准确度，建议再上传一张室内白光照片。"
+                : "For better accuracy, please upload one more indoor-white-light photo.",
+          });
+        }
+        await Promise.all([refreshIdentity(userId), refreshEnvStress(userId)]);
+      } catch (e) {
+        const err =
+          e instanceof DOMException && e.name === "AbortError"
+            ? "Photo request timed out. Please try again."
+            : e instanceof Error
+              ? e.message
+              : "Failed to process photo";
+        setSendError(err);
+        pushMessage({ id: makeId("a"), role: "assistant", content: `Sorry — ${err}.` });
+      } finally {
+        window.clearTimeout(timeout);
+        setIsSending(false);
+      }
     },
-    [avatarUrl, pushMessage],
+    [
+      analysisPhotoRefs,
+      applyEnvelope,
+      avatarUrl,
+      isSending,
+      lang,
+      photoPipelineEnabled,
+      pushMessage,
+      refreshEnvStress,
+      refreshIdentity,
+      userId,
+    ],
   );
 
   const handleConcernsChange = useCallback(
@@ -585,20 +836,19 @@ export function AuroraChatPage() {
         const controller = new AbortController();
         const timeout = window.setTimeout(() => controller.abort(), 25000);
 
-        const envelope = await bffRequest<BffEnvelope>("/v1/chat", {
-          uid: userId,
-          lang,
-          traceId: traceIdRef.current,
-          briefId: briefIdRef.current,
-          method: "POST",
-          body: {
+        let envelope: BffEnvelope;
+        try {
+          envelope = await requestChatViaProxy({
+            requestLang: lang,
             ...(messageForUpstream ? { message: messageForUpstream } : {}),
-            action: { action_id: chip.id, kind: "chip", data: chip.data ?? {} },
-            session: { state: sessionState, trace_id: traceIdRef.current, brief_id: briefIdRef.current },
-          },
-          signal: controller.signal,
-        });
-        window.clearTimeout(timeout);
+            actionId: chip.id,
+            actionLabel: chip.label,
+            actionData: isPlainObject(chip.data) ? chip.data : {},
+            signal: controller.signal,
+          });
+        } finally {
+          window.clearTimeout(timeout);
+        }
 
         applyEnvelope(envelope, { userMessage: isProfileChip ? undefined : messageForUpstream, gateMessage });
         void refreshIdentity(userId);
@@ -616,7 +866,7 @@ export function AuroraChatPage() {
         setIsSending(false);
       }
     },
-    [applyEnvelope, isSending, lang, pushMessage, refreshEnvStress, refreshIdentity, sessionState, userId],
+    [applyEnvelope, isSending, lang, pushMessage, refreshEnvStress, refreshIdentity, requestChatViaProxy, userId],
   );
 
   const requestRoutine = useCallback(async () => {
@@ -631,15 +881,15 @@ export function AuroraChatPage() {
     try {
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), 30000);
-
-      const focus = skinIdentity?.concerns?.[0] ?? undefined;
-      const envelope = await bffRequest<BffEnvelope>("/v1/reco/generate", {
-        uid: userId,
-        lang,
-        traceId: traceIdRef.current,
-        briefId: briefIdRef.current,
-        method: "POST",
-        body: { ...(focus ? { focus } : {}) },
+      const envelope = await requestChatViaProxy({
+        requestLang: lang,
+        message:
+          lang === "CN"
+            ? "请给我个性化产品推荐。"
+            : "Please give me personalized product recommendations.",
+        actionId: "chip.start.reco_products",
+        actionLabel: lang === "CN" ? "获取产品推荐" : "Get product recommendations",
+        actionData: { trigger_source: "action" },
         signal: controller.signal,
       });
       window.clearTimeout(timeout);
@@ -659,7 +909,7 @@ export function AuroraChatPage() {
     } finally {
       setIsSending(false);
     }
-  }, [applyEnvelope, isSending, lang, pushMessage, refreshEnvStress, refreshIdentity, skinIdentity?.concerns, userId]);
+  }, [applyEnvelope, isSending, lang, pushMessage, refreshEnvStress, refreshIdentity, requestChatViaProxy, userId]);
 
   const renderBffCard = useCallback((card: BffCard) => {
     const payload = card.payload ?? {};
@@ -722,6 +972,68 @@ export function AuroraChatPage() {
         <section key={card.card_id} className="mt-4 rounded-2xl border border-indigo-200 bg-indigo-50 p-4 shadow-sm" aria-label="Diagnosis gate">
           <div className="text-xs font-semibold text-indigo-900">Diagnosis first</div>
           {missing.length ? <div className="mt-1 text-xs text-indigo-800">Missing: {missing.join(", ")}</div> : null}
+        </section>
+      );
+    }
+
+    if (card.type === "ingredient_plan") {
+      const plan = isPlainObject((payload as any).plan) ? ((payload as any).plan as Record<string, unknown>) : (payload as Record<string, unknown>);
+      const intensity = typeof plan.intensity === "string" ? plan.intensity : typeof (payload as any).intensity === "string" ? (payload as any).intensity : "balanced";
+      const targets = Array.isArray(plan.targets) ? (plan.targets as any[]) : Array.isArray((payload as any).targets) ? ((payload as any).targets as any[]) : [];
+      const avoid = Array.isArray(plan.avoid) ? (plan.avoid as any[]) : Array.isArray((payload as any).avoid) ? ((payload as any).avoid as any[]) : [];
+      const conflicts = Array.isArray(plan.conflicts) ? (plan.conflicts as any[]) : Array.isArray((payload as any).conflicts) ? ((payload as any).conflicts as any[]) : [];
+      return (
+        <section key={card.card_id} className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 shadow-sm" aria-label="Ingredient plan">
+          <div className="text-xs font-semibold text-emerald-900">Ingredient plan · {String(intensity)}</div>
+          {targets.length ? (
+            <ul className="mt-2 list-disc pl-4 text-xs text-emerald-900">
+              {targets.slice(0, 6).map((item, idx) => (
+                <li key={`target_${idx}`}>
+                  {String((item as any).ingredient_id ?? "ingredient")}
+                  {Number.isFinite(Number((item as any).priority)) ? ` · P${Math.round(Number((item as any).priority))}` : ""}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {avoid.length ? (
+            <ul className="mt-2 list-disc pl-4 text-xs text-emerald-900">
+              {avoid.slice(0, 4).map((item, idx) => (
+                <li key={`avoid_${idx}`}>
+                  Avoid: {String((item as any).ingredient_id ?? "ingredient")}
+                  {typeof (item as any).severity === "string" ? ` (${String((item as any).severity)})` : ""}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {conflicts.length ? (
+            <ul className="mt-2 list-disc pl-4 text-xs text-emerald-900">
+              {conflicts.slice(0, 3).map((item, idx) => (
+                <li key={`conflict_${idx}`}>{String((item as any).description ?? (item as any).message ?? "")}</li>
+              ))}
+            </ul>
+          ) : null}
+        </section>
+      );
+    }
+
+    if (card.type === "confidence_notice") {
+      const severity = typeof (payload as any).severity === "string" ? (payload as any).severity : "warn";
+      const message = typeof (payload as any).message === "string" ? (payload as any).message : "Conservative mode is active.";
+      const details = Array.isArray((payload as any).details) ? ((payload as any).details as any[]) : [];
+      const actions = Array.isArray((payload as any).actions) ? ((payload as any).actions as any[]) : [];
+      const tone = severity === "block" ? "border-rose-200 bg-rose-50 text-rose-900" : "border-amber-200 bg-amber-50 text-amber-900";
+      return (
+        <section key={card.card_id} className={`mt-4 rounded-2xl border p-4 shadow-sm ${tone}`} aria-label="Confidence notice">
+          <div className="text-xs font-semibold">Confidence notice</div>
+          <div className="mt-1 text-xs">{String(message)}</div>
+          {details.length ? (
+            <ul className="mt-2 list-disc pl-4 text-xs">
+              {details.slice(0, 5).map((line, idx) => (
+                <li key={`detail_${idx}`}>{String(line)}</li>
+              ))}
+            </ul>
+          ) : null}
+          {actions.length ? <div className="mt-2 text-[11px] opacity-80">Actions: {actions.slice(0, 4).map(String).join(" · ")}</div> : null}
         </section>
       );
     }
@@ -794,6 +1106,7 @@ export function AuroraChatPage() {
                 asyncPollStopsRef.current.clear();
                 cardRequestIdRef.current = {};
                 setSessionState(null);
+                setAnalysisPhotoRefs([]);
                 pendingGateMessageRef.current = null;
                 setSendError(null);
                 setInput("");
@@ -819,7 +1132,7 @@ export function AuroraChatPage() {
             type="file"
             accept="image/*"
             className="hidden"
-            onChange={(e) => handleSelfiePicked(e.target.files?.[0] ?? null)}
+            onChange={(e) => void handleSelfiePicked(e.target.files?.[0] ?? null)}
           />
 
           {skinIdentity && diagnosisProgress < 100 ? (

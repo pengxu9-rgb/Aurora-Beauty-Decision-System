@@ -100,6 +100,21 @@ export function normalizeAuroraLang(raw: unknown): AuroraLang {
   return "EN";
 }
 
+function isFormDataBody(value: unknown): value is FormData {
+  return typeof FormData !== "undefined" && value instanceof FormData;
+}
+
+function isBodyInitLike(value: unknown): value is BodyInit {
+  if (value == null) return false;
+  if (typeof value === "string") return true;
+  if (typeof URLSearchParams !== "undefined" && value instanceof URLSearchParams) return true;
+  if (typeof Blob !== "undefined" && value instanceof Blob) return true;
+  if (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) return true;
+  if (typeof Uint8Array !== "undefined" && value instanceof Uint8Array) return true;
+  if (typeof ReadableStream !== "undefined" && value instanceof ReadableStream) return true;
+  return false;
+}
+
 export async function bffRequest<T>(
   path: string,
   opts: {
@@ -107,27 +122,44 @@ export async function bffRequest<T>(
     lang?: AuroraLang;
     traceId?: string;
     briefId?: string;
-    method?: "GET" | "POST";
+    method?: "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
     body?: unknown;
+    headers?: Record<string, string>;
     signal?: AbortSignal;
   },
 ): Promise<T> {
   const base = getPivotaAgentBaseUrl();
   const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
 
+  const method = opts.method ?? (opts.body !== undefined ? "POST" : "GET");
+  const hasRequestBody = method !== "GET" && method !== "HEAD";
+  const bodyIsFormData = isFormDataBody(opts.body);
+
+  let requestBody: BodyInit | undefined;
+  if (hasRequestBody) {
+    if (opts.body === undefined) requestBody = JSON.stringify({});
+    else if (bodyIsFormData || isBodyInitLike(opts.body)) requestBody = opts.body as BodyInit;
+    else requestBody = JSON.stringify(opts.body);
+  }
+
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
     "X-Aurora-UID": opts.uid,
+    ...(opts.headers ?? {}),
   };
   if (opts.traceId) headers["X-Trace-ID"] = opts.traceId;
   if (opts.briefId) headers["X-Brief-ID"] = opts.briefId;
   if (opts.lang) headers["X-Lang"] = opts.lang;
 
-  const method = opts.method ?? (opts.body ? "POST" : "GET");
+  if (hasRequestBody && !bodyIsFormData && !isBodyInitLike(opts.body)) {
+    headers["Content-Type"] = headers["Content-Type"] || "application/json";
+  } else if (hasRequestBody && typeof opts.body === "string" && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+
   const res = await fetch(url, {
     method,
     headers,
-    ...(method === "POST" ? { body: JSON.stringify(opts.body ?? {}) } : {}),
+    ...(requestBody !== undefined ? { body: requestBody } : {}),
     signal: opts.signal,
   });
 

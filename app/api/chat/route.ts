@@ -16,6 +16,7 @@ import { ingredientKbHealthV1, getIngredientResearchProfileV1, searchIngredientR
 import { ingredientSearchV1 } from "@/lib/ingredient-search";
 import type { IngredientSearchOutputV1 } from "@/lib/ingredient-search-core";
 import { buildKbProfile, type KbProfile, type KbSnippet, inferKbCanonicalKey } from "@/lib/kb-profile";
+import { resolveChatRouteProxyPrelude } from "@/lib/chatRouteProxyPrelude";
 import { canonicalizeRawIngredientText } from "@/lib/raw-ingredient-cleaning";
 import { prisma } from "@/lib/server/prisma";
 import { findSimilarSkus, findSimilarSkusByAnchorProductId, type RegionPreference } from "@/lib/vector-service";
@@ -32,6 +33,11 @@ type ChatRequest = {
   messages?: unknown[];
   action_id?: string;
   action_label?: string;
+  action_data?: Record<string, unknown>;
+  action?: string | { action_id?: string; kind?: "chip" | "action"; data?: Record<string, unknown> };
+  session?: Record<string, unknown>;
+  language?: string;
+  client_state?: string;
   clarification_id?: string;
   selected_option_index?: number;
   anchor_product_id?: string;
@@ -4594,13 +4600,6 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const rawQuery = normalizeQuery(body);
-  if (!rawQuery) return NextResponse.json({ error: "`query` (or `message`) is required" }, { status: 400 });
-  const bffContext = parseBffContextPrefix(rawQuery);
-  // Always use the user-authored text for intent parsing. The BFF prefix carries context JSON
-  // and can contain unrelated tokens (e.g. "budget"), which should not drive intent detection.
-  const query = bffContext?.stripped_query?.trim() ? bffContext.stripped_query.trim() : rawQuery;
-
   const { userId, setCookieHeader } = getOrCreateAnonymousUserId(req);
   const jsonResponse = (data: unknown, init?: Parameters<typeof NextResponse.json>[1]) => {
     const routing = (data as any)?.router_v2;
@@ -4617,6 +4616,27 @@ export async function POST(req: Request) {
     withSetCookie(streamTextResponse(text, opts), setCookieHeader);
 
   const includeLlmError = process.env.NODE_ENV === "development" || body.debug === true;
+
+  const proxyPrelude = await resolveChatRouteProxyPrelude({
+    req,
+    body,
+    userId,
+    extractTextFromUnknownMessage,
+    env: process.env,
+  });
+  if (proxyPrelude.handled) {
+    if (proxyPrelude.kind === "strict_error") {
+      return withSetCookie(NextResponse.json({ error: proxyPrelude.error }, { status: proxyPrelude.status }), setCookieHeader);
+    }
+    return withSetCookie(NextResponse.json(proxyPrelude.response), setCookieHeader);
+  }
+
+  const rawQuery = normalizeQuery(body);
+  if (!rawQuery) return NextResponse.json({ error: "`query` (or `message`) is required" }, { status: 400 });
+  const bffContext = parseBffContextPrefix(rawQuery);
+  // Always use the user-authored text for intent parsing. The BFF prefix carries context JSON
+  // and can contain unrelated tokens (e.g. "budget"), which should not drive intent detection.
+  const query = bffContext?.stripped_query?.trim() ? bffContext.stripped_query.trim() : rawQuery;
 
   const limit = typeof body.limit === "number" && body.limit > 0 ? Math.min(20, body.limit) : 6;
 
