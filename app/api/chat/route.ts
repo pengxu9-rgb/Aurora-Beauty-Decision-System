@@ -322,6 +322,21 @@ You must identify which **Phase** the conversation is in and stick to it. DO NOT
 
 const USER_ID_COOKIE_NAME = "aurora_uid";
 const USER_ID_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365; // 1 year
+const ROUTER_STATE_COOKIE_NAME = "aurora_router_v2_state";
+const ROUTER_STATE_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 7; // 7 days
+const SHORTLIST_HISTORY_MAX_ITEMS = 24;
+const DEFAULT_RECO_PROBE_GUARD_TERMS = [
+  "winona soothing repair serum",
+  "ipsa time reset aqua",
+  "the ordinary buffet + copper peptides 1%",
+  "multi-peptide + copper peptides 1%",
+];
+
+type RouterStateCookieV2 = {
+  loop_clarify_count: number;
+  recent_shortlist_ids: string[];
+  updated_at_ms: number;
+};
 
 function parseCookieHeader(raw: string | null): Record<string, string> {
   if (!raw) return {};
@@ -351,6 +366,71 @@ function serializeCookie(
   return parts.join("; ");
 }
 
+function parseEnvBoolean(raw: string | undefined, defaultValue: boolean) {
+  if (raw == null) return defaultValue;
+  const t = String(raw).trim().toLowerCase();
+  if (!t) return defaultValue;
+  if (["1", "true", "yes", "on"].includes(t)) return true;
+  if (["0", "false", "no", "off"].includes(t)) return false;
+  return defaultValue;
+}
+
+function parseRouterStateCookieValue(raw: string | null | undefined): RouterStateCookieV2 {
+  if (!raw || typeof raw !== "string") {
+    return { loop_clarify_count: 0, recent_shortlist_ids: [], updated_at_ms: 0 };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return { loop_clarify_count: 0, recent_shortlist_ids: [], updated_at_ms: 0 };
+    }
+    const loopRaw = Number((parsed as any).loop_clarify_count);
+    const loop = Number.isFinite(loopRaw) ? Math.max(0, Math.min(9, Math.trunc(loopRaw))) : 0;
+    const shortlistIds = Array.isArray((parsed as any).recent_shortlist_ids)
+      ? (parsed as any).recent_shortlist_ids
+          .map((v: unknown) => (typeof v === "string" ? v.trim() : ""))
+          .filter((v: string) => looksLikeUuid(v))
+          .slice(0, SHORTLIST_HISTORY_MAX_ITEMS)
+      : [];
+    const updatedRaw = Number((parsed as any).updated_at_ms);
+    const updated = Number.isFinite(updatedRaw) ? Math.max(0, Math.trunc(updatedRaw)) : 0;
+    return { loop_clarify_count: loop, recent_shortlist_ids: shortlistIds, updated_at_ms: updated };
+  } catch {
+    return { loop_clarify_count: 0, recent_shortlist_ids: [], updated_at_ms: 0 };
+  }
+}
+
+function readRouterStateCookie(req: Request): RouterStateCookieV2 {
+  const cookies = parseCookieHeader(req.headers.get("cookie"));
+  return parseRouterStateCookieValue(cookies[ROUTER_STATE_COOKIE_NAME]);
+}
+
+function encodeRouterStateCookie(state: RouterStateCookieV2): string {
+  const normalized: RouterStateCookieV2 = {
+    loop_clarify_count: Math.max(0, Math.min(9, Math.trunc(state.loop_clarify_count || 0))),
+    recent_shortlist_ids: (Array.isArray(state.recent_shortlist_ids) ? state.recent_shortlist_ids : [])
+      .map((id) => String(id || "").trim())
+      .filter((id) => looksLikeUuid(id))
+      .slice(0, SHORTLIST_HISTORY_MAX_ITEMS),
+    updated_at_ms: Number.isFinite(Number(state.updated_at_ms)) ? Math.max(0, Math.trunc(Number(state.updated_at_ms))) : Date.now(),
+  };
+  return JSON.stringify(normalized);
+}
+
+function mergeRecentShortlistIds(prev: string[], next: string[]) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const id of [...next, ...prev]) {
+    const clean = String(id || "").trim();
+    if (!looksLikeUuid(clean)) continue;
+    if (seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean);
+    if (out.length >= SHORTLIST_HISTORY_MAX_ITEMS) break;
+  }
+  return out;
+}
+
 function getOrCreateAnonymousUserId(req: Request): { userId: string; setCookieHeader?: string } {
   const cookies = parseCookieHeader(req.headers.get("cookie"));
   const existing = typeof cookies[USER_ID_COOKIE_NAME] === "string" ? cookies[USER_ID_COOKIE_NAME].trim() : "";
@@ -369,6 +449,15 @@ function getOrCreateAnonymousUserId(req: Request): { userId: string; setCookieHe
 function withSetCookie(response: Response, setCookieHeader?: string) {
   if (!setCookieHeader) return response;
   response.headers.append("Set-Cookie", setCookieHeader);
+  return response;
+}
+
+function withSetCookies(response: Response, setCookieHeaders: Array<string | null | undefined>) {
+  for (const header of setCookieHeaders) {
+    const value = typeof header === "string" ? header.trim() : "";
+    if (!value) continue;
+    response.headers.append("Set-Cookie", value);
+  }
   return response;
 }
 
@@ -1890,6 +1979,7 @@ function isLoopingClarificationLikeAnswerV2(answer: string): boolean {
   if (/pick what you want next|先选一下方向|我可以继续，但我需要你先选|i can continue, but/i.test(t)) return true;
   if (/quick skin profile|补齐一个简短的皮肤画像|before i can recommend products safely/i.test(t)) return true;
   if (/reply with the options|点选即可|tap an option/i.test(t)) return true;
+  if (/repeated clarification loops|loop-breaker mode|防循环模式|switching to loop-breaker/i.test(t)) return true;
   return false;
 }
 
@@ -1906,6 +1996,122 @@ function countRecentAssistantClarificationLoopsV2(messages: unknown[], maxScan =
     else break;
   }
   return count;
+}
+
+function normalizeLooseTextForMatching(text: string) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function getRecoProbeGuardTerms(): string[] {
+  const raw = String(process.env.AURORA_CHAT_RECO_PROBE_GUARD_TERMS || "").trim();
+  const terms = raw
+    ? raw
+        .split(",")
+        .map((t) => normalizeLooseTextForMatching(t))
+        .filter(Boolean)
+    : DEFAULT_RECO_PROBE_GUARD_TERMS.map((t) => normalizeLooseTextForMatching(t));
+  return Array.from(new Set(terms));
+}
+
+function applyRecoProbeSeedGuard<T extends { product_id: string; sku: { brand: string; name: string } }>(
+  items: T[],
+  input: { query: string; min_keep?: number },
+): {
+  items: T[];
+  enabled: boolean;
+  applied: boolean;
+  filtered_count: number;
+  explicit_probe_request: boolean;
+} {
+  const enabled = parseEnvBoolean(process.env.AURORA_CHAT_RECO_PROBE_GUARD_ENABLED, true);
+  if (!enabled || !items.length) {
+    return { items, enabled, applied: false, filtered_count: 0, explicit_probe_request: false };
+  }
+
+  const terms = getRecoProbeGuardTerms();
+  if (!terms.length) {
+    return { items, enabled, applied: false, filtered_count: 0, explicit_probe_request: false };
+  }
+
+  const queryNorm = normalizeLooseTextForMatching(input.query);
+  const explicitProbeRequest = terms.some((term) => queryNorm.includes(term));
+  if (explicitProbeRequest) {
+    return { items, enabled, applied: false, filtered_count: 0, explicit_probe_request: true };
+  }
+
+  const isProbeItem = (it: T) => {
+    const nameNorm = normalizeLooseTextForMatching(`${it.sku.brand} ${it.sku.name}`);
+    return terms.some((term) => nameNorm.includes(term) || term.includes(nameNorm));
+  };
+
+  const nonProbe = items.filter((it) => !isProbeItem(it));
+  const minKeep = Math.max(1, Math.trunc(input.min_keep ?? 3));
+  if (nonProbe.length >= Math.min(minKeep, items.length)) {
+    return {
+      items: nonProbe,
+      enabled,
+      applied: nonProbe.length !== items.length,
+      filtered_count: Math.max(0, items.length - nonProbe.length),
+      explicit_probe_request: false,
+    };
+  }
+
+  // Keep a minimal shortlist when the DB is sparse, but still prioritize non-probe items first.
+  if (nonProbe.length > 0) {
+    const probe = items.filter(isProbeItem);
+    const supplement = probe.slice(0, Math.max(0, minKeep - nonProbe.length));
+    const mixed = [...nonProbe, ...supplement];
+    return {
+      items: mixed,
+      enabled,
+      applied: mixed.length !== items.length || nonProbe.length !== items.length,
+      filtered_count: Math.max(0, items.length - mixed.length),
+      explicit_probe_request: false,
+    };
+  }
+
+  return { items, enabled, applied: false, filtered_count: 0, explicit_probe_request: false };
+}
+
+function applyShortlistHistoryDiversity<T extends { product_id: string }>(
+  items: T[],
+  recentShortlistIds: string[],
+): { items: T[]; applied: boolean } {
+  if (!items.length || !recentShortlistIds.length) return { items, applied: false };
+  const seen = new Set(recentShortlistIds.filter((id) => looksLikeUuid(id)));
+  if (!seen.size) return { items, applied: false };
+
+  const unseen: T[] = [];
+  const repeated: T[] = [];
+  for (const item of items) {
+    if (seen.has(item.product_id)) repeated.push(item);
+    else unseen.push(item);
+  }
+
+  if (!unseen.length || !repeated.length) return { items, applied: false };
+  return { items: [...unseen, ...repeated], applied: true };
+}
+
+function extractShortlistProductIdsFromResponseEnvelope(data: unknown): string[] {
+  if (!data || typeof data !== "object") return [];
+  const payload = data as any;
+  const fromAlternatives = Array.isArray(payload?.structured?.alternatives)
+    ? payload.structured.alternatives
+        .map((a: any) => (a && typeof a === "object" ? String(a?.product?.product_id || "").trim() : ""))
+        .filter((id: string) => looksLikeUuid(id))
+    : [];
+  if (fromAlternatives.length) return fromAlternatives.slice(0, SHORTLIST_HISTORY_MAX_ITEMS);
+
+  const fromContextCandidates = Array.isArray(payload?.context?.candidates)
+    ? payload.context.candidates
+        .map((c: any) => (c && typeof c === "object" ? String(c?.id || "").trim() : ""))
+        .filter((id: string) => looksLikeUuid(id))
+    : [];
+  return fromContextCandidates.slice(0, SHORTLIST_HISTORY_MAX_ITEMS);
 }
 
 function buildSingleSoftSafetyQuestion(input: {
@@ -4601,6 +4807,31 @@ export async function POST(req: Request) {
   }
 
   const { userId, setCookieHeader } = getOrCreateAnonymousUserId(req);
+  const routerStateCookie = readRouterStateCookie(req);
+  const makeRouterStateCookieHeader = (input: {
+    answerText?: string | null;
+    shortlistProductIds?: string[];
+  }): string => {
+    const answerText = typeof input.answerText === "string" ? input.answerText : "";
+    const loopCount = isLoopingClarificationLikeAnswerV2(answerText)
+      ? Math.min(9, Math.max(0, routerStateCookie.loop_clarify_count + 1))
+      : 0;
+    const mergedShortlistIds = mergeRecentShortlistIds(
+      routerStateCookie.recent_shortlist_ids,
+      Array.isArray(input.shortlistProductIds) ? input.shortlistProductIds : [],
+    );
+    const payload: RouterStateCookieV2 = {
+      loop_clarify_count: loopCount,
+      recent_shortlist_ids: mergedShortlistIds,
+      updated_at_ms: Date.now(),
+    };
+    return serializeCookie(ROUTER_STATE_COOKIE_NAME, encodeRouterStateCookie(payload), {
+      path: "/",
+      maxAgeSeconds: ROUTER_STATE_COOKIE_MAX_AGE_SECONDS,
+      sameSite: "Lax",
+      secure: process.env.NODE_ENV === "production",
+    });
+  };
   const jsonResponse = (data: unknown, init?: Parameters<typeof NextResponse.json>[1]) => {
     const routing = (data as any)?.router_v2;
     if (routing && process.env.NODE_ENV !== "test") {
@@ -4610,10 +4841,18 @@ export async function POST(req: Request) {
         // no-op
       }
     }
-    return withSetCookie(NextResponse.json(data, init), setCookieHeader);
+    const shortlistProductIds = extractShortlistProductIdsFromResponseEnvelope(data);
+    const answerText = typeof (data as any)?.answer === "string" ? (data as any).answer : "";
+    return withSetCookies(NextResponse.json(data, init), [
+      setCookieHeader,
+      makeRouterStateCookieHeader({ answerText, shortlistProductIds }),
+    ]);
   };
   const streamResponse = (text: string, opts?: Parameters<typeof streamTextResponse>[1]) =>
-    withSetCookie(streamTextResponse(text, opts), setCookieHeader);
+    withSetCookies(streamTextResponse(text, opts), [
+      setCookieHeader,
+      makeRouterStateCookieHeader({ answerText: text }),
+    ]);
 
   const includeLlmError = process.env.NODE_ENV === "development" || body.debug === true;
 
@@ -4626,9 +4865,15 @@ export async function POST(req: Request) {
   });
   if (proxyPrelude.handled) {
     if (proxyPrelude.kind === "strict_error") {
-      return withSetCookie(NextResponse.json({ error: proxyPrelude.error }, { status: proxyPrelude.status }), setCookieHeader);
+      return withSetCookies(NextResponse.json({ error: proxyPrelude.error }, { status: proxyPrelude.status }), [
+        setCookieHeader,
+        makeRouterStateCookieHeader({ answerText: "" }),
+      ]);
     }
-    return withSetCookie(NextResponse.json(proxyPrelude.response), setCookieHeader);
+    return withSetCookies(NextResponse.json(proxyPrelude.response), [
+      setCookieHeader,
+      makeRouterStateCookieHeader({ answerText: "" }),
+    ]);
   }
 
   const rawQuery = normalizeQuery(body);
@@ -5306,7 +5551,9 @@ export async function POST(req: Request) {
       ? resolveIntentSignalV2({ query: recentUserContextText })
       : ({ source: "none", intent_id: null, intent_resolved: null } satisfies IntentSignalV2);
   const resolvedIntentV2 = intentSignalV2.intent_resolved ?? recentIntentSignalV2.intent_resolved;
-  const loopLikeClarificationCount = intentRouterV2Enabled ? countRecentAssistantClarificationLoopsV2(messages) : 0;
+  const loopLikeClarificationCount = intentRouterV2Enabled
+    ? Math.max(countRecentAssistantClarificationLoopsV2(messages), routerStateCookie.loop_clarify_count)
+    : 0;
   const routingMeta = {
     intent_source: intentSignalV2.source,
     intent_resolved: resolvedIntentV2,
@@ -6236,7 +6483,18 @@ export async function POST(req: Request) {
       );
     }
 
+    const probeGuard = applyRecoProbeSeedGuard(scored, {
+      query: contextualQuery,
+      min_keep: 3,
+    });
+    scored = probeGuard.items;
+
     scored.sort((a, b) => b.score.total - a.score.total || b.similarity - a.similarity);
+    const shortlistHistoryDiversity = applyShortlistHistoryDiversity(scored, routerStateCookie.recent_shortlist_ids);
+    if (shortlistHistoryDiversity.applied) {
+      scored = shortlistHistoryDiversity.items;
+    }
+
     const shortlistLimit = Math.min(8, Math.max(3, limit));
     const top = scored.slice(0, shortlistLimit);
 
@@ -6339,6 +6597,16 @@ export async function POST(req: Request) {
       ...(ingredient_search ? { ingredient_search } : {}),
       ...(ingredient_search_error ? { ingredient_search_error } : {}),
       retrieval,
+      reco_probe_guard: {
+        enabled: probeGuard.enabled,
+        applied: probeGuard.applied,
+        filtered_count: probeGuard.filtered_count,
+        explicit_probe_request: probeGuard.explicit_probe_request,
+      },
+      shortlist_history_diversity: {
+        applied: shortlistHistoryDiversity.applied,
+        history_size: routerStateCookie.recent_shortlist_ids.length,
+      },
       shortlist_evidence_summary: evidenceSummary,
       candidates,
     };
