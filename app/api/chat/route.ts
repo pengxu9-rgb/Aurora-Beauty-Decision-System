@@ -366,6 +366,60 @@ function serializeCookie(
   return parts.join("; ");
 }
 
+function parseSerializedSetCookieHeader(
+  serialized: string,
+): { name: string; value: string; options: { path?: string; maxAge?: number; sameSite?: "lax" | "strict" | "none"; secure?: boolean } } | null {
+  const text = String(serialized || "").trim();
+  if (!text) return null;
+  const segments = text
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (!segments.length) return null;
+
+  const first = segments[0];
+  const eqIndex = first.indexOf("=");
+  if (eqIndex <= 0) return null;
+
+  const name = first.slice(0, eqIndex).trim();
+  const rawValue = first.slice(eqIndex + 1).trim();
+  if (!name) return null;
+
+  let value = rawValue;
+  try {
+    value = decodeURIComponent(rawValue);
+  } catch {
+    // keep raw value if decode fails
+  }
+
+  const options: { path?: string; maxAge?: number; sameSite?: "lax" | "strict" | "none"; secure?: boolean } = {};
+  for (const segment of segments.slice(1)) {
+    const lower = segment.toLowerCase();
+    if (lower === "secure") {
+      options.secure = true;
+      continue;
+    }
+    if (lower.startsWith("path=")) {
+      const pathValue = segment.slice(5).trim();
+      if (pathValue) options.path = pathValue;
+      continue;
+    }
+    if (lower.startsWith("max-age=")) {
+      const maxAgeRaw = Number.parseInt(segment.slice(8).trim(), 10);
+      if (Number.isFinite(maxAgeRaw)) options.maxAge = Math.max(0, Math.trunc(maxAgeRaw));
+      continue;
+    }
+    if (lower.startsWith("samesite=")) {
+      const sameSiteRaw = segment.slice(9).trim().toLowerCase();
+      if (sameSiteRaw === "lax" || sameSiteRaw === "strict" || sameSiteRaw === "none") {
+        options.sameSite = sameSiteRaw;
+      }
+    }
+  }
+
+  return { name, value, options };
+}
+
 function parseEnvBoolean(raw: string | undefined, defaultValue: boolean) {
   if (raw == null) return defaultValue;
   const t = String(raw).trim().toLowerCase();
@@ -453,9 +507,27 @@ function withSetCookie(response: Response, setCookieHeader?: string) {
 }
 
 function withSetCookies(response: Response, setCookieHeaders: Array<string | null | undefined>) {
+  const maybeNextResponse = response as Response & {
+    cookies?: {
+      set?: (
+        name: string,
+        value: string,
+        options?: { path?: string; maxAge?: number; sameSite?: "lax" | "strict" | "none"; secure?: boolean },
+      ) => void;
+    };
+  };
+  const canUseNextCookies = typeof maybeNextResponse.cookies?.set === "function";
+
   for (const header of setCookieHeaders) {
     const value = typeof header === "string" ? header.trim() : "";
     if (!value) continue;
+    if (canUseNextCookies) {
+      const parsed = parseSerializedSetCookieHeader(value);
+      if (parsed) {
+        maybeNextResponse.cookies!.set!(parsed.name, parsed.value, parsed.options);
+        continue;
+      }
+    }
     response.headers.append("Set-Cookie", value);
   }
   return response;
@@ -7148,7 +7220,10 @@ export async function POST(req: Request) {
     }
 
     // Otherwise: treat as navigation (the user may just be answering a profile question or starting the chat).
-    if (intentRouterV2Enabled && loopLikeClarificationCount >= 2) {
+    const shouldTriggerLoopBreakerInNavigationFallback =
+      intentRouterV2Enabled &&
+      (loopLikeClarificationCount >= 2 || (loopLikeClarificationCount >= 1 && profileAnswerOnly && !resolvedIntentV2));
+    if (shouldTriggerLoopBreakerInNavigationFallback) {
       routingMeta.loop_breaker_triggered = true;
 
       if (resolvedIntentV2 === "evaluate_product" || resolvedIntentV2 === "dupe_compare") {
