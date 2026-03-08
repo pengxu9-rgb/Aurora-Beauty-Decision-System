@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server.js";
 
 import { parseUpstreamChatRequest } from "./request.ts";
-import { executePromptText } from "./providers.ts";
-import { parseCandidateFromText, resolveTemplateDefinition, validateRequiredKeysObject } from "./templates.ts";
+import { classifyProviderExecutionFailure, executePromptText } from "./providers.ts";
+import { listSupportedTemplateIds, parseCandidateFromText, resolveTemplateDefinition, validateRequiredKeysObject } from "./templates.ts";
 import type {
   ModelExecutionResult,
   SupportedProvider,
   TemplateValidationFailureReason,
+  UpstreamChatRequest,
   UpstreamFailurePayload,
   UpstreamSuccessPayload,
 } from "./types.ts";
@@ -27,6 +28,50 @@ function buildSuccess(payload: UpstreamSuccessPayload) {
 
 function buildFailure(payload: UpstreamFailurePayload, status = 200) {
   return NextResponse.json(payload, { status });
+}
+
+function buildProviderFailure({
+  request,
+  templateIntent,
+  attempts,
+  err,
+}: {
+  request: UpstreamChatRequest;
+  templateIntent: string | null;
+  attempts: number;
+  err: unknown;
+}) {
+  const classified = classifyProviderExecutionFailure(err);
+  return buildFailure({
+    ok: false,
+    error: classified.error,
+    intent: templateIntent || request.intent_hint || "generic",
+    prompt_template_id: request.prompt_template_id,
+    prompt_hash: request.prompt_hash,
+    structured: null,
+    answer: "",
+    text: "",
+    raw_text: "",
+    failure_reason: classified.failure_reason,
+    missing_keys: [],
+    retry_count: Math.max(0, attempts - 1),
+    llm_provider: request.llm_provider,
+    llm_model: request.llm_model,
+    upstream_status: classified.upstream_status,
+    upstream_error_code: classified.upstream_error_code,
+    ...(request.debug
+      ? {
+          debug: {
+            validator_failure_reason: null,
+            missing_keys: [],
+            retry_count: Math.max(0, attempts - 1),
+            provider_error: classified.error,
+            upstream_status: classified.upstream_status,
+            upstream_error_code: classified.upstream_error_code,
+          },
+        }
+      : {}),
+  });
 }
 
 export async function handleUpstreamChatRequest({
@@ -105,7 +150,16 @@ export async function handleUpstreamChatRequest({
 
   while (attempts < 2) {
     attempts += 1;
-    lastResult = await performAttempt(activePrompt);
+    try {
+      lastResult = await performAttempt(activePrompt);
+    } catch (err) {
+      return buildProviderFailure({
+        request,
+        templateIntent: template?.intent || null,
+        attempts,
+        err,
+      });
+    }
     if (lastResult.validation.ok) {
       const structured = lastResult.validation.value;
       return buildSuccess({
@@ -179,4 +233,10 @@ export async function handleUpstreamChatRequest({
         }
       : {}),
   });
+}
+
+export function getUpstreamRouteHealth() {
+  return {
+    supported_templates: listSupportedTemplateIds(),
+  };
 }

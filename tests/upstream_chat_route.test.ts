@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { handlePublicChatRequest } from "../lib/publicChatFacade.ts";
+import { readChatRouteBffProxyConfig } from "../lib/chatRouteBffProxy.ts";
 import { handleUpstreamChatRequest } from "../lib/upstream/handleUpstreamChat.ts";
+import { getProviderReadiness } from "../lib/upstream/providers.ts";
+import { getUpstreamRouteHealth } from "../lib/upstream/handleUpstreamChat.ts";
 
 function withEnv(patch: Record<string, string | undefined>, fn: () => Promise<void> | void) {
   const prev: Record<string, string | undefined> = {};
@@ -145,6 +148,52 @@ test("upstream chat returns machine-readable failure for missing reco alternativ
   assert.equal(payload.ok, false);
   assert.equal(payload.failure_reason, "missing_required_keys");
   assert.deepEqual(payload.missing_keys, ["alternatives"]);
+});
+
+test("upstream chat converts missing provider env into machine-readable failure", async () => {
+  const response = await handleUpstreamChatRequest({
+    req: new Request("http://localhost/api/upstream/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+    body: {
+      query: "Return strict JSON",
+      prompt_template_id: "routine_fit_summary_v1",
+      llm_provider: "gemini",
+    },
+    executePrompt: async () => {
+      throw new Error("Missing required env var (one of): GEMINI_API_KEY, GOOGLE_API_KEY");
+    },
+  });
+
+  const payload = await readJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.failure_reason, "provider_env_missing");
+  assert.equal(payload.prompt_template_id, "routine_fit_summary_v1");
+});
+
+test("upstream chat converts provider http failures into machine-readable failure", async () => {
+  const response = await handleUpstreamChatRequest({
+    req: new Request("http://localhost/api/upstream/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+    body: {
+      query: "Return strict JSON",
+      prompt_template_id: "routine_fit_summary_v1",
+      llm_provider: "gemini",
+    },
+    executePrompt: async () => {
+      throw new Error("Gemini generateContent failed (503): upstream unavailable");
+    },
+  });
+
+  const payload = await readJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.failure_reason, "provider_http_error");
+  assert.equal(payload.upstream_status, 503);
 });
 
 test("upstream chat accepts shape-tolerant reco_main_v1_0 payloads", async () => {
@@ -366,6 +415,39 @@ test("public /api/chat facade proxies to BFF when proxy is enabled", async (t) =
 
       const payload = await readJson(response);
       assert.equal(payload.answer, "ok from bff");
+    },
+  );
+});
+
+test("public chat route config exposes proxy readiness inputs", async () => {
+  await withEnv(
+    {
+      AURORA_CHAT_ROUTE_BFF_PROXY_ENABLED: "true",
+      PIVOTA_AGENT_URL: "https://bff.test",
+    },
+    async () => {
+      const payload = readChatRouteBffProxyConfig(process.env);
+      assert.equal(payload.enabled, true);
+      assert.equal(payload.baseUrl, "https://bff.test");
+    },
+  );
+});
+
+test("upstream route health exposes provider readiness and supported templates", async () => {
+  await withEnv(
+    {
+      GEMINI_API_KEY: "gemini_test_key",
+      OPENAI_API_KEY: undefined,
+    },
+    async () => {
+      const payload = {
+        ...getProviderReadiness(),
+        ...getUpstreamRouteHealth(),
+      };
+      assert.equal(payload.gemini_configured, true);
+      assert.equal(payload.openai_configured, false);
+      assert.equal(Array.isArray(payload.supported_templates), true);
+      assert.equal((payload.supported_templates as unknown[]).includes("routine_fit_summary_v1"), true);
     },
   );
 });

@@ -1,4 +1,8 @@
-import type { ModelExecutionResult, SupportedProvider } from "./types.ts";
+import type {
+  ModelExecutionResult,
+  ProviderExecutionFailureReason,
+  SupportedProvider,
+} from "./types.ts";
 
 function optionalAnyEnv(names: string[]) {
   for (const name of names) {
@@ -6,6 +10,10 @@ function optionalAnyEnv(names: string[]) {
     if (value) return value;
   }
   return null;
+}
+
+function hasAnyEnv(names: string[]) {
+  return Boolean(optionalAnyEnv(names));
 }
 
 function requireAnyEnv(names: string[]) {
@@ -23,6 +31,13 @@ function resolveProvider(preferred: SupportedProvider | null): SupportedProvider
   if (preferred) return preferred;
   if (optionalAnyEnv(["GEMINI_API_KEY", "GOOGLE_API_KEY"])) return "gemini";
   return "openai";
+}
+
+export function getProviderReadiness() {
+  return {
+    gemini_configured: hasAnyEnv(["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+    openai_configured: hasAnyEnv(["OPENAI_API_KEY"]),
+  };
 }
 
 function resolveModel(provider: SupportedProvider, requested: string | null) {
@@ -111,4 +126,50 @@ export async function executePromptText({
   const text =
     provider === "gemini" ? await geminiGenerateText(prompt, model) : await openaiGenerateText(prompt, model);
   return { provider, model, text };
+}
+
+export function classifyProviderExecutionFailure(err: unknown): {
+  failure_reason: ProviderExecutionFailureReason;
+  error: string;
+  upstream_status: number | null;
+  upstream_error_code: string | null;
+} {
+  const error = err instanceof Error ? err : new Error(String(err));
+  const message = String(error.message || "provider execution failed").trim();
+  const codeRaw = (err && typeof err === "object" && "code" in err ? (err as { code?: unknown }).code : null) ?? null;
+  const upstream_error_code =
+    typeof codeRaw === "string" && codeRaw.trim() ? codeRaw.trim() : null;
+  const statusMatch = message.match(/\((\d{3})\)/);
+  const upstream_status = statusMatch ? Number(statusMatch[1]) : null;
+
+  if (/missing required env var/i.test(message)) {
+    return {
+      failure_reason: "provider_env_missing",
+      error: message,
+      upstream_status: null,
+      upstream_error_code,
+    };
+  }
+  if (upstream_status != null) {
+    return {
+      failure_reason: "provider_http_error",
+      error: message,
+      upstream_status,
+      upstream_error_code,
+    };
+  }
+  if (/missing text/i.test(message)) {
+    return {
+      failure_reason: "provider_response_invalid",
+      error: message,
+      upstream_status: null,
+      upstream_error_code,
+    };
+  }
+  return {
+    failure_reason: "provider_execution_failed",
+    error: message,
+    upstream_status: null,
+    upstream_error_code,
+  };
 }
