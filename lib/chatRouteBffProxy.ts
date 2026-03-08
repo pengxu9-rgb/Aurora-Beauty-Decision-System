@@ -69,7 +69,7 @@ export function isChatRouteBffProxyEnabled(env: NodeJS.ProcessEnv = process.env)
     .toLowerCase() !== "false";
 }
 
-function readChatRouteBffProxyConfig(env: NodeJS.ProcessEnv = process.env): ChatRouteBffProxyConfig {
+export function readChatRouteBffProxyConfig(env: NodeJS.ProcessEnv = process.env): ChatRouteBffProxyConfig {
   const enabled = isChatRouteBffProxyEnabled(env);
   const failureMode = normalizeProxyFailureMode(env.AURORA_CHAT_ROUTE_BFF_PROXY_FAILURE_MODE);
   const timeoutNum = Number(env.AURORA_CHAT_ROUTE_BFF_PROXY_TIMEOUT_MS || 18000);

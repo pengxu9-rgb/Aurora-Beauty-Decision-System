@@ -68,6 +68,12 @@ export type ModelExecutionResult = {
   text: string;
 };
 
+export type ProviderExecutionFailureReason =
+  | "provider_env_missing"
+  | "provider_http_error"
+  | "provider_response_invalid"
+  | "provider_execution_failed";
+
 export type UpstreamSuccessPayload = {
   ok: true;
   intent: string;
@@ -100,5 +106,7 @@ export type UpstreamFailurePayload = {
   retry_count: number;
   llm_provider: SupportedProvider | null;
   llm_model: string | null;
+  upstream_status?: number | null;
+  upstream_error_code?: string | null;
   debug?: Record<string, unknown>;
 };

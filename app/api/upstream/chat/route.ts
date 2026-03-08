@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server.js";
 
-import { handleUpstreamChatRequest } from "@/lib/upstream/handleUpstreamChat";
+import { getProviderReadiness } from "@/lib/upstream/providers";
+import { getUpstreamRouteHealth, handleUpstreamChatRequest } from "@/lib/upstream/handleUpstreamChat";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,9 +17,13 @@ export async function POST(req: Request) {
 }
 
 export async function GET() {
+  const readiness = getProviderReadiness();
+  const health = getUpstreamRouteHealth();
   return NextResponse.json({
     ok: true,
     message:
       "POST machine-readable JSON to this endpoint. Example: { query, prompt_template_id, required_structured_keys?, intent_hint?, prompt_hash?, parent_trace_id?, parent_request_id?, llm_provider?, llm_model? }",
+    ...readiness,
+    ...health,
   });
 }

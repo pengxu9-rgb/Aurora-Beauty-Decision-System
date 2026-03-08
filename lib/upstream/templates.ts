@@ -1,5 +1,6 @@
 import { extractJsonObject, extractJsonObjectByKeys, isPlainObject, parseJsonOnlyObject } from "./json.ts";
 import type {
+  SupportedTemplateId,
   TemplateDefinition,
   TemplateValidationFailureReason,
   TemplateValidationResult,
@@ -198,6 +199,10 @@ const TEMPLATE_MAP: Record<string, TemplateDefinition> = {
       }),
   },
 };
+
+export function listSupportedTemplateIds(): SupportedTemplateId[] {
+  return Object.keys(TEMPLATE_MAP) as SupportedTemplateId[];
+}
 
 export function resolveTemplateDefinition(templateId: UpstreamTemplateId) {
   if (!templateId) return null;
