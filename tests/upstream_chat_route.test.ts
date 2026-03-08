@@ -222,6 +222,93 @@ test("upstream chat accepts shape-tolerant reco_main_v1_0 payloads", async () =>
   assert.equal(Array.isArray((payload.structured as Record<string, unknown>).recommendations), true);
 });
 
+test("upstream chat rejects generic reco_main_v1_0 empty recommendations", async () => {
+  const response = await handleUpstreamChatRequest({
+    req: new Request("http://localhost/api/upstream/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+    body: {
+      query: "Return reco main JSON",
+      prompt_template_id: "reco_main_v1_0",
+      debug: true,
+    },
+    executePrompt: async () => ({
+      provider: "gemini",
+      model: "gemini-test",
+      text: JSON.stringify({
+        recommendations: [],
+        metadata: { task_mode: "goal_based_products" },
+        warnings: ["recent_logs_missing"],
+      }),
+    }),
+  });
+
+  const payload = await readJson(response);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.failure_reason, "empty_recommendations_rejected");
+  assert.deepEqual(payload.missing_keys, ["recommendations"]);
+  assert.equal(payload.debug?.empty_recommendations_rejected, true);
+  assert.equal(Array.isArray(payload.debug?.attempts), true);
+});
+
+test("upstream chat accepts explicit ingredient no-candidate reco_main_v1_0 empty mode", async () => {
+  const response = await handleUpstreamChatRequest({
+    req: new Request("http://localhost/api/upstream/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+    body: {
+      query: "Return reco main JSON",
+      prompt_template_id: "reco_main_v1_0",
+    },
+    executePrompt: async () => ({
+      provider: "gemini",
+      model: "gemini-test",
+      text: JSON.stringify({
+        recommendations: [],
+        task_mode: "ingredient_lookup_no_candidates",
+        products_empty_reason: "ingredient_constraint_no_match",
+        missing_info: ["ingredient_constraint_no_match"],
+        warnings: ["No verified product candidates containing the queried ingredient."],
+        constraint_match_summary: { matched: 0, total: 0, dropped: 0 },
+      }),
+    }),
+  });
+
+  const payload = await readJson(response);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.intent, "reco_products");
+  assert.deepEqual((payload.structured as Record<string, unknown>).recommendations, []);
+});
+
+test("upstream chat rejects reco_main_v1_0 items without grounded identity and reasons", async () => {
+  const response = await handleUpstreamChatRequest({
+    req: new Request("http://localhost/api/upstream/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+    body: {
+      query: "Return reco main JSON",
+      prompt_template_id: "reco_main_v1_0",
+      debug: true,
+    },
+    executePrompt: async () => ({
+      provider: "gemini",
+      model: "gemini-test",
+      text: JSON.stringify({
+        recommendations: [{ slot: "PM" }],
+      }),
+    }),
+  });
+
+  const payload = await readJson(response);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.failure_reason, "missing_required_keys");
+  assert.equal(payload.missing_keys.includes("recommendations[0].identity"), true);
+  assert.equal(payload.missing_keys.includes("recommendations[0].reasons"), true);
+});
+
 test("upstream chat accepts dupe_suggest_parse via parse.anchor_product", async () => {
   const response = await handleUpstreamChatRequest({
     req: new Request("http://localhost/api/upstream/chat", {

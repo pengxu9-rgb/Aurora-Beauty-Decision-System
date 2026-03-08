@@ -147,6 +147,7 @@ export async function handleUpstreamChatRequest({
   let attempts = 0;
   let lastResult: Awaited<ReturnType<typeof performAttempt>> | null = null;
   let activePrompt = request.prompt;
+  const attemptSummaries: Array<Record<string, unknown>> = [];
 
   while (attempts < 2) {
     attempts += 1;
@@ -160,6 +161,15 @@ export async function handleUpstreamChatRequest({
         err,
       });
     }
+    const recommendationCount =
+      Array.isArray(lastResult.candidate?.recommendations) ? lastResult.candidate.recommendations.length : 0;
+    attemptSummaries.push({
+      attempt: attempts,
+      recommendation_count: recommendationCount,
+      validator_failure_reason: lastResult.validation.failure_reason,
+      missing_keys: lastResult.validation.missing_keys,
+      empty_recommendations_rejected: lastResult.validation.failure_reason === "empty_recommendations_rejected",
+    });
     if (lastResult.validation.ok) {
       const structured = lastResult.validation.value;
       return buildSuccess({
@@ -183,6 +193,7 @@ export async function handleUpstreamChatRequest({
                 missing_keys: [],
                 retry_count: attempts - 1,
                 provider_text_preview: lastResult.llm.text.slice(0, 500),
+                attempts: attemptSummaries,
               },
             }
           : {}),
@@ -229,6 +240,9 @@ export async function handleUpstreamChatRequest({
             missing_keys: failure?.validation.missing_keys || [],
             retry_count: Math.max(0, attempts - 1),
             provider_text_preview: (failure?.llm.text || "").slice(0, 500),
+            attempts: attemptSummaries,
+            empty_recommendations_rejected:
+              (failure?.validation.failure_reason || "") === "empty_recommendations_rejected",
           },
         }
       : {}),

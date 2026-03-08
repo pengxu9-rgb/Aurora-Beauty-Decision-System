@@ -31,6 +31,7 @@ export type TemplateValidationFailureReason =
   | "json_parse_failed"
   | "missing_required_keys"
   | "clarify_like_response"
+  | "empty_recommendations_rejected"
   | "unsupported_prompt_template_id";
 
 export type TemplateValidationResult =
