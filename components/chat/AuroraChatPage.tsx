@@ -23,6 +23,13 @@ import {
 } from "@/lib/pivotaAgentBff";
 import { createRecoFeedbackReporter, parseRecoBlockName } from "@/lib/recoEmployeeFeedback";
 import { mergeRecoPayloadWithAsyncPatch, startRecoAsyncPolling } from "@/lib/recoRealtimeUpdates";
+import {
+  PHOTO_UPLOAD_TIMEOUT_MS,
+  SKIN_ANALYSIS_TIMEOUT_MS,
+  isAbortLikeError,
+  photoUploadTemporaryIssueMessage,
+  skinAnalysisTemporaryIssueMessage,
+} from "@/lib/skinAnalysisClient";
 import type { EnvStressUiModelV1 } from "@/types";
 import { ChevronDown, ChevronUp, Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -696,8 +703,10 @@ export function AuroraChatPage() {
         content: lang === "CN" ? `上传照片（${slotLabel}）` : `Upload photo (${slotLabel})`,
       });
 
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 45000);
+      let mergedPhotos = analysisPhotoRefs;
+
+      const uploadController = new AbortController();
+      const uploadTimeout = window.setTimeout(() => uploadController.abort(), PHOTO_UPLOAD_TIMEOUT_MS);
       try {
         const form = new FormData();
         form.append("slot_id", slotId);
@@ -711,7 +720,7 @@ export function AuroraChatPage() {
           briefId: briefIdRef.current,
           method: "POST",
           body: form,
-          signal: controller.signal,
+          signal: uploadController.signal,
         });
         applyEnvelope(uploadEnvelope, { gateMessage: "photo_upload" });
 
@@ -731,9 +740,24 @@ export function AuroraChatPage() {
           return;
         }
 
-        const mergedPhotos = mergeAnalysisPhotoRefs(analysisPhotoRefs, [{ slot_id: slotId, photo_id: photoId, qc_status: qcStatus }]);
+        mergedPhotos = mergeAnalysisPhotoRefs(analysisPhotoRefs, [{ slot_id: slotId, photo_id: photoId, qc_status: qcStatus }]);
         setAnalysisPhotoRefs(mergedPhotos);
+      } catch (e) {
+        const err = isAbortLikeError(e)
+          ? photoUploadTemporaryIssueMessage(lang)
+          : e instanceof Error && e.message
+            ? e.message
+            : photoUploadTemporaryIssueMessage(lang);
+        setSendError(err);
+        pushMessage({ id: makeId("a"), role: "assistant", content: err });
+        return;
+      } finally {
+        window.clearTimeout(uploadTimeout);
+      }
 
+      const analysisController = new AbortController();
+      const analysisTimeout = window.setTimeout(() => analysisController.abort(), SKIN_ANALYSIS_TIMEOUT_MS);
+      try {
         const analysisEnvelope = await bffRequest<BffEnvelope>("/v1/analysis/skin", {
           uid: userId,
           lang,
@@ -744,7 +768,7 @@ export function AuroraChatPage() {
             use_photo: true,
             photos: mergedPhotos,
           },
-          signal: controller.signal,
+          signal: analysisController.signal,
         });
         applyEnvelope(analysisEnvelope, { gateMessage: "analysis_summary" });
 
@@ -760,17 +784,12 @@ export function AuroraChatPage() {
           });
         }
         await Promise.all([refreshIdentity(userId), refreshEnvStress(userId)]);
-      } catch (e) {
-        const err =
-          e instanceof DOMException && e.name === "AbortError"
-            ? "Photo request timed out. Please try again."
-            : e instanceof Error
-              ? e.message
-              : "Failed to process photo";
+      } catch (_e) {
+        const err = skinAnalysisTemporaryIssueMessage(lang);
         setSendError(err);
-        pushMessage({ id: makeId("a"), role: "assistant", content: `Sorry — ${err}.` });
+        pushMessage({ id: makeId("a"), role: "assistant", content: err });
       } finally {
-        window.clearTimeout(timeout);
+        window.clearTimeout(analysisTimeout);
         setIsSending(false);
       }
     },
