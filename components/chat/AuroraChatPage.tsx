@@ -79,6 +79,27 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function toTrimmedStringArray(value: unknown, limit = 6) {
+  const items = Array.isArray(value) ? value : [];
+  return items.map((item) => String(item ?? "").trim()).filter(Boolean).slice(0, limit);
+}
+
+function humanizeCardLabel(value: unknown) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const spaced = raw.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+function pickFirstText(...values: unknown[]) {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
 function parseConflictDetectorOutputV1(value: unknown): ConflictDetectorOutputV1 | null {
   if (!isPlainObject(value)) return null;
   const schemaVersion = typeof value.schema_version === "string" ? value.schema_version : null;
@@ -1031,6 +1052,188 @@ export function AuroraChatPage() {
               ))}
             </ul>
           ) : null}
+        </section>
+      );
+    }
+
+    if (card.type === "photo_modules_v1") {
+      const modules = Array.isArray((payload as any).modules) ? ((payload as any).modules as any[]) : [];
+      const usedPhotos = (payload as any).used_photos === true;
+      const qualityGrade = pickFirstText(
+        (payload as any).quality_grade,
+        (payload as any).quality_report?.photo_quality?.grade,
+      );
+      const topLevelRegions = Array.isArray((payload as any).regions) ? ((payload as any).regions as any[]) : [];
+      const moduleProductCount = modules.reduce((sum, item) => {
+        const products = Array.isArray((item as any)?.products) ? ((item as any).products as any[]) : [];
+        return sum + products.length;
+      }, 0);
+      const actionCount = modules.reduce((sum, item) => {
+        const actions = Array.isArray((item as any)?.actions) ? ((item as any).actions as any[]) : [];
+        return sum + actions.length;
+      }, 0);
+      const actionProductCount = modules.reduce((sum, item) => {
+        const actions = Array.isArray((item as any)?.actions) ? ((item as any).actions as any[]) : [];
+        return (
+          sum +
+          actions.reduce((innerSum, action) => {
+            const products = Array.isArray((action as any)?.products) ? ((action as any).products as any[]) : [];
+            return innerSum + products.length;
+          }, 0)
+        );
+      }, 0);
+      const summary = pickFirstText(
+        (payload as any).summary,
+        usedPhotos
+          ? `Reviewed ${modules.length} photo area${modules.length === 1 ? "" : "s"} with ${actionCount} targeted follow-up action${actionCount === 1 ? "" : "s"}.`
+          : "Structured photo review returned module-level guidance.",
+      );
+
+      return (
+        <section key={card.card_id} className="mt-4 rounded-2xl border border-sky-200 bg-sky-50 p-4 shadow-sm" aria-label="Photo analysis">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="text-xs font-semibold text-sky-900">Photo analysis</div>
+            <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-medium text-sky-900">
+              {usedPhotos ? "Photo-led" : "Structured review"}
+            </span>
+            {qualityGrade ? (
+              <span className="rounded-full border border-sky-200 px-2 py-0.5 text-[11px] text-sky-900">Quality · {qualityGrade}</span>
+            ) : null}
+          </div>
+          <div className="mt-2 text-xs text-sky-900">{summary}</div>
+          <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] text-sky-900">
+            <div className="rounded-xl bg-white px-3 py-2">
+              <div className="font-semibold">{modules.length}</div>
+              <div className="opacity-80">Areas reviewed</div>
+            </div>
+            <div className="rounded-xl bg-white px-3 py-2">
+              <div className="font-semibold">{topLevelRegions.length}</div>
+              <div className="opacity-80">Heatmap regions</div>
+            </div>
+            <div className="rounded-xl bg-white px-3 py-2">
+              <div className="font-semibold">{actionCount}</div>
+              <div className="opacity-80">Targeted actions</div>
+            </div>
+            <div className="rounded-xl bg-white px-3 py-2">
+              <div className="font-semibold">{moduleProductCount + actionProductCount}</div>
+              <div className="opacity-80">Linked products</div>
+            </div>
+          </div>
+          {modules.length ? (
+            <div className="mt-3 space-y-3">
+              {modules.slice(0, 4).map((module, idx) => {
+                const actions = Array.isArray((module as any)?.actions) ? ((module as any).actions as any[]) : [];
+                const directProducts = Array.isArray((module as any)?.products) ? ((module as any).products as any[]) : [];
+                const actionProducts = actions.flatMap((action) =>
+                  Array.isArray((action as any)?.products) ? ((action as any).products as any[]) : [],
+                );
+                const productNames = [...directProducts, ...actionProducts]
+                  .map((product) => pickFirstText((product as any)?.name, (product as any)?.title))
+                  .filter(Boolean)
+                  .slice(0, 3);
+                const actionLabels = actions
+                  .map((action) =>
+                    pickFirstText(
+                      (action as any)?.ingredient_name,
+                      (action as any)?.ingredient_id,
+                      (action as any)?.action_type,
+                    ),
+                  )
+                  .filter(Boolean)
+                  .slice(0, 3);
+                const label = pickFirstText((module as any)?.title, humanizeCardLabel((module as any)?.module_id), `Area ${idx + 1}`);
+                const moduleSummary = pickFirstText(
+                  (module as any)?.summary,
+                  actions[0] && pickFirstText((actions[0] as any)?.why, (actions[0] as any)?.how_to_use?.notes),
+                  directProducts[0] && pickFirstText((directProducts[0] as any)?.why_match),
+                  "Linked actions and product ideas are grouped under this area.",
+                );
+                return (
+                  <div key={`${card.card_id}_${label}_${idx}`} className="rounded-xl border border-sky-100 bg-white p-3">
+                    <div className="text-xs font-semibold text-slate-900">{label}</div>
+                    <div className="mt-1 text-xs text-slate-700">{moduleSummary}</div>
+                    {actionLabels.length ? (
+                      <div className="mt-2 text-[11px] text-slate-700">
+                        Actions: <span className="font-medium">{actionLabels.join(" · ")}</span>
+                      </div>
+                    ) : null}
+                    {productNames.length ? (
+                      <div className="mt-1 text-[11px] text-slate-700">
+                        Products: <span className="font-medium">{productNames.join(" · ")}</span>
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="mt-3 text-xs text-slate-500">No photo modules were returned.</div>
+          )}
+        </section>
+      );
+    }
+
+    if (card.type === "analysis_story_v2") {
+      const uiCard = isPlainObject((payload as any).ui_card_v1) ? ((payload as any).ui_card_v1 as Record<string, unknown>) : {};
+      const headline = pickFirstText(uiCard.headline, (payload as any).summary, "Personalized skin analysis");
+      const keyPoints = toTrimmedStringArray(uiCard.key_points);
+      const actionsNow = toTrimmedStringArray(uiCard.actions_now, 5);
+      const avoidNow = toTrimmedStringArray(uiCard.avoid_now, 4);
+      const safetyNotes = toTrimmedStringArray((payload as any).safety_notes, 4);
+      const priorityFindings = Array.isArray((payload as any).priority_findings) ? ((payload as any).priority_findings as any[]) : [];
+      const confidenceLabel = pickFirstText(uiCard.confidence_label, (payload as any).confidence_overall?.level);
+      const nextCheckin = pickFirstText(uiCard.next_checkin);
+
+      return (
+        <section key={card.card_id} className="mt-4 rounded-2xl border border-violet-200 bg-violet-50 p-4 shadow-sm" aria-label="Skin analysis story">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="text-xs font-semibold text-violet-900">Skin analysis</div>
+            {confidenceLabel ? (
+              <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-medium text-violet-900">Confidence · {confidenceLabel}</span>
+            ) : null}
+          </div>
+          <div className="mt-2 text-sm font-semibold text-slate-900">{headline}</div>
+          {keyPoints.length ? (
+            <ul className="mt-3 list-disc pl-4 text-xs text-slate-700">
+              {keyPoints.map((item, idx) => (
+                <li key={`point_${idx}`}>{item}</li>
+              ))}
+            </ul>
+          ) : null}
+          {priorityFindings.length ? (
+            <div className="mt-3">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-violet-900">Priority findings</div>
+              <ul className="mt-1 list-disc pl-4 text-xs text-slate-700">
+                {priorityFindings.slice(0, 3).map((item, idx) => (
+                  <li key={`finding_${idx}`}>{pickFirstText((item as any)?.title, (item as any)?.detail)}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {actionsNow.length ? (
+            <div className="mt-3">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-violet-900">Actions now</div>
+              <ul className="mt-1 list-disc pl-4 text-xs text-slate-700">
+                {actionsNow.map((item, idx) => (
+                  <li key={`action_${idx}`}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {avoidNow.length ? (
+            <div className="mt-3">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-violet-900">Avoid for now</div>
+              <ul className="mt-1 list-disc pl-4 text-xs text-slate-700">
+                {avoidNow.map((item, idx) => (
+                  <li key={`avoid_${idx}`}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {safetyNotes.length ? (
+            <div className="mt-3 text-[11px] text-slate-700">Safety: {safetyNotes.join(" · ")}</div>
+          ) : null}
+          {nextCheckin ? <div className="mt-3 text-[11px] text-violet-900">Next check-in: {nextCheckin}</div> : null}
         </section>
       );
     }
