@@ -3,7 +3,9 @@ export type SupportedProvider = "gemini" | "openai";
 export type SupportedTemplateId =
   | "routine_fit_summary_v1"
   | "reco_main_v1_0"
+  | "reco_main_v1_2"
   | "reco_alternatives_v1_0"
+  | "reco_alternatives_hybrid_v1"
   | "dupe_suggest_parse"
   | "dupe_compare_parse"
   | "dupe_compare_main";

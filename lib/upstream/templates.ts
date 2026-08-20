@@ -273,6 +273,44 @@ const TEMPLATE_MAP: Record<string, TemplateDefinition> = {
           '{ "recommendations":[{"name":"","why":[""],"slot":"AM|PM|ANY","sku":{"brand":"","name":"","sku_id":"","product_id":""}}], "missing_info":[""], "warnings":[""], "metadata":{"task_mode":"goal_based_products|ingredient_filtered_products|ingredient_lookup_no_candidates"} }\nGeneric reco mode MUST return at least 1 grounded recommendation. If there is no grounded candidate, do not return an empty success object. Only explicit ingredient/no-candidate mode may return recommendations: [].',
       }),
   },
+  // The gateway's reco mainline prompt advanced to v1_2 (PIVOTA-Agent prompts/reco_main_v1_2.*) while this
+  // registry still ended at v1_0, so every mainline call answered 400 unsupported_prompt_template_id and BOTH
+  // reco surfaces (consumer /v1/reco/generate and the agent-door recommend_products) returned zero
+  // recommendations in production (2026-08-19). The v1_2 OUTPUT contract keeps `recommendations` as the top
+  // key and enriches each item (brand/name at top level, use_case, concern_match, skin_fit, constraint_notes,
+  // query_terms), so the shared validator applies unchanged — items still need a grounded identity and
+  // reasons, and generic mode still may not return an empty list.
+  reco_main_v1_2: {
+    template_id: "reco_main_v1_2",
+    intent: "reco_products",
+    required_keys: ["recommendations"],
+    validate: (candidate) => validateRecoMain(candidate),
+    buildRetryPrompt: ({ prompt, missing_keys, failure_reason }) =>
+      buildJsonOnlyRetryPrompt({
+        prompt,
+        missing_keys,
+        failure_reason,
+        schemaSummary:
+          '{ "recommendations":[{"slot":"other","step":"cleanser|treatment|moisturizer|sunscreen|other","score":0,"product_type":"","brand":"","name":"","display_name":"","use_case":"","concern_match":[""],"skin_fit":[""],"constraint_notes":[""],"query_terms":[""],"reasons":[""],"sku":{"brand":"","name":"","display_name":"","sku_id":"","product_id":"","category":""},"missing_info":[""],"warnings":[""]}], "evidence":{}, "confidence":0.0, "missing_info":[""], "warnings":[""] }\nGeneric reco mode MUST return at least 1 grounded recommendation. If there is no grounded candidate, do not return an empty success object. Only explicit ingredient/no-candidate mode may return recommendations: [].',
+      }),
+  },
+  // The hybrid alternatives lane (gateway prompts/reco_alternatives_hybrid_v1.*) sends this id and expects a
+  // top-level `alternatives` array — the same contract as reco_alternatives_v1_0, with per-item provenance
+  // (kind, candidate_origin, grounding_status). Unregistered, it was the second latent 400 of the same skew.
+  reco_alternatives_hybrid_v1: {
+    template_id: "reco_alternatives_hybrid_v1",
+    intent: "alternatives",
+    required_keys: ["alternatives"],
+    validate: (candidate) => validateAlternatives(candidate),
+    buildRetryPrompt: ({ prompt, missing_keys, failure_reason }) =>
+      buildJsonOnlyRetryPrompt({
+        prompt,
+        missing_keys,
+        failure_reason,
+        schemaSummary:
+          '{ "alternatives":[{"kind":"dupe|similar|premium","candidate_origin":"catalog|open_world","grounding_status":"catalog_verified|name_only","product":{"brand":"","name":""},"why_candidate":[""],"tradeoffs":[""]}] }',
+      }),
+  },
   dupe_suggest_parse: {
     template_id: "dupe_suggest_parse",
     intent: "product_parse",
