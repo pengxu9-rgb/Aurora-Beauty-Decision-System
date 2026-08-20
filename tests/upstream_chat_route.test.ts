@@ -538,3 +538,148 @@ test("upstream route health exposes provider readiness and supported templates",
     },
   );
 });
+
+
+// ── the two ids the PIVOTA-Agent gateway ACTUALLY SENDS (2026-08-19 skew: both used to 400) ────────────────
+
+test("upstream chat accepts reco_main_v1_2 — the id the gateway's mainline sends", async () => {
+  const response = await handleUpstreamChatRequest({
+    req: new Request("http://localhost/api/upstream/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+    body: {
+      query: "Return reco main JSON",
+      prompt_template_id: "reco_main_v1_2",
+    },
+    executePrompt: async () => ({
+      provider: "gemini",
+      model: "gemini-test",
+      // A realistic v1_2 item: identity at TOP level (brand/name/display_name) plus sku, reasons[],
+      // and the v1_2-only enrichment fields — exactly what prompts/reco_main_v1_2.user_schema.json asks for.
+      text: JSON.stringify({
+        recommendations: [
+          {
+            slot: "treatment",
+            step: "treatment",
+            score: 82,
+            product_type: "treatment",
+            brand: "Paula's Choice",
+            name: "2% BHA Liquid Exfoliant",
+            display_name: "2% BHA Liquid Exfoliant",
+            use_case: "Unclogs pores without scrubbing",
+            concern_match: ["clogged pores"],
+            skin_fit: ["sensitive"],
+            constraint_notes: ["start 2-3x/week"],
+            query_terms: ["bha exfoliant"],
+            reasons: ["leave-on BHA, fragrance-free"],
+            sku: { brand: "Paula's Choice", name: "2% BHA Liquid Exfoliant", sku_id: "sku_1", product_id: "sig_abc", category: "Exfoliant" },
+            missing_info: [],
+            warnings: [],
+          },
+        ],
+        evidence: {},
+        confidence: 0.74,
+        missing_info: [],
+        warnings: [],
+      }),
+    }),
+  });
+
+  const payload = await readJson(response);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.intent, "reco_products");
+  assert.equal(payload.prompt_template_id, "reco_main_v1_2");
+  const recs = (payload.structured as Record<string, unknown>).recommendations as unknown[];
+  assert.equal(Array.isArray(recs) && recs.length === 1, true);
+});
+
+test("reco_main_v1_2 keeps the shared guards: generic empty is rejected, explicit no-candidate mode is not", async () => {
+  const call = (text: string) =>
+    handleUpstreamChatRequest({
+      req: new Request("http://localhost/api/upstream/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      }),
+      body: { query: "Return reco main JSON", prompt_template_id: "reco_main_v1_2" },
+      executePrompt: async () => ({ provider: "gemini", model: "gemini-test", text }),
+    });
+
+  const generic = await readJson(await call(JSON.stringify({ recommendations: [], metadata: { task_mode: "goal_based_products" } })));
+  assert.equal(generic.ok, false);
+  assert.equal(generic.failure_reason, "empty_recommendations_rejected");
+
+  const explicit = await readJson(
+    await call(
+      JSON.stringify({
+        recommendations: [],
+        task_mode: "ingredient_lookup_no_candidates",
+        products_empty_reason: "ingredient_constraint_no_match",
+        missing_info: ["ingredient_constraint_no_match"],
+        warnings: ["No verified product candidates containing the queried ingredient."],
+        constraint_match_summary: { matched: 0, total: 0, dropped: 0 },
+      }),
+    ),
+  );
+  assert.equal(explicit.ok, true);
+
+  const ungrounded = await readJson(await call(JSON.stringify({ recommendations: [{ slot: "PM" }] })));
+  assert.equal(ungrounded.ok, false);
+  assert.equal(ungrounded.failure_reason, "missing_required_keys");
+});
+
+test("upstream chat accepts reco_alternatives_hybrid_v1 — the hybrid alternatives lane's id", async () => {
+  const response = await handleUpstreamChatRequest({
+    req: new Request("http://localhost/api/upstream/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+    body: {
+      query: "Return alternatives JSON",
+      prompt_template_id: "reco_alternatives_hybrid_v1",
+    },
+    executePrompt: async () => ({
+      provider: "gemini",
+      model: "gemini-test",
+      text: JSON.stringify({
+        alternatives: [
+          {
+            kind: "similar",
+            candidate_origin: "catalog",
+            grounding_status: "catalog_verified",
+            product: { brand: "The Ordinary", name: "Niacinamide 10% + Zinc 1%" },
+            why_candidate: ["same hero active at a lower price"],
+            tradeoffs: ["thinner texture"],
+          },
+        ],
+      }),
+    }),
+  });
+
+  const payload = await readJson(response);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.intent, "alternatives");
+  assert.equal(Array.isArray((payload.structured as Record<string, unknown>).alternatives), true);
+});
+
+test("an id NO template registers still answers 400 unsupported_prompt_template_id", async () => {
+  const response = await handleUpstreamChatRequest({
+    req: new Request("http://localhost/api/upstream/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+    body: { query: "x", prompt_template_id: "reco_main_v1_3" },
+    executePrompt: async () => ({ provider: "gemini", model: "gemini-test", text: "{}" }),
+  });
+  assert.equal(response.status, 400);
+  const payload = await readJson(response);
+  assert.equal(payload.failure_reason, "unsupported_prompt_template_id");
+});
+
+test("the health listing advertises every id the gateway sends", async () => {
+  const health = getUpstreamRouteHealth();
+  const supported = (health as Record<string, unknown>).supported_templates as string[];
+  for (const id of ["reco_main_v1_2", "reco_alternatives_hybrid_v1", "reco_main_v1_0", "reco_alternatives_v1_0"]) {
+    assert.equal(supported.includes(id), true, `${id} must be listed`);
+  }
+});
