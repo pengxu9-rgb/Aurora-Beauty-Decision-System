@@ -594,6 +594,97 @@ test("upstream chat accepts reco_main_v1_2 — the id the gateway's mainline sen
   assert.equal(Array.isArray(recs) && recs.length === 1, true);
 });
 
+test("upstream chat accepts reco_main_v1_3 — the id the agent door sends", async () => {
+  // SECOND OCCURRENCE of the id skew this section exists for. v1_0 -> v1_2 cost both reco surfaces
+  // their recommendations on 2026-08-19; v1_3 400'd the agent door's whole LLM leg on 2026-09-09
+  // (PIVOTA-Agent#2162, rolled back by env in #2165). The output contract is v1_2's byte for byte —
+  // v1_3's user_schema.json is a copy — so an ordinary grounded answer must validate identically.
+  const response = await handleUpstreamChatRequest({
+    req: new Request("http://localhost/api/upstream/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    }),
+    body: { query: "Return reco main JSON", prompt_template_id: "reco_main_v1_3" },
+    executePrompt: async () => ({
+      provider: "gemini",
+      model: "gemini-test",
+      text: JSON.stringify({
+        recommendations: [
+          {
+            slot: "treatment",
+            step: "treatment",
+            score: 82,
+            product_type: "bronzer",
+            brand: "Sigma Beauty",
+            name: "Matte Bronzer",
+            display_name: "Matte Bronzer",
+            use_case: "Adds warmth for contouring",
+            concern_match: ["contour"],
+            skin_fit: ["all"],
+            constraint_notes: [],
+            query_terms: ["matte bronzer"],
+            reasons: ["blendable, buildable warmth"],
+            sku: { brand: "Sigma Beauty", name: "Matte Bronzer", sku_id: "sku_9", product_id: "sig_bronzer", category: "Bronzer" },
+            missing_info: [],
+            warnings: [],
+          },
+        ],
+        evidence: {},
+        confidence: 0.7,
+        missing_info: [],
+        warnings: [],
+      }),
+    }),
+  });
+
+  const payload = await readJson(response);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.intent, "reco_products");
+  assert.equal(payload.prompt_template_id, "reco_main_v1_3");
+  const recs = (payload.structured as Record<string, unknown>).recommendations as unknown[];
+  assert.equal(Array.isArray(recs) && recs.length === 1, true);
+});
+
+test("reco_main_v1_3 accepts a REASONED empty — its prompt instructs one — but still rejects a bare empty", async () => {
+  // THE REASON v1_3 CANNOT REUSE v1_2's VALIDATOR. v1_3's DOMAIN BOUNDARY tells the model: "For a tool,
+  // brush or device request, return recommendations: [] and say in missing_info that this lane does not
+  // cover tools", and the same for any category it does not cover. The gateway still labels those calls
+  // goal_based_products, which matches none of RECO_MAIN_EMPTY_TASK_MODE_HINTS — so under v1_2's
+  // validator the registry would reject precisely the answers v1_3 asks the model to give.
+  //
+  // The guard is relaxed, not removed: an empty list with NO stated reason is the model failing rather
+  // than refusing, and stays rejected.
+  const call = (text: string, id: string) =>
+    handleUpstreamChatRequest({
+      req: new Request("http://localhost/api/upstream/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      }),
+      body: { query: "Return reco main JSON", prompt_template_id: id },
+      executePrompt: async () => ({ provider: "gemini", model: "gemini-test", text }),
+    });
+
+  const refusal = JSON.stringify({
+    recommendations: [],
+    missing_info: ["This lane does not cover beauty tools."],
+    metadata: { task_mode: "goal_based_products" },
+  });
+  const reasoned = await readJson(await call(refusal, "reco_main_v1_3"));
+  assert.equal(reasoned.ok, true, "a refusal that states its reason is a valid v1_3 answer");
+
+  const bare = await readJson(
+    await call(JSON.stringify({ recommendations: [], metadata: { task_mode: "goal_based_products" } }), "reco_main_v1_3"),
+  );
+  assert.equal(bare.ok, false);
+  assert.equal(bare.failure_reason, "empty_recommendations_rejected", "a bare empty is still the model failing");
+
+  // AND v1_2 IS UNCHANGED. The allowance is per-template: the same refusal body that v1_3 accepts must
+  // still be rejected under v1_2, whose prompt never instructs an empty answer.
+  const underV12 = await readJson(await call(refusal, "reco_main_v1_2"));
+  assert.equal(underV12.ok, false);
+  assert.equal(underV12.failure_reason, "empty_recommendations_rejected");
+});
+
 test("reco_main_v1_2 keeps the shared guards: generic empty is rejected, explicit no-candidate mode is not", async () => {
   const call = (text: string) =>
     handleUpstreamChatRequest({
@@ -663,12 +754,15 @@ test("upstream chat accepts reco_alternatives_hybrid_v1 — the hybrid alternati
 });
 
 test("an id NO template registers still answers 400 unsupported_prompt_template_id", async () => {
+  // The id here must be one that is genuinely unregistered, and it goes stale every time the gateway
+  // advances: this control used to name reco_main_v1_3, which is now registered above — so it started
+  // asserting 400 against a template that answers 200. Pick a version far past anything shipped.
   const response = await handleUpstreamChatRequest({
     req: new Request("http://localhost/api/upstream/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
     }),
-    body: { query: "x", prompt_template_id: "reco_main_v1_3" },
+    body: { query: "x", prompt_template_id: "reco_main_v9_9" },
     executePrompt: async () => ({ provider: "gemini", model: "gemini-test", text: "{}" }),
   });
   assert.equal(response.status, 400);
@@ -679,7 +773,7 @@ test("an id NO template registers still answers 400 unsupported_prompt_template_
 test("the health listing advertises every id the gateway sends", async () => {
   const health = getUpstreamRouteHealth();
   const supported = (health as Record<string, unknown>).supported_templates as string[];
-  for (const id of ["reco_main_v1_2", "reco_alternatives_hybrid_v1", "reco_main_v1_0", "reco_alternatives_v1_0"]) {
+  for (const id of ["reco_main_v1_2", "reco_main_v1_3", "reco_alternatives_hybrid_v1", "reco_main_v1_0", "reco_alternatives_v1_0"]) {
     assert.equal(supported.includes(id), true, `${id} must be listed`);
   }
 });
