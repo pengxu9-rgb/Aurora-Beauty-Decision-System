@@ -4,6 +4,7 @@ export type SupportedTemplateId =
   | "routine_fit_summary_v1"
   | "reco_main_v1_0"
   | "reco_main_v1_2"
+  | "reco_main_v1_3"
   | "reco_alternatives_v1_0"
   | "reco_alternatives_hybrid_v1"
   | "dupe_suggest_parse"

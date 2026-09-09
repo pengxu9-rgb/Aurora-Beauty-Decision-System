@@ -113,12 +113,9 @@ function getRecoMainTaskMode(candidate: Record<string, unknown>) {
   ).toLowerCase();
 }
 
-function isExplicitRecoEmptyMode(candidate: Record<string, unknown>) {
-  const taskMode = getRecoMainTaskMode(candidate);
-  if (!taskMode) return false;
-  const modeAllowsEmpty = RECO_MAIN_EMPTY_TASK_MODE_HINTS.some((token) => taskMode.includes(token));
-  if (!modeAllowsEmpty) return false;
-
+// Does the model's empty answer come with a stated reason? Split out of isExplicitRecoEmptyMode so a
+// template whose CONTRACT includes refusing a category can reuse it without the task_mode gate below.
+function hasRecoEmptyReason(candidate: Record<string, unknown>) {
   const missingInfo = readStringArray(candidate.missing_info);
   const warnings = readStringArray(candidate.warnings);
   const failureReason = readString(candidate.failure_reason);
@@ -126,7 +123,6 @@ function isExplicitRecoEmptyMode(candidate: Record<string, unknown>) {
   const taskWarnings = readStringArray(readObject(candidate.metadata)?.warnings);
   const constraintSummary = readObject(candidate.constraint_match_summary);
   const matchedCount = Number((constraintSummary && constraintSummary.matched) ?? NaN);
-
   return Boolean(
     failureReason ||
       productsEmptyReason ||
@@ -135,6 +131,14 @@ function isExplicitRecoEmptyMode(candidate: Record<string, unknown>) {
       taskWarnings.length > 0 ||
       (Number.isFinite(matchedCount) && matchedCount === 0),
   );
+}
+
+function isExplicitRecoEmptyMode(candidate: Record<string, unknown>) {
+  const taskMode = getRecoMainTaskMode(candidate);
+  if (!taskMode) return false;
+  const modeAllowsEmpty = RECO_MAIN_EMPTY_TASK_MODE_HINTS.some((token) => taskMode.includes(token));
+  if (!modeAllowsEmpty) return false;
+  return hasRecoEmptyReason(candidate);
 }
 
 function readRecoIdentity(item: Record<string, unknown>) {
@@ -169,7 +173,17 @@ function readRecoReasons(item: Record<string, unknown>) {
   ].filter(Boolean);
 }
 
-function validateRecoMain(candidate: Record<string, unknown> | null): TemplateValidationResult {
+function validateRecoMain(
+  candidate: Record<string, unknown> | null,
+  // A template whose own prompt INSTRUCTS an empty answer for some requests cannot be held to the
+  // task_mode gate: reco_main_v1_3 tells the model to return recommendations: [] for a tool, brush or
+  // device request and for any category it does not cover, while the gateway still labels the call
+  // goal_based_products — none of the RECO_MAIN_EMPTY_TASK_MODE_HINTS tokens. Registering v1_3 with
+  // the v1_2 validator would therefore reject exactly the answers v1_3 asks for.
+  // The guard is relaxed, not removed: a BARE empty (no missing_info, no warnings, no reason of any
+  // kind) is still rejected, because that is the model failing rather than refusing.
+  { allowReasonedEmpty = false }: { allowReasonedEmpty?: boolean } = {},
+): TemplateValidationResult {
   if (!candidate) return failure("json_parse_failed");
   const recommendations = Array.isArray(candidate.recommendations) ? candidate.recommendations : null;
   if (!recommendations) {
@@ -177,6 +191,9 @@ function validateRecoMain(candidate: Record<string, unknown> | null): TemplateVa
   }
   if (recommendations.length === 0) {
     if (isExplicitRecoEmptyMode(candidate)) {
+      return success(candidate, true);
+    }
+    if (allowReasonedEmpty && hasRecoEmptyReason(candidate)) {
       return success(candidate, true);
     }
     return failure("empty_recommendations_rejected", ["recommendations"], candidate);
@@ -292,6 +309,34 @@ const TEMPLATE_MAP: Record<string, TemplateDefinition> = {
         failure_reason,
         schemaSummary:
           '{ "recommendations":[{"slot":"other","step":"cleanser|treatment|moisturizer|sunscreen|other","score":0,"product_type":"","brand":"","name":"","display_name":"","use_case":"","concern_match":[""],"skin_fit":[""],"constraint_notes":[""],"query_terms":[""],"reasons":[""],"sku":{"brand":"","name":"","display_name":"","sku_id":"","product_id":"","category":""},"missing_info":[""],"warnings":[""]}], "evidence":{}, "confidence":0.0, "missing_info":[""], "warnings":[""] }\nGeneric reco mode MUST return at least 1 grounded recommendation. If there is no grounded candidate, do not return an empty success object. Only explicit ingredient/no-candidate mode may return recommendations: [].',
+      }),
+  },
+  // The agent door (PIVOTA-Agent recommend_products) advanced to v1_3 — the SECOND time the gateway
+  // shipped a prompt id this registry did not hold. The first, v1_0 -> v1_2, is recorded above and cost
+  // both reco surfaces their recommendations on 2026-08-19; this one 400'd the agent door's whole LLM
+  // leg on 2026-09-09 and was rolled back by env (PIVOTA-Agent#2165) rather than fixed here.
+  //
+  // The OUTPUT contract is v1_2's, unchanged: v1_3's user_schema.json is a byte-copy, so the same
+  // required key, the same identity/reasons checks and the same retry summary apply.
+  //
+  // What DOES differ is that v1_3 has categories it must refuse. Its DOMAIN BOUNDARY instructs
+  // "return recommendations: [] and say in missing_info that this lane does not cover tools", and the
+  // same for any category it does not cover. The gateway still labels those calls goal_based_products,
+  // so isExplicitRecoEmptyMode would reject them — the prompt would be asking for an answer this
+  // registry refuses. Hence allowReasonedEmpty: a refusal that states its reason is valid for v1_3; a
+  // bare empty is still the model failing, and is still rejected.
+  reco_main_v1_3: {
+    template_id: "reco_main_v1_3",
+    intent: "reco_products",
+    required_keys: ["recommendations"],
+    validate: (candidate) => validateRecoMain(candidate, { allowReasonedEmpty: true }),
+    buildRetryPrompt: ({ prompt, missing_keys, failure_reason }) =>
+      buildJsonOnlyRetryPrompt({
+        prompt,
+        missing_keys,
+        failure_reason,
+        schemaSummary:
+          '{ "recommendations":[{"slot":"other","step":"cleanser|treatment|moisturizer|sunscreen|other","score":0,"product_type":"","brand":"","name":"","display_name":"","use_case":"","concern_match":[""],"skin_fit":[""],"constraint_notes":[""],"query_terms":[""],"reasons":[""],"sku":{"brand":"","name":"","display_name":"","sku_id":"","product_id":"","category":""},"missing_info":[""],"warnings":[""]}], "evidence":{}, "confidence":0.0, "missing_info":[""], "warnings":[""] }\nReturn at least 1 grounded recommendation when the request names a category this lane covers. If the request is for a tool, brush or device, or for a category the lane does not cover, return recommendations: [] AND say why in missing_info — an empty list with no reason is rejected.',
       }),
   },
   // The hybrid alternatives lane (gateway prompts/reco_alternatives_hybrid_v1.*) sends this id and expects a
